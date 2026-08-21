@@ -1,0 +1,6 @@
+#!/bin/bash
+# wcvoicekeep: 安装完成后自动加载 LaunchDaemon，无需重启手机
+PLIST=/var/jb/Library/LaunchDaemons/com.wcvoicekeep.daemon.plist
+launchctl unload "$PLIST" >/dev/null 2>&1 || true
+launchctl load "$PLIST" >/dev/null 2>&1 || true
+exit 0

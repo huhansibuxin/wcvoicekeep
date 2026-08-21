@@ -1,0 +1,8 @@
+# Theos build artifacts
+.theos/
+.obj/
+packages/
+*.deb
+
+# OS junk
+.DS_Store
