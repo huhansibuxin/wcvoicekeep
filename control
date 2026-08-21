@@ -1,9 +1,9 @@
 Package: com.wcvoicekeep
 Name: wcvoicekeep
-Depends: firmware (>= 16.0)
-Version: 1.0.0
+Depends: ellekit, firmware (>= 16.0)
+Version: 1.0.1
 Architecture: iphoneos-arm64
-Description: LaunchDaemon that keeps WeChat Keyboard (Wetype) main app alive in the background and relaunches it if it dies, so voice input no longer needs the foreground jump. True zero-jump (not an animation-removal hack).
+Description: LaunchDaemon keeps WeChat Keyboard (Wetype) main app alive + read-only introspection tweak to find the floating-window entry selector. Step toward zero-jump voice (no animation hack).
 Maintainer: huhansibuxin
 Author: huhansibuxin
 Section: Utilities
