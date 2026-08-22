@@ -34,6 +34,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+// notify.h 在 theos iOS SDK 16.5 路径里默认找不全 - 手动声明 Darwin 通知 API
+// 而不依赖 <notify.h>。这是私有 API 但 iOS 13+ 名/segnature 都稳定。
+extern uint32_t notify_post(const char *name);
+
 // ===== 配置 =====
 static NSString *const kTargetBundleID = @"com.tencent.wetype";
 static const char    *const kTriggerName = "com.wcvoicekeep.pip.trigger"; // 与 Tweak.xm 一致
