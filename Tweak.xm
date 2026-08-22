@@ -97,105 +97,103 @@ static void ProbeStateProbe(void) {
 //   预备:          preparePictureInPictureForStandby  (gate 过才不早退)
 //   真正起 PiP:    startWithCompletionHandler:        (startPictureInPicture)
 // 之前 v1.4~1.6 死在两点：(1) 开关在 Manager 不在 Policy，从未置 1；(2) 只 prepare 没 setup/start。
-static void EnsureStandbyPiP(void) {
-    Class mgrCls = objc_getClass("WBVoiceInputPIPManager");
-    if (!mgrCls) { WLog(@"PROBE WBVoiceInputPIPManager NOT FOUND"); return; }
-    WLog(@"PROBE WBVoiceInputPIPManager found");
-
-    SEL shared = NSSelectorFromString(@"sharedInstance");
-    if (![mgrCls respondsToSelector:shared]) { WLog(@"PROBE no +sharedInstance"); return; }
-    id mgr = ((id (*)(Class, SEL))objc_msgSend)(mgrCls, shared);
-    if (!mgr) { WLog(@"PROBE sharedInstance nil"); return; }
-
-    SEL isActive    = NSSelectorFromString(@"isActive");
+// 真正执行一次 engage（置开关 -> setup -> setStandby -> prepare -> start）。
+// 不做幂等/冷却判断（由 EnsureStandbyPiP 外层负责），便于内部重试。
+static void EngageOnce(id mgr, int attempt) {
     SEL isSupported = NSSelectorFromString(@"isSupported");
     SEL isSetup     = NSSelectorFromString(@"isSetup");
     SEL setup       = NSSelectorFromString(@"setup");
     SEL setStandby  = NSSelectorFromString(@"setStandbyPlaybackStateEnabled:");
     SEL startSel    = NSSelectorFromString(@"startWithCompletionHandler:");
     SEL standby     = NSSelectorFromString(@"preparePictureInPictureForStandby");
+    SEL shared      = NSSelectorFromString(@"sharedInstance");
 
-    BOOL vActive    = [mgr respondsToSelector:isActive]    ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isActive) : NO;
-    BOOL vSupported = [mgr respondsToSelector:isSupported] ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isSupported) : NO;
-    BOOL vSetup     = [mgr respondsToSelector:isSetup]     ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isSetup) : NO;
+    BOOL vSetup = [mgr respondsToSelector:isSetup] ? ((BOOL (*)(id,SEL))objc_msgSend)(mgr, isSetup) : NO;
+    WLog(@"PROBE [attempt %d] isSupported=%d isSetup=%d", attempt,
+         (int)([mgr respondsToSelector:isSupported] ? ((BOOL(*)(id,SEL))objc_msgSend)(mgr,isSupported):NO),
+         (int)vSetup);
 
-    // 幂等 + 抗抖动：已经 active 就别再 setup/start（PiP 在后台也能保活，重复戳同一个单例反而危险）；
-    // 短间隔(<2s)重复触发直接跳过，避免双 dylib / 多次事件下反复调用导致状态互相踩、崩进安全模式。
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (vActive) { WLog(@"PROBE already active, skip re-engage"); return; }
-    if (now - gLastEngage < 2.0) { WLog(@"PROBE cooldown skip (last engage %.1fs ago)", now - gLastEngage); return; }
-    gLastEngage = now;
-
-    WLog(@"PROBE mgr isActive=%d isSupported=%d isSetup=%d", (int)vActive, (int)vSupported, (int)vSetup);
-
-    // (1) 打开 standby 模式开关 —— 在 WBVoiceInputManager 上（不是 Policy）
+    // (1) 开门控 recordingStandbyMode=1（WBVoiceInputManager 上，非 Policy）
     Class vmCls = objc_getClass("WBVoiceInputManager");
     if (vmCls && [vmCls respondsToSelector:shared]) {
         id vm = ((id (*)(Class, SEL))objc_msgSend)(vmCls, shared);
         SEL setMode = NSSelectorFromString(@"setRecordingStandbyMode:");
         SEL updMode = NSSelectorFromString(@"updateRecordingStandbyMode:");
-        SEL getMode = NSSelectorFromString(@"recordingStandbyMode");
         if (vm) {
-            if (getMode && [vm respondsToSelector:getMode])
-                WLog(@"PROBE VoiceInputManager.recordingStandbyMode(before)=%ld",
-                     (long)((NSInteger (*)(id,SEL))objc_msgSend)(vm, getMode));
-            if (setMode && [vm respondsToSelector:setMode])
-                ((void (*)(id,SEL,NSInteger))objc_msgSend)(vm, setMode, 1);
-            if (updMode && [vm respondsToSelector:updMode])
-                ((void (*)(id,SEL,NSInteger))objc_msgSend)(vm, updMode, 1);
-            if (getMode && [vm respondsToSelector:getMode])
-                WLog(@"PROBE VoiceInputManager.recordingStandbyMode(after)=%ld",
-                     (long)((NSInteger (*)(id,SEL))objc_msgSend)(vm, getMode));
+            if (setMode && [vm respondsToSelector:setMode]) ((void(*)(id,SEL,NSInteger))objc_msgSend)(vm,setMode,1);
+            if (updMode && [vm respondsToSelector:updMode]) ((void(*)(id,SEL,NSInteger))objc_msgSend)(vm,updMode,1);
         }
     } else {
         WLog(@"PROBE WBVoiceInputManager NOT found (无法置 recordingStandbyMode)");
     }
 
-    // (2) setup：建 pipController / pipSourceView / pipContentVC（若还没建）
-    if (!vSetup && [mgr respondsToSelector:setup]) {
-        WLog(@"PROBE calling setup");
-        ((void (*)(id, SEL))objc_msgSend)(mgr, setup);
-    }
-
+    // (2) setup：建 pipController / pipSourceView / pipContentVC（仅首次 isSetup=0）
+    if (!vSetup && [mgr respondsToSelector:setup]) { WLog(@"PROBE calling setup"); ((void(*)(id,SEL))objc_msgSend)(mgr,setup); }
     // (3) 启 standby 播放状态
-    if ([mgr respondsToSelector:setStandby])
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(mgr, setStandby, YES);
-
+    if ([mgr respondsToSelector:setStandby]) ((void(*)(id,SEL,BOOL))objc_msgSend)(mgr,setStandby,YES);
     // (4) prepare standby（gate 过才生效）
     if (![mgr respondsToSelector:standby]) { WLog(@"PROBE no -preparePictureInPictureForStandby"); return; }
-    ((void (*)(id, SEL))objc_msgSend)(mgr, standby);
+    ((void(*)(id,SEL))objc_msgSend)(mgr,standby);
     WLog(@"PROBE preparePictureInPictureForStandby INVOKED");
+    // (5) 真正 start PiP
+    if ([mgr respondsToSelector:startSel]) { WLog(@"PROBE calling startWithCompletionHandler:"); ((void(*)(id,SEL,id))objc_msgSend)(mgr,startSel,NULL); }
+}
 
-    // (5) 真正 start PiP；传 NULL 避免 block ABI 风险，靠下面轮询确认
-    if ([mgr respondsToSelector:startSel]) {
-        WLog(@"PROBE calling startWithCompletionHandler:");
-        ((void (*)(id, SEL, id))objc_msgSend)(mgr, startSel, NULL);
-    } else {
-        WLog(@"PROBE no -startWithCompletionHandler: (依赖 prepare 的 auto-start)");
-    }
+static void EnsureStandbyPiP(void) {
+    Class mgrCls = objc_getClass("WBVoiceInputPIPManager");
+    if (!mgrCls) { WLog(@"PROBE WBVoiceInputPIPManager NOT FOUND"); return; }
+    SEL shared = NSSelectorFromString(@"sharedInstance");
+    if (![mgrCls respondsToSelector:shared]) { WLog(@"PROBE no +sharedInstance"); return; }
+    id mgr = ((id (*)(Class, SEL))objc_msgSend)(mgrCls, shared);
+    if (!mgr) { WLog(@"PROBE sharedInstance nil"); return; }
 
-    // 轮询 isActive 确认是否真建立（0.5/1/2/4/8s）
-    for (NSNumber *secs in @[@(0.5), @(1.0), @(2.0), @(4.0), @(8.0)]) {
+    SEL isActive = NSSelectorFromString(@"isActive");
+    BOOL vActive = [mgr respondsToSelector:isActive] ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isActive) : NO;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    // 幂等 + 抗抖动：已 active 跳过；<2s 重复触发跳过（防双 dylib 反复戳单例崩安全模式）
+    if (vActive) { WLog(@"PROBE already active, skip"); return; }
+    if (now - gLastEngage < 2.0) { WLog(@"PROBE cooldown skip (last engage %.1fs ago)", now - gLastEngage); return; }
+    gLastEngage = now;
+
+    WLog(@"PROBE WBVoiceInputPIPManager found");
+    EngageOnce(mgr, 0);
+
+    // 轮询 + 重试：冷态 startPictureInPicture 概率成功（即便留前台也偶发失败，见 10:34:42 段）。
+    // 前台窗口内重 prepare+start 2 次（0.8s/1.6s）。一旦滑后台，重试也在后台必败 ——
+    // 所以真正关键是首次 start 压到前台尽快执行（见 TriggerOnMain 0 延迟）。
+    __block int attempt = 0;
+    for (NSNumber *secs in @[@(0.8), @(1.6)]) {
         double d = [secs doubleValue];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            BOOL active = [mgr respondsToSelector:isActive]
-                ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isActive) : NO;
+            BOOL active = [mgr respondsToSelector:isActive] ? ((BOOL(*)(id,SEL))objc_msgSend)(mgr,isActive) : NO;
+            WLog(@"PROBE t=%.1fs isActive=%d", d, (int)active);
+            if (!active && attempt < 2) {
+                attempt++;
+                WLog(@"PROBE retry engage (attempt %d) — 冷态 start 偶发失败，重 prepare+start", attempt);
+                EngageOnce(mgr, attempt);
+            }
+        });
+    }
+    // 尾部确认
+    for (NSNumber *secs in @[@(2.0), @(4.0), @(8.0)]) {
+        double d = [secs doubleValue];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            BOOL active = [mgr respondsToSelector:isActive] ? ((BOOL(*)(id,SEL))objc_msgSend)(mgr,isActive) : NO;
             WLog(@"PROBE t=%.1fs isActive=%d", d, (int)active);
         });
     }
 }
 
 static void TriggerOnMain(void) {
+    // 0 延迟：becomeActive 后下一个 run loop 立即执行，赶在用户滑后台挂起前把 PiP 拉起来。
+    // dispatch 定时器与 dyld 完全无关（dylib 在进程启动最早阶段已由 dyld 加载完，远早于本通知），
+    // 不存在抢锁风险；延迟越短，前台窗口越大，越不易被滑后台打断。
     dispatch_async(dispatch_get_main_queue(), ^{
         ProbeDelegate();
-        // 延迟压到 0.5s：足够让 UIWindowScene 变成 key window，又赶在用户滑后台挂起前
-        // 把 PiP 建起来。之前 1.2s 太晚 —— 用户快速滑后台后 app 被挂起，dispatch_after 不再触发 -> 失效。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            WLog(@"TRIGGER firing EnsureStandbyPiP");
-            EnsureStandbyPiP();
-        });
+        WLog(@"TRIGGER firing EnsureStandbyPiP (0-delay)");
+        EnsureStandbyPiP();
     });
 }
 
