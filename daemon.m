@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.9)
+//  wcvoicekeep daemon  (v1.9.10)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -74,9 +74,10 @@ static const int    kPipWaitTimeoutSec = 15;      // 等 dylib 报 pip.built 超
 static const int    kKillStaleSec     = 25;       // 进程在跑但迟迟无 pip.built -> kill 重试（锁屏僵尸）
 static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.daemon.log";
 
-// 前向声明：maybeWarmWechat / reWarm 定义在 registerNotifs 之后，但息屏回调里要用
+// 前向声明：maybeWarmWechat / reWarm / watchWechat 定义在 registerNotifs 之后，但回调里要用
 static void maybeWarmWechat(void);
 static void reWarm(void);
+static void watchWechat(void);
 
 // ===== 无头启动：SBS 后台 flag=1（首选），LSA active:NO（兜底）=====
 // SBS background flag=1 = 真后台启动（不显 UI）。LSA active:NO 仅兜底（会带 UI）。
@@ -207,6 +208,7 @@ static time_t gLastWarmup = 0; // pip.built 时间戳（日志参考）
 // 状态（warmupForeground 里要用，须先声明）
 static BOOL gPipUp = NO;       // dylib 确认 PiP 已建（自保活生效）
 static BOOL gScreenBlank = NO; // 屏幕熄灭（hasBlankedScreen 通知）
+static BOOL gLocked = NO;      // v1.9.10：设备锁定（lockstate 通知，1=锁定）——锁屏拉起输入法是僵尸没 PiP
 static time_t gWarmupLaunchTs = 0;
 
 static BOOL warmupForeground(void) {
@@ -262,7 +264,7 @@ static BOOL warmupForeground(void) {
 // ===== 触发：发 Darwin 通知让 dylib 兜底建 PiP =====
 static void postTrigger(void) {
     uint32_t st = notify_post(kTriggerName);
-    LOG(@"notify_post(%s) -> %u (0=ok)", kTriggerName, st);
+    if (st != 0) LOG(@"notify_post(%s) FAILED (%u)", kTriggerName, st); // 静默：成功不刷屏，失败才记
 }
 
 // ===== v1.9.1 状态机：dylib 反向通知 pip.built + 屏幕状态 =====
@@ -279,7 +281,7 @@ static void registerNotifs(void) {
         gLastWarmup = time(NULL);
         LOG(@"PIP.BUILT received -> warmup success, self keep-alive active");
     });
-    // 屏幕状态：1=息屏，0=亮屏/解锁
+    // 屏幕状态：1=息屏，0=亮屏
     static int scrToken = 0;
     notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &scrToken,
                              dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
@@ -287,14 +289,10 @@ static void registerNotifs(void) {
         notify_get_state(scrToken, &st);
         gScreenBlank = (st == 1);
         LOG(@"screen %@ (state=%llu)", gScreenBlank ? @"BLANK" : @"UNBLANK", (unsigned long long)st);
-        // v1.9.9：屏幕状态一变（息屏 OR 亮屏/解锁），只要 wetype 还没保活(gPipUp==NO)
-        // 就立即重拉，保证"注销后第一次拉起"：
-        //   - 息屏：无感补拉（锁屏拉起等解锁激活）
-        //   - 亮屏/解锁：注销后锁屏期预热没完成，解锁瞬间立即补完
-        // 重拉内部 gWarmingUp 防并发（回调线程 + 主循环 + 息屏事件可能同时触发）。
-        if (!gPipUp) {
-            LOG(@"screen %s & wetype not kept-alive -> immediate re-warm",
-                gScreenBlank ? @"BLANK" : @"UNBLANK");
+        watchWechat(); // 微信看护：屏幕事件也顺带查（微信无头不需激活，息屏/亮屏都拉）
+        // wetype：仅亮屏且未锁定时才拉（锁屏拉起是僵尸没 PiP，老板实测）。解锁由 lockstate 回调触发。
+        if (!gScreenBlank && !gLocked && !gPipUp) {
+            LOG(@"screen ON & unlocked & wetype not kept-alive -> immediate re-warm");
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                 gPipUp = NO;
                 reWarm();
@@ -302,7 +300,28 @@ static void registerNotifs(void) {
             });
         }
     });
-    LOG(@"notifs registered (pip.built + hasBlankedScreen)");
+
+    // v1.9.10 锁屏状态：1=锁定，0=解锁。锁屏拉起输入法是僵尸（无法激活没 PiP），
+    // 所以 wetype 只在解锁后重拉；微信无头拉起不受锁屏影响，照拉。
+    static int lockToken = 0;
+    notify_register_dispatch("com.apple.springboard.lockstate", &lockToken,
+                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
+        uint64_t st = 0;
+        notify_get_state(lockToken, &st);
+        gLocked = (st == 1);
+        LOG(@"lock %@ (state=%llu)", gLocked ? @"LOCKED" : @"UNLOCKED", (unsigned long long)st);
+        watchWechat(); // 微信：锁屏/解锁都拉（无头不需激活）
+        // 解锁瞬间：wetype 没保活 -> 立即重拉（补完注销后锁屏期没完成的预热）
+        if (!gLocked && !gPipUp) {
+            LOG(@"unlocked & wetype not kept-alive -> immediate re-warm");
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                gPipUp = NO;
+                reWarm();
+                if (gPipUp) maybeWarmWechat();
+            });
+        }
+    });
+    LOG(@"notifs registered (pip.built + hasBlankedScreen + lockstate)");
 }
 
 // 杀进程：锁屏期 SBS 拉起可能只起进程不激活（不建 PiP），杀掉让下轮重试激活
@@ -339,21 +358,19 @@ static void warmupOnce(void) {
     LOG(@"%@ no pip.built in %ds - will retry", kTargetBundleID, kPipWaitTimeoutSec);
 }
 
-// v1.9.2 重预热：不在跑就拉（老板要求：杀了/掉了要能重新拉起）。
-//   - 亮屏：试 3 次，间隔 5s（闪一次建 PiP，成功后自保活不再闪）
-//   - 息屏：只试 1 次（UnlockDevice 亮屏唤醒），失败后放 2min 长间隔，防屏幕反复亮
-// v1.9.8：加 gWarmingUp 防并发（息屏事件回调线程 + 主循环可能同时触发重拉）
+// v1.9.2 重预热：死了就拉（老板拍板）。v1.9.8 加 gWarmingUp 防并发
+// （回调线程 + 主循环可能同时触发）。v1.9.10：只在解锁态被调用，去掉息屏分支。
 static BOOL gWarmingUp = NO;
+static BOOL gLastAliveLogged = NO; // 日志静默：alive 状态只在翻转时打一次，不每 60s 刷屏
 static void reWarm(void) {
-    if (gWarmingUp) { LOG(@"reWarm: already warming, skip"); return; }
+    if (gWarmingUp) { return; } // 静默：防并发重试不刷屏
     gWarmingUp = YES;
-    int maxAttempts = gScreenBlank ? 1 : 3;
     int attempts = 0;
-    while (!gPipUp && attempts < maxAttempts) {
+    while (!gPipUp && attempts < 3) {
         @autoreleasepool { warmupOnce(); }
         if (gPipUp) break;
         attempts++;
-        sleep(gScreenBlank ? 120 : 5);
+        sleep(5);
     }
     gWarmingUp = NO;
 }
@@ -412,11 +429,16 @@ int main(int argc, char *argv[]) {
         LOG(@"sleeping %ds for SpringBoard...", kBootDelaySec);
         sleep(kBootDelaySec);
 
-        // 注销后立即预热：最多试 ~2 分钟（锁屏期无感重试；有密码则等你解锁激活）。
-        // 超时后交给 60s 看护 + 屏幕事件即时重拉（v1.9.9 不再受屏幕门控，保证必拉）。
-        LOG(@"boot warmup loop until pip.built (max ~2min)...");
+        // 注销后立即预热：最多试 ~2 分钟。锁屏期不拉输入法（僵尸没 PiP，老板要求），
+        // 等解锁——lockstate 回调会在解锁瞬间立即重拉补完。
+        LOG(@"boot warmup loop until pip.built (max ~2min, skip while LOCKED)...");
         time_t bootStart = time(NULL);
         while (!gPipUp && time(NULL) - bootStart < 120) {
+            if (gLocked) {
+                // 锁屏不拉输入法（拉起是僵尸没 PiP）；解锁由 lockstate 回调即时重拉
+                sleep(5);
+                continue;
+            }
             @autoreleasepool { warmupOnce(); }
             if (gPipUp) break;
             // v1.9.7：开机 30s 先拉微信（顺序仍是输入法先开始尝试，但不等 2min 窗口）
@@ -428,10 +450,9 @@ int main(int argc, char *argv[]) {
         // 兜底：循环结束还没拉过微信就补拉（防 2min 全在锁屏且 30s 点恰好没到）
         maybeWarmWechat();
 
-        // 守护循环（v1.9.9 老板拍板：死了就拉，不看屏幕——注销后第一次必拉，
-        // 接受偶尔亮屏闪一下换可靠拉起）：
-        //  - wetype：活着只发 trigger；死了/僵尸 -> 无条件 kill+重拉
-        //  - 微信：被杀就无头拉（不管息屏，无 UI 无打扰），120s 节流
+        // 守护循环（v1.9.10 老板拍板）：
+        //  - wetype：解锁态死了/僵尸 -> 无条件 kill+重拉（锁屏拉起是僵尸没 PiP，锁屏不拉）
+        //  - 微信：被杀就无头拉（不管锁屏/息屏，无 UI 无打扰），120s 节流
         while (1) {
             sleep(kCheckIntervalSec);
             @autoreleasepool {
@@ -439,22 +460,35 @@ int main(int argc, char *argv[]) {
 
                 if (isAppRunning(kTargetBundleID)) {
                     if (gPipUp) {
-                        LOG(@"%@ alive -> only trigger dylib", kTargetBundleID);
+                        // 静默：alive 状态只在从非 alive 翻转时打一次，周期性 tick 不刷屏
+                        if (!gLastAliveLogged) {
+                            gLastAliveLogged = YES;
+                            LOG(@"%@ alive -> keep-alive active (only trigger dylib)", kTargetBundleID);
+                        }
                         postTrigger();
-                    } else {
+                    } else if (!gLocked) {
+                        gLastAliveLogged = NO;
                         // 进程在但从未建 PiP（锁屏期拉起没激活的僵尸）-> 杀掉重试
-                        LOG(@"%@ running but NO pip.built (zombie) -> kill & re-warm", kTargetBundleID);
+                        LOG(@"%@ zombie & unlocked -> kill & re-warm", kTargetBundleID);
                         killApp();
                         gPipUp = NO;
                         reWarm();
                         if (gPipUp) maybeWarmWechat();
+                    } else {
+                        gLastAliveLogged = NO;
+                        LOG(@"%@ zombie & LOCKED -> skip (lock-screen pull is dead, no PiP)", kTargetBundleID);
                     }
                     continue;
                 }
-                LOG(@"%@ NOT running -> re-warm", kTargetBundleID);
-                gPipUp = NO;
-                reWarm();
-                if (gPipUp) maybeWarmWechat();
+                gLastAliveLogged = NO;
+                if (!gLocked) {
+                    LOG(@"%@ NOT running & unlocked -> re-warm", kTargetBundleID);
+                    gPipUp = NO;
+                    reWarm();
+                    if (gPipUp) maybeWarmWechat();
+                } else {
+                    LOG(@"%@ died & LOCKED -> skip wetype (lock-screen pull is dead, no PiP)", kTargetBundleID);
+                }
             }
         }
     }
