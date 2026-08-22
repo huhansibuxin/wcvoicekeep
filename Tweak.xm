@@ -205,17 +205,9 @@ static void EnsureStandbyPiP(void) {
     WLog(@"PROBE WBVoiceInputPIPManager found");
     EngageOnce(mgr, 0);
 
-    // v1.9.4：daemon 预热拉起时，1.5s 强制定时退后台（不等 isActive 轮询——老板实测
-    // "弹出来好几秒才进后台"）。PiP 若已在 completion/轮询里建好并退后台，此定时器
-    // 幂等跳过（AutoBackground 判 appState==Background return）。
-    // 手动拉起（IsWarmup=NO）不设此定时器，绝不打扰正常使用。
-    if (IsWarmup()) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            WLog(@"WARMUP force-background at 1.5s (keep-alive test)");
-            AutoBackground();
-        });
-    }
+    // v1.9.4 曾加 1.5s 强制定时退后台 —— 实测失败（01:17:12 日志：WillResignActive 时
+    // isActive=0，PiP 未建好就被退，App 挂起被清无法保活）。v1.9.5 回退：
+    // 等 PiP 确认（completion/轮询 isActive=1）再退后台 —— 闪屏时长 ≈ PiP 启动时间，压不掉。
 
     // 轮询 + 重试：冷态 startPictureInPicture 概率成功（即便留前台也偶发失败，见 10:34:42 段）。
     // 前台窗口内重 prepare+start 2 次（0.8s/1.6s）。一旦滑后台，重试也在后台必败 ——

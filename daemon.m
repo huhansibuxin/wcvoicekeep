@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.4)
+//  wcvoicekeep daemon  (v1.9.5)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -329,13 +329,23 @@ static void reWarm(void) {
 }
 
 // v1.9.4：无头拉起微信（后台 flag=1，不显 UI 不闪屏），让微信主 App 后台待命。
-// 仅注销后 wetype 预热完成、错开几秒后执行一次（gWechatWarmed 防重复）。
+// 仅 wetype 预热成功后错开几秒执行一次（gWechatWarmed 防重复）。
 static BOOL gWechatWarmed = NO;
 static void warmWechatHeadless(void) {
     if (!sbsReady() || !g_SBSLaunch) { LOG(@"wechat headless: SBS unavailable"); return; }
     int r = g_SBSLaunch((__bridge CFStringRef)kWechatBundleID, 1); // SBSApplicationLaunchFlagBackground
     LOG(@"wechat headless SBSLaunchApplicationWithIdentifier(%@, Background=1) -> %d (0=ok)",
         kWechatBundleID, r);
+}
+
+// v1.9.5：微信无头拉起封装（防重复）。开机路径 + 看护僵尸分支（开机锁屏导致预热稍后
+// 才成功）都会调，保证只要 wetype 预热成功过，微信就一定被拉起一次。
+static void maybeWarmWechat(void) {
+    if (gWechatWarmed) return;
+    gWechatWarmed = YES; // 先置位防重复（sleep 期间若重复进入也只会拉一次）
+    LOG(@"sleeping 5s then headless-pull WeChat...");
+    sleep(5);
+    warmWechatHeadless();
 }
 
 int main(int argc, char *argv[]) {
@@ -368,12 +378,7 @@ int main(int argc, char *argv[]) {
         LOG(@"boot warmup done (gPipUp=%d) -> entering 60s watch", (int)gPipUp);
 
         // 注销后：wetype 预热完成，错开 5s 无头拉起微信（后台、不显 UI）待命；仅一次
-        if (gPipUp && !gWechatWarmed) {
-            LOG(@"sleeping 5s then headless-pull WeChat...");
-            sleep(5);
-            warmWechatHeadless();
-            gWechatWarmed = YES;
-        }
+        if (gPipUp) maybeWarmWechat();
 
         // 守护循环：活着只发 trigger；中途死了只在息屏时重拉（亮屏绝不打扰视频/PiP/使用）
         while (1) {
@@ -389,6 +394,7 @@ int main(int argc, char *argv[]) {
                         killApp();
                         gPipUp = NO;
                         reWarm();
+                        if (gPipUp) maybeWarmWechat(); // 开机锁屏稍后成功 -> 补拉微信
                     }
                     continue;
                 }

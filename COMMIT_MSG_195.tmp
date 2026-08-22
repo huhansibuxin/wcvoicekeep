@@ -1,0 +1,17 @@
+fix(wcvoicekeep): 回退1.5s强退（实测保不住活）+ 微信拉起覆盖锁屏稍后成功边角 (v1.9.5)
+
+实测铁证（01:17 注销日志）：1.5s 强制定时退后台时 PiP 尚未建好
+  - 01:17:12 WillResignActive -> PiP isActive before bg = 0（PiP 没起来就被退）
+  - 01:17:13 t=4.0s 才 isActive=1 -> 但 App 已被强制退后台 -> 01:18:19 挂起被清、保活失败
+结论：闪屏时长 ≈ PiP 启动时间，压不掉；必须等 PiP 确认(isActive=1)再退后台才能保活。
+
+改动：
+  Tweak.xm：删 1.5s force-background 定时器（回退 v1.9.3 的"等 PiP 确认再退"，
+    completion + 轮询[0.4,1.0,1.8] + 尾部[2.5,4,8] 安全网不变）
+  daemon.m：maybeWarmWechat() 防重复封装（先置位再 sleep 5s），开机路径 +
+    看护僵尸分支（开机锁屏导致预热稍后才成功）都调，保证 wetype 预热成功就补拉微信
+
+control 1.9.4 -> 1.9.5。
+
+老板实测：注销 -> wetype 闪 ~2-4s（等 PiP 建好）-> 自动退后台保活 -> 5s 后微信无头拉起。
+重注入 WCVoiceKeep-dylib！
