@@ -1,15 +1,15 @@
 //
-//  wcvoicekeep daemon  (v1.8.7)
+//  wcvoicekeep daemon  (v1.9.0)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
-//  能在后台被无头拉起一次，让 dylib 用原生 PiP standby 接住（见 Tweak.xm）。
+//  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
 //
-//  === 架构（架构同 v1.8.0，本文件仅修 bug） ===
+//  === 架构 ===
 //    dylib(Tweak.xm, TF 注入主 App) : 监听 DidFinishLaunching / DidBecomeActive
-//                                     / 达尔文通知 com.wcvoicekeep.pip.trigger，
-//                                     任一发生就建立 PiP standby。
-//    daemon(本文件, LaunchDaemon)   : RunAtLoad 自动起 → 拉 Wetype 一次 → 发
-//                                     达尔文通知给 dylib 兜底建 PiP。
+//                                     / 达尔文通知 com.wcvoicekeep.pip.trigger；
+//                                     前台激活时建 PiP standby；预热模式下建完自动退后台。
+//    daemon(本文件, LaunchDaemon)   : RunAtLoad 自动起 → 前台预热 Wetype 一次（带
+//                                     --wcvk-warmup 参数）→ 之后 60s 轮询看护。
 //
 //  === v1.8.2 修复（根因） ===
 //  v1.8.1 用 dlopen SpringBoardServices + dlsym "SBSLaunchApplicationWithIdentifier"。
@@ -22,16 +22,19 @@
 //  第二参 active=NO 本意是后台拉起，但【实测 iOS 16 照样弹 UI】——active:NO 只是
 //  "不抢已运行 App 的前台"，新 App launch 时界面仍渲染。所以这条路做不到真无头。
 //
-//  === v1.8.7 修复（真无头启动）===
-//  要"无头/后台启动不显 UI"（同支付宝静默推送唤醒主 App 进后台），正确做法是
-//  SpringBoardServices 私有 API：
-//      int SBSLaunchApplicationWithIdentifier(CFStringRef bid, int flags);
-//  flags = 1 (SBSApplicationLaunchFlagBackground，sbutils -b 源码佐证 flags|=1)
-//  -> 主 App 收到 didFinishLaunching 即进 background，绝不上前台、不渲染 UI，
-//     dylib 在后台收到通知照样建 PiP standby（PiP 在 background 也能持续）。
-//  需要 entitlement：com.apple.springboard.launchapplications（entitlements.plist 已有）。
-//  iOS 16 上 SpringBoardServices 磁盘二进制被合进 dyld shared cache，dlopen 可能失败，
-//  所以 SBS 不可用时回退 LSA active:NO（仅兜底，会带 UI）。
+//  === v1.8.7 修复（无头启动，v1.9.0 弃用改预热）===
+//  SBSLaunchApplicationWithIdentifier(CFStringRef, int flags)，flags=1=Background 可无头拉起。
+//  但实测：后台拉起的 App 里 startPictureInPicture 被系统硬拒（UIScene 必须
+//  ForegroundActive，AVKit 错误 -1001），dylib 建不起 PiP -> 无保活凭证 -> App 挂起被杀。
+//  v1.8.8 音频保活（静音循环）能保活但耗 media 服务（老板否决）。
+//
+//  === v1.9.0 架构（最终，老板拍板）===
+//  唯一可行 = 开机后前台预热一次：
+//    1) 前台拉起让 App 激活出 UI（闪 ~0.5s，带 --wcvk-warmup 参数）
+//    2) dylib 立即建 PiP（isActive=1）
+//    3) dylib 判定预热 -> [[UIApplication suspend]] 自动退后台
+//    4) PiP 常驻后台 = 自保活凭证（无 media 服务、0 CPU），点语音按钮不跳转
+//  预热节流：成功拉起后 15min 内不重复（防反复闪屏）；锁屏期失败不记录，每 60s 重试。
 //
 //  进程存在检测也由 SBS 改 proc_listpids，避免 dlsym 失败时拿不到 pid 误判"未跑"。
 //
@@ -47,6 +50,7 @@
 #include <sys/proc.h>       // struct kinfo_proc / KERN_PROC_*
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>           // time() 预热节流
 
 // notify.h 在 theos iOS SDK 16.5 路径里默认找不全 - 手动声明 Darwin 通知 API
 // 而不依赖 <notify.h>。这是私有 API 但 iOS 13+ 名/segnature 都稳定。
@@ -164,56 +168,63 @@ static BOOL sbsReady(void) {
     return ok;
 }
 
-// ===== 核心：拉 Wetype 到 background（真无头，不显 UI）=====
-static void launchBackground(void) {
-    LOG(@"launchBackground called");
+// ===== 预热：前台拉起（激活出 UI）→ dylib 建 PiP → 自动退后台 =====
+// v1.9.0 架构（老板拍板）：后台起 PiP 被系统硬限制（UIScene 必须 ForegroundActive，
+// AVKit 错误 -1001 铁证，无私有 API 可绕）；音频保活又耗 media 服务（已否决）。
+// 唯一可行 = 开机后前台预热一次：
+//   1) 前台拉起让 App 激活出 UI（闪 ~0.5s）
+//   2) dylib 立即建 PiP（isActive=1）
+//   3) dylib 判定预热（--wcvk-warmup 参数）-> [[UIApplication suspend]] 自动退后台
+//   4) PiP 常驻后台 = 自保活凭证（无 media 服务、0 CPU），点语音按钮不跳转
+// 首选 SBSLaunchApplicationForDebugging 带 --wcvk-warmup 参数；
+// 兜底 SBS flag=0 前台激活 / LSA active:YES。
+static time_t gLastWarmup = 0;
+static const time_t kWarmupMinInterval = 900; // 15min：成功拉起后节流，防反复闪屏
 
-    // 首选：SBS 后台无头启动（flag=1 = SBSApplicationLaunchFlagBackground）
+static BOOL warmupForeground(void) {
+    LOG(@"warmupForeground called");
+    // (1) 首选：SBSLaunchApplicationForDebugging 带 --wcvk-warmup 参数（dylib 据此自动退后台）
     if (sbsReady() && g_SBSLaunch) {
-        int flags = 1; // SBSApplicationLaunchFlagBackground（sbutils -b 源码佐证 flags|=1）
-        int r = g_SBSLaunch((__bridge CFStringRef)kTargetBundleID, flags);
-        LOG(@"SBSLaunchApplicationWithIdentifier(%@, Background=1) -> %d (0=ok)", kTargetBundleID, r);
-        if (r == 0) { LOG(@"SBS background launch OK - no UI should appear"); return; }
-        LOG(@"SBS returned non-zero, fallback to LSA");
+        static int (*sbsDbg)(CFStringRef, CFURLRef, CFArrayRef, CFDictionaryRef,
+                             CFStringRef, CFStringRef, char) = NULL;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+                             RTLD_LAZY);
+            if (h) sbsDbg = dlsym(h, "SBSLaunchApplicationForDebugging");
+        });
+        if (sbsDbg) {
+            NSArray *args = @[@"--wcvk-warmup"];
+            int r = sbsDbg((__bridge CFStringRef)kTargetBundleID, NULL,
+                           (__bridge CFArrayRef)args, NULL, NULL, NULL, 0);
+            LOG(@"warmup SBSLaunchApplicationForDebugging(--wcvk-warmup) -> %d (0=ok)", r);
+            if (r == 0) return YES;
+            LOG(@"warmup debug-launch failed(%d), fallback", r);
+        } else {
+            LOG(@"warmup SBSLaunchApplicationForDebugging dlsym FAILED, fallback");
+        }
+        // (2) 兜底：SBS 普通前台激活（flag=0）；dylib 用「启动后<8s 且刚建 PiP」启发式判定
+        int r = g_SBSLaunch((__bridge CFStringRef)kTargetBundleID, 0);
+        LOG(@"warmup SBSLaunchApplicationWithIdentifier(flag=0) -> %d (0=ok)", r);
+        if (r == 0) return YES;
     }
-
-    // 兜底：LSA active:NO（iOS16 实测会带 UI，仅兜底用）
-    ensureLSFrameworkLoaded();   // 先确保 framework 已加载，类才找得到
+    // (3) 最后兜底：LSA active:YES 前台
+    ensureLSFrameworkLoaded();
     Class cls = NSClassFromString(@"LSApplicationWorkspace");
-    if (cls == Nil) {
-        LOG(@"[FATAL] LSApplicationWorkspace class not found even after dlopen - check framework path");
-        return;
-    }
+    if (cls == Nil) { LOG(@"[FATAL] LSApplicationWorkspace class not found"); return NO; }
     id ws = nil;
     @try { ws = [cls performSelector:@selector(defaultWorkspace)]; }
-    @catch (NSException *e) { LOG(@"[FATAL] defaultWorkspace threw: %@", e); return; }
-    if (ws == nil) { LOG(@"[FATAL] defaultWorkspace returned nil"); return; }
-
+    @catch (NSException *e) { LOG(@"[FATAL] defaultWorkspace threw: %@", e); return NO; }
+    if (ws == nil) { LOG(@"[FATAL] defaultWorkspace nil"); return NO; }
     SEL sel = NSSelectorFromString(@"openApplicationWithBundleID:active:");
-    if (![ws respondsToSelector:sel]) {
-        // 极旧版本兜底：openApplicationWithBundleID:
-        sel = NSSelectorFromString(@"openApplicationWithBundleID:");
-        if (![ws respondsToSelector:sel]) {
-            LOG(@"[FATAL] LSApplicationWorkspace has no openApplicationWithBundleID selector");
-            return;
-        }
-        @try {
-            BOOL ok = (BOOL)[ws performSelector:sel withObject:kTargetBundleID];
-            LOG(@"openApplicationWithBundleID: -> %d", ok);
-        } @catch (NSException *e) { LOG(@"[FATAL] old path threw: %@", e); }
-        return;
-    }
-
-    // active=NO = 不抢前台（但新 App launch 仍会渲染 UI，iOS16 实测）。
-    // 用 objc_msgSend 强转明确传 BOOL，避免 performSelector:withObject:
-    // 把 CFBoolean 指针当 BOOL 塞进参数寄存器造成错位。
+    if (![ws respondsToSelector:sel]) { LOG(@"[FATAL] no openApplicationWithBundleID:active:"); return NO; }
     BOOL ok = NO;
     @try {
         BOOL (*impl)(id, SEL, id, BOOL) = (BOOL(*)(id, SEL, id, BOOL))objc_msgSend;
-        ok = impl(ws, sel, kTargetBundleID, NO);
-    } @catch (NSException *e) { LOG(@"[FATAL] launch threw: %@", e); return; }
-    LOG(@"openApplicationWithBundleID:%@ active:NO -> ret=%d (UI may appear - SBS unavailable)",
-        kTargetBundleID, ok);
+        ok = impl(ws, sel, kTargetBundleID, YES);
+    } @catch (NSException *e) { LOG(@"[FATAL] LSA launch threw: %@", e); return NO; }
+    LOG(@"warmup LSA openApplicationWithBundleID:active:YES -> %d", ok);
+    return ok;
 }
 
 // ===== 触发：发 Darwin 通知让 dylib 兜底建 PiP =====
@@ -222,26 +233,34 @@ static void postTrigger(void) {
     LOG(@"notify_post(%s) -> %u (0=ok)", kTriggerName, st);
 }
 
-// ===== 主循环：定期检查，拉起后等 dylib 起来再发触发 =====
+// ===== 主循环：App 活着就只发 trigger；死了才预热（节流防反复闪屏）=====
+// 锁屏期预热失败（App 起不来/不激活）不记入节流 -> 每 60s 重试，锁屏下无闪屏可见；
+// 一旦成功拉起（PiP 自保活）进入 15min 节流，避免中途闪屏打扰。
 static void checkAndLaunch(void) {
     if (isAppRunning(kTargetBundleID)) {
         LOG(@"%@ alive -> only trigger dylib", kTargetBundleID);
         postTrigger();
         return;
     }
-    LOG(@"%@ NOT running -> background launch", kTargetBundleID);
-    launchBackground();
-    // 等 dylib 接 didFinishLaunching 建 PiP（最坏兜底是触发通知）
+    time_t now = time(NULL);
+    if (now - gLastWarmup < kWarmupMinInterval) {
+        LOG(@"%@ NOT running but warmup cooldown (%.0fs left) - skip", kTargetBundleID,
+            (double)(kWarmupMinInterval - (now - gLastWarmup)));
+        return;
+    }
+    LOG(@"%@ NOT running -> foreground warmup", kTargetBundleID);
+    warmupForeground();
+    BOOL cameUp = NO;
     for (int i = 0; i < kRelLaunchDelaySec; i++) {
         sleep(1);
-        if (isAppRunning(kTargetBundleID)) {
-            LOG(@"%@ up after %ds, firing trigger", kTargetBundleID, i+1);
-            postTrigger();
-            return;
-        }
+        if (isAppRunning(kTargetBundleID)) { cameUp = YES; break; }
     }
-    LOG(@"%@ did NOT come up in %ds - will retry next tick",
-        kTargetBundleID, kRelLaunchDelaySec);
+    if (cameUp) {
+        gLastWarmup = now; // 成功拉起才进节流（锁屏期失败不记录，下轮继续重试）
+        LOG(@"%@ up after warmup - dylib will build PiP & auto-background (self keep-alive)", kTargetBundleID);
+    } else {
+        LOG(@"%@ did NOT come up in %ds - retry next tick", kTargetBundleID, kRelLaunchDelaySec);
+    }
 }
 
 int main(int argc, char *argv[]) {
