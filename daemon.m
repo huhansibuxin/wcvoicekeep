@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.1)
+//  wcvoicekeep daemon  (v1.9.2)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -204,17 +204,21 @@ static BOOL warmupForeground(void) {
         });
         if (sbsDbg) {
             NSArray *args = @[@"--wcvk-warmup"];
+            // v1.9.2：息屏时带 SBSApplicationLaunchUnlockDevice(4) 亮屏唤醒预热
+            char flags = gScreenBlank ? 4 : 0;
             int r = sbsDbg((__bridge CFStringRef)kTargetBundleID, NULL,
-                           (__bridge CFArrayRef)args, NULL, NULL, NULL, 0);
-            LOG(@"warmup SBSLaunchApplicationForDebugging(--wcvk-warmup) -> %d (0=ok)", r);
+                           (__bridge CFArrayRef)args, NULL, NULL, NULL, flags);
+            LOG(@"warmup SBSLaunchApplicationForDebugging(--wcvk-warmup, flags=%d) -> %d (0=ok)", (int)flags, r);
             if (r == 0) return YES;
             LOG(@"warmup debug-launch failed(%d), fallback", r);
         } else {
             LOG(@"warmup SBSLaunchApplicationForDebugging dlsym FAILED, fallback");
         }
-        // (2) 兜底：SBS 普通前台激活（flag=0）；dylib 用「启动后<8s 且刚建 PiP」启发式判定
-        int r = g_SBSLaunch((__bridge CFStringRef)kTargetBundleID, 0);
-        LOG(@"warmup SBSLaunchApplicationWithIdentifier(flag=0) -> %d (0=ok)", r);
+        // (2) 兜底：SBS 前台激活（亮屏 flag=0；息屏 flag=4 亮屏唤醒）；
+        //     dylib 用「启动后<8s 且刚建 PiP」启发式判定
+        int flags = gScreenBlank ? 4 : 0;
+        int r = g_SBSLaunch((__bridge CFStringRef)kTargetBundleID, flags);
+        LOG(@"warmup SBSLaunchApplicationWithIdentifier(flags=%d) -> %d (0=ok)", flags, r);
         if (r == 0) return YES;
     }
     // (3) 最后兜底：LSA active:YES 前台
@@ -304,6 +308,20 @@ static void warmupOnce(void) {
     LOG(@"%@ no pip.built in %ds - will retry", kTargetBundleID, kPipWaitTimeoutSec);
 }
 
+// v1.9.2 重预热：不在跑就拉（老板要求：杀了/掉了要能重新拉起）。
+//   - 亮屏：试 3 次，间隔 5s（闪一次建 PiP，成功后自保活不再闪）
+//   - 息屏：只试 1 次（UnlockDevice 亮屏唤醒），失败后放 2min 长间隔，防屏幕反复亮
+static void reWarm(void) {
+    int maxAttempts = gScreenBlank ? 1 : 3;
+    int attempts = 0;
+    while (!gPipUp && attempts < maxAttempts) {
+        @autoreleasepool { warmupOnce(); }
+        if (gPipUp) break;
+        attempts++;
+        sleep(gScreenBlank ? 120 : 5);
+    }
+}
+
 int main(int argc, char *argv[]) {
     // 早期 stderr（不依赖 Foundation/ObjC runtime）——
     // launchd 任何阶段拒收(进程类型/entitlement/签名/sandbox)都能立刻看到，
@@ -322,15 +340,11 @@ int main(int argc, char *argv[]) {
         LOG(@"sleeping %ds for SpringBoard...", kBootDelaySec);
         sleep(kBootDelaySec);
 
-        // 快速预热循环：尽早拉起（锁屏期每 ~20s 重试，解锁后 ~5s 内闪屏建 PiP）
-        while (!gPipUp) {
-            @autoreleasepool { warmupOnce(); }
-            if (gPipUp) break;
-            sleep(kFastRetrySec);
-        }
-        LOG(@"warmup complete (gPipUp=YES) -> entering 60s watch");
+        // 开机预热（尽早）：亮屏快试 / 息屏亮屏唤醒试一次
+        reWarm();
+        LOG(@"boot warmup done (gPipUp=%d) -> entering 60s watch", (int)gPipUp);
 
-        // 守护循环
+        // 守护循环：活着只发 trigger；死了重拉（杀了/掉了都能恢复）
         while (1) {
             sleep(kCheckIntervalSec);
             @autoreleasepool {
@@ -339,21 +353,10 @@ int main(int argc, char *argv[]) {
                     postTrigger();
                     continue;
                 }
-                // App 死了：
-                //  - 屏幕亮 -> 绝不自动重预热（老板要求：前台用着别闪），降级到下次注销
-                //  - 屏幕灭 -> 静默重预热（无感），带 15min 节流
+                LOG(@"%@ NOT running -> re-warm (screen %s)", kTargetBundleID,
+                    gScreenBlank ? "BLANK" : "ON");
                 gPipUp = NO;
-                time_t now = time(NULL);
-                if (gScreenBlank && now - gLastWarmup >= kWarmupMinInterval) {
-                    LOG(@"%@ died & screen BLANK -> silent re-warm", kTargetBundleID);
-                    while (!gPipUp) {
-                        @autoreleasepool { warmupOnce(); }
-                        if (gPipUp) break;
-                        sleep(kFastRetrySec);
-                    }
-                } else {
-                    LOG(@"%@ died & screen ON -> NO auto re-warm (avoid mid-session flash); degraded until respring", kTargetBundleID);
-                }
+                reWarm();
             }
         }
     }

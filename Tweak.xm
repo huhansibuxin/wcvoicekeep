@@ -170,8 +170,20 @@ static void EngageOnce(id mgr, int attempt) {
     if (![mgr respondsToSelector:standby]) { WLog(@"PROBE no -preparePictureInPictureForStandby"); return; }
     ((void(*)(id,SEL))objc_msgSend)(mgr,standby);
     WLog(@"PROBE preparePictureInPictureForStandby INVOKED");
-    // (5) 真正 start PiP
-    if ([mgr respondsToSelector:startSel]) { WLog(@"PROBE calling startWithCompletionHandler:"); ((void(*)(id,SEL,id))objc_msgSend)(mgr,startSel,NULL); }
+    // (5) 真正 start PiP —— v1.9.2：传完成回调，PiP 一建好立刻报 daemon + 退后台（零轮询延迟）。
+    // 安全：block 体忽略参数语义（不读入参，防 wetype 真实签名是 ^(void)/^(NSError*) 时崩），
+    // 且回调内再核 isActive 实况 —— 若回调是"将要开始"而非"已完成"，isActive=0 则跳过，
+    // 由下方轮询兜底，绝不提前退。
+    if ([mgr respondsToSelector:startSel]) {
+        WLog(@"PROBE calling startWithCompletionHandler:(completion)");
+        void (^completion)(BOOL) = ^(BOOL ok) {
+            SEL ia = NSSelectorFromString(@"isActive");
+            BOOL act = [mgr respondsToSelector:ia] ? ((BOOL(*)(id,SEL))objc_msgSend)(mgr,ia) : NO;
+            WLog(@"PROBE startWithCompletionHandler fired ok=%d isActive=%d", (int)ok, (int)act);
+            if (act && IsWarmup()) WarmupDone(); // PiP 真建好 -> 立即报+退后台
+        };
+        ((void(*)(id,SEL,id))objc_msgSend)(mgr,startSel,completion);
+    }
 }
 
 static void EnsureStandbyPiP(void) {

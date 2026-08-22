@@ -1,0 +1,28 @@
+feat(wcvoicekeep): 息屏亮屏唤醒预热 + 杀掉自动重拉 + PiP 建好即退 (v1.9.2)
+
+老板拍板三点：
+  1. 息屏也要能拉起：warmupForeground 在 gScreenBlank 时带 SBSApplicationLaunchUnlockDevice(4)
+     亮屏唤醒 -> App 激活建 PiP -> 自动退后台。息屏只试 1 次、失败放 2min 长间隔，防屏幕反复亮。
+  2. 杀了/掉了要重拉：守护循环不在跑就 reWarm()（亮屏试 3 次间隔 5s；60s 轮询天然节流）。
+     移除 v1.9.1 的「亮屏不重预热」限制（老板确认可接受偶尔闪一次换功能恢复）。
+  3. 退出压快：Tweak.xm EngageOnce 的 startWithCompletionHandler: 从 NULL 改传完成回调，
+     PiP 一建好立即 WarmupDone()（报 pip.built + suspend 退后台），零轮询延迟；
+     安全设计：block 忽略入参语义（防签名差异崩）+ 回调内再核 isActive（防"将要开始"回调误退），
+     轮询 [0.4,1.0,1.8] 仍保留兜底。
+
+daemon.m：
+  - warmupForeground: flags = gScreenBlank ? 4 : 0（SBSApplicationLaunchUnlockDevice）
+  - 新增 reWarm()：亮屏 maxAttempts=3 / 息屏 maxAttempts=1 + sleep 120s
+  - main(): 开机 reWarm() 一次；60s 看护不在跑就 reWarm()
+
+Tweak.xm：
+  - EngageOnce (5)：startWithCompletionHandler: 传 completion block（isActive 实况核验 + WarmupDone）
+
+control 1.9.1 -> 1.9.2。
+
+老板实测：
+  - 息屏注销 -> 屏幕自动亮一次做预热（无锁屏密码则真能息屏拉起；有 Face ID/密码则激活等解锁）
+  - 杀 wetype -> 下个 60s tick 重拉闪一次 -> PiP 恢复
+  - 闪屏明显变短：wcvoicekeep.log 应有 startWithCompletionHandler fired ok=1 isActive=1
+    -> posted pip.built -> suspend（不再等 0.4s 轮询）
+  - 重注入 WCVoiceKeep-dylib！
