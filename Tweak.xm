@@ -83,6 +83,34 @@ static void ProbeStateProbe(void) {
     }
 }
 
+// 探测 WBVoiceInputPolicy（standby 模式开关类，主 App 内）
+static void ProbePolicyAndEngage(void) {
+    Class polCls = objc_getClass("WBVoiceInputPolicy");
+    WLog(@"PROBE WBVoiceInputPolicy class = %@", polCls ?: @"(nil)");
+    if (!polCls) return;
+    SEL shared = NSSelectorFromString(@"sharedInstance");
+    SEL recMode = NSSelectorFromString(@"recordingStandbyMode");
+    SEL should  = NSSelectorFromString(@"shouldUsePIPStandbyMode");
+    SEL isPip   = NSSelectorFromString(@"isPipSupported");
+    WLog(@"PROBE Policy responds shared=%d recMode=%d shouldUse=%d isPip=%d",
+         (int)class_respondsToSelector(polCls, shared),
+         (int)class_respondsToSelector(polCls, recMode),
+         (int)class_respondsToSelector(polCls, should),
+         (int)class_respondsToSelector(polCls, isPip));
+    if (!class_respondsToSelector(polCls, shared)) return;
+    id pol = ((id (*)(Class, SEL))objc_msgSend)(polCls, shared);
+    if (!pol) return;
+    if ([pol respondsToSelector:recMode])
+        WLog(@"PROBE Policy.recordingStandbyMode = %ld",
+             (long)((NSInteger (*)(id, SEL))objc_msgSend)(pol, recMode));
+    if ([pol respondsToSelector:isPip])
+        WLog(@"PROBE Policy.isPipSupported = %d",
+             (int)((BOOL (*)(id, SEL))objc_msgSend)(pol, isPip));
+    if ([pol respondsToSelector:should])
+        WLog(@"PROBE Policy.shouldUsePIPStandbyMode = %d",
+             (int)((BOOL (*)(id, SEL))objc_msgSend)(pol, should));
+}
+
 // 幂等触发主 App 自建 PiP standby，并探测每一步是否成功
 static void EnsureStandbyPiP(void) {
     Class mgrCls = objc_getClass("WBVoiceInputPIPManager");
@@ -96,62 +124,48 @@ static void EnsureStandbyPiP(void) {
 
     SEL isActive    = NSSelectorFromString(@"isActive");
     SEL isSupported = NSSelectorFromString(@"isSupported");
-    SEL picCtl      = NSSelectorFromString(@"pictureInPictureController");
-    SEL picPossible = NSSelectorFromString(@"isPictureInPicturePossible");
-    SEL standbyMode = NSSelectorFromString(@"recordingStandbyMode");
-    SEL startPIP    = NSSelectorFromString(@"startPictureInPicture");
     SEL setStandby  = NSSelectorFromString(@"setStandbyPlaybackStateEnabled:");
 
-    WLog(@"PROBE mgr=%@ responds isActive=%d isSupported=%d picCtl=%d picPossible=%d standbyMode=%d startPIP=%d setStandby=%d",
-         mgr,
-         (int)[mgr respondsToSelector:isActive],
-         (int)[mgr respondsToSelector:isSupported],
-         (int)[mgr respondsToSelector:picCtl],
-         (int)[mgr respondsToSelector:picPossible],
-         (int)[mgr respondsToSelector:standbyMode],
-         (int)[mgr respondsToSelector:startPIP],
-         (int)[mgr respondsToSelector:setStandby]);
+    BOOL vActive    = [mgr respondsToSelector:isActive]    ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isActive) : NO;
+    BOOL vSupported = [mgr respondsToSelector:isSupported] ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isSupported) : NO;
+    WLog(@"PROBE mgr isActive(value)=%d isSupported(value)=%d setStandby responds=%d",
+         (int)vActive, (int)vSupported, (int)[mgr respondsToSelector:setStandby]);
+
+    // 先确认 standby 模式开关（WBVoiceInputPolicy.recordingStandbyMode）是不是 0 导致 prepare 早退
+    ProbePolicyAndEngage();
 
     SEL standby = NSSelectorFromString(@"preparePictureInPictureForStandby");
     if (![mgr respondsToSelector:standby]) { WLog(@"PROBE no -preparePictureInPictureForStandby"); return; }
 
+    // 若 Policy 存在且 recordingStandbyMode==0，先置 1 再 prepare（假设 shouldUsePIPStandbyMode 门控）
+    Class polCls = objc_getClass("WBVoiceInputPolicy");
+    if (polCls) {
+        SEL pshared = NSSelectorFromString(@"sharedInstance");
+        SEL precMode = NSSelectorFromString(@"recordingStandbyMode");
+        SEL psetMode = NSSelectorFromString(@"setRecordingStandbyMode:");
+        if (class_respondsToSelector(polCls, pshared) && class_respondsToSelector(polCls, psetMode)) {
+            id pol = ((id (*)(Class, SEL))objc_msgSend)(polCls, pshared);
+            if (pol && [pol respondsToSelector:precMode] && [pol respondsToSelector:psetMode]) {
+                NSInteger cur = ((NSInteger (*)(id, SEL))objc_msgSend)(pol, precMode);
+                WLog(@"PROBE Policy pre-set recordingStandbyMode=%ld -> forcing 1", (long)cur);
+                ((void (*)(id, SEL, NSInteger))objc_msgSend)(pol, psetMode, 1);
+            }
+        }
+    }
+
     ((void (*)(id, SEL))objc_msgSend)(mgr, standby);
     WLog(@"PROBE preparePictureInPictureForStandby INVOKED on %@", mgr);
 
-    // 多时间点轮询 isActive + 查 picController 是否建立 + 查 WBVoiceStateProbe 标志
+    // 多时间点轮询 isActive，确认是否真建立
     for (NSNumber *secs in @[@(0.5), @(1.0), @(2.0), @(4.0)]) {
         double d = [secs doubleValue];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             BOOL active = [mgr respondsToSelector:isActive]
                 ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isActive) : NO;
-            id ctl = [mgr respondsToSelector:picCtl]
-                ? ((id (*)(id, SEL))objc_msgSend)(mgr, picCtl) : nil;
-            WLog(@"PROBE t=%.1fs isActive=%d picController=%@",
-                 d, (int)active, ctl ?: @"(nil)");
-            ProbeStateProbe();
+            WLog(@"PROBE t=%.1fs isActive=%d", d, (int)active);
         });
     }
-
-    // 兜底实验：若 prepare 后仍无 active，尝试直接 setStandbyPlaybackStateEnabled:1 + startPictureInPicture
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        BOOL active = [mgr respondsToSelector:isActive]
-            ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isActive) : NO;
-        if (!active) {
-            WLog(@"PROBE fallback: prepare 后仍未 active，尝试 setStandby:1 + startPIP");
-            if ([mgr respondsToSelector:setStandby])
-                ((void (*)(id, SEL, BOOL))objc_msgSend)(mgr, setStandby, YES);
-            if ([mgr respondsToSelector:startPIP])
-                ((void (*)(id, SEL))objc_msgSend)(mgr, startPIP);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                BOOL a2 = ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isActive);
-                WLog(@"PROBE fallback after startPIP t=5.5s isActive=%d", (int)a2);
-                ProbeStateProbe();
-            });
-        }
-    });
 }
 
 static void TriggerOnMain(void) {
