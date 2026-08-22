@@ -19,6 +19,12 @@
 static NSString *gLogPath = nil;
 static const char *const kTriggerName = "com.wcvoicekeep.pip.trigger";
 
+// 抗双注入 / 抗重复触发：
+//   1) gRegistered —— 构造器若被两个 dylib 各跑一次，只注册一次通知，避免事件被触发 N 遍（日志打 24 遍的根因）
+//   2) gLastEngage —— 同一进程内短间隔不要反复 setup/start 同一个 PiP 单例，避免状态互相踩导致崩
+static BOOL gRegistered = NO;
+static NSTimeInterval gLastEngage = 0;
+
 static void InitLogPath(void) {
     if (gLogPath) return;
     NSArray<NSString *> *cands = @[
@@ -112,6 +118,14 @@ static void EnsureStandbyPiP(void) {
     BOOL vActive    = [mgr respondsToSelector:isActive]    ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isActive) : NO;
     BOOL vSupported = [mgr respondsToSelector:isSupported] ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isSupported) : NO;
     BOOL vSetup     = [mgr respondsToSelector:isSetup]     ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isSetup) : NO;
+
+    // 幂等 + 抗抖动：已经 active 就别再 setup/start（PiP 在后台也能保活，重复戳同一个单例反而危险）；
+    // 短间隔(<2s)重复触发直接跳过，避免双 dylib / 多次事件下反复调用导致状态互相踩、崩进安全模式。
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (vActive) { WLog(@"PROBE already active, skip re-engage"); return; }
+    if (now - gLastEngage < 2.0) { WLog(@"PROBE cooldown skip (last engage %.1fs ago)", now - gLastEngage); return; }
+    gLastEngage = now;
+
     WLog(@"PROBE mgr isActive=%d isSupported=%d isSetup=%d", (int)vActive, (int)vSupported, (int)vSetup);
 
     // (1) 打开 standby 模式开关 —— 在 WBVoiceInputManager 上（不是 Policy）
@@ -175,7 +189,9 @@ static void EnsureStandbyPiP(void) {
 static void TriggerOnMain(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         ProbeDelegate();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+        // 延迟压到 0.5s：足够让 UIWindowScene 变成 key window，又赶在用户滑后台挂起前
+        // 把 PiP 建起来。之前 1.2s 太晚 —— 用户快速滑后台后 app 被挂起，dispatch_after 不再触发 -> 失效。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             WLog(@"TRIGGER firing EnsureStandbyPiP");
             EnsureStandbyPiP();
@@ -193,6 +209,11 @@ __attribute__((constructor)) static void __wcVKInit(void) {
         }
         WLog(@"CTOR injected into WeChat Keyboard, registering triggers");
 
+        // 去重：若构造器被两个 dylib 各跑一次（旧版没删+新版同注），只注册一次，
+        // 避免同一事件被触发 N 遍（日志打 24 遍、并反复戳 PiP 单例导致崩进安全模式）。
+        if (gRegistered) { WLog(@"CTOR already registered (duplicate dylib load?) -> skip re-register"); return; }
+        gRegistered = YES;
+
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationDidBecomeActiveNotification
                         object:nil
@@ -200,6 +221,18 @@ __attribute__((constructor)) static void __wcVKInit(void) {
                     usingBlock:^(NSNotification *note) {
             WLog(@"EVT UIApplicationDidBecomeActive -> TriggerOnMain");
             TriggerOnMain();
+        }];
+
+        // 退后台前探针：确认 PiP 是否已在建。若退后台前 isActive=0，说明用户滑太快/没建起来
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationWillResignActiveNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            Class mc = objc_getClass("WBVoiceInputPIPManager");
+            id m = mc ? ((id (*)(Class,SEL))objc_msgSend)(mc, NSSelectorFromString(@"sharedInstance")) : nil;
+            BOOL a = m ? ((BOOL (*)(id,SEL))objc_msgSend)(m, NSSelectorFromString(@"isActive")) : NO;
+            WLog(@"EVT UIApplicationWillResignActive -> PiP isActive before bg = %d  (0=来不及建，下次前台会重试)", (int)a);
         }];
 
         [[NSNotificationCenter defaultCenter]
