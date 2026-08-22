@@ -1,6 +1,30 @@
 #!/bin/bash
-# wcvoicekeep: 安装完成后自动加载 LaunchDaemon，无需重启手机
+# wcvoicekeep: 安装完成后自动加载 LaunchDaemon，无需手动操作。
+# iOS 16 rootless 注意：
+#   - plist 必须 root:wheel 且 0644，binary 必须 0755 root:wheel，否则 launchd 拒绝执行。
+#   - 新 launchd 优先用 bootstrap+kickstart；老环境回退到 load+start。
+#   - RunAtLoad 已设：若本次激活失败，重启/重越狱后 launchd 也会自动拉起。
+
 PLIST=/var/jb/Library/LaunchDaemons/com.wcvoicekeep.daemon.plist
+BIN=/var/jb/usr/bin/wcvoicekeep
+LABEL=com.wcvoicekeep.daemon
+
+# 修正属主/权限（rootless daemon 强要求）
+chown root:wheel "$PLIST" 2>/dev/null || true
+chmod 0644 "$PLIST" 2>/dev/null || true
+chown root:wheel "$BIN" 2>/dev/null || true
+chmod 0755 "$BIN" 2>/dev/null || true
+
+# 先卸后载，确保最新配置生效
 launchctl unload "$PLIST" >/dev/null 2>&1 || true
-launchctl load "$PLIST" >/dev/null 2>&1 || true
+launchctl bootout system "$LABEL" >/dev/null 2>&1 || true
+
+# iOS 16 新 launchd：bootstrap + kickstart（立即拉起）
+if launchctl bootstrap system "$PLIST" >/dev/null 2>&1; then
+    launchctl kickstart -k system/"$LABEL" >/dev/null 2>&1 || true
+# 老 launchd 兜底：load + start
+elif launchctl load "$PLIST" >/dev/null 2>&1; then
+    launchctl start "$LABEL" >/dev/null 2>&1 || true
+fi
+
 exit 0

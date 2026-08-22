@@ -20,7 +20,19 @@ WCVoiceKeep_FRAMEWORKS = UIKit
 WCVoiceKeep_LDFLAGS = -Wl,-no_warn_inits -F$(THEOS_PROJECT_DIR)/Frameworks -framework CydiaSubstrate
 WCVoiceKeep_CFLAGS = -fobjc-arc -fno-modules -w
 
+# ===== 守护进程（注销/重启后自动把 Wetype 主 App 后台拉起，触发 dylib 建 PiP standby）=====
+# rootless 下 TOOL_INSTALL_PATH=/usr/bin -> 实际落到 /var/jb/usr/bin/wcvoicekeep，
+# 与 layout 里 com.wcvoicekeep.daemon.plist 的 Program 路径一致。
+TOOL_NAME = wcvoicekeep
+wcvoicekeep_FILES = daemon.m
+wcvoicekeep_INSTALL_PATH = /usr/bin
+wcvoicekeep_FRAMEWORKS = Foundation
+# 关键：SBSLaunchApplicationWithIdentifier 需要 com.apple.springboard.launchapplications 权限，
+# 不签这个 entitlement，daemon 拉 App 会被拒/被杀。
+wcvoicekeep_CODESIGN_FLAGS = -S$(THEOS_PROJECT_DIR)/entitlements.plist
+
 include $(THEOS_MAKE_PATH)/tweak.mk
+include $(THEOS_MAKE_PATH)/tool.mk
 
 before-package::
 	@chmod 755 layout/DEBIAN/postinst

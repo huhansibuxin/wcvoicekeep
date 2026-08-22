@@ -13,6 +13,11 @@
 //  standby 一旦活，键盘扩展 requireJumpToMainAppForRecording 恒 0 → 零跳转。
 //
 //  daemon 生命周期：LaunchDaemon RunAtLoad + KeepAlive。
+//  编译：见 Makefile 的 TOOL_NAME=wcvoicekeep（rootless 落到 /var/jb/usr/bin/wcvoicekeep），
+//        并用 entitlements.plist（含 com.apple.springboard.launchapplications）ldid 签名，
+//        否则 SBSLaunchApplicationWithIdentifier 会被拒 -> daemon 拉不起 Wetype。
+//  无闪：kLaunchSuspended=TRUE -> 纯后台 suspended 拉起，不进前台，故开机/respring 不闪；
+//        主 App 收到 DidFinishLaunching -> dylib 建 PiP standby（见 Tweak.xm）。
 //
 
 #import <Foundation/Foundation.h>
@@ -26,8 +31,8 @@ static NSString *const kTargetBundleID = @"com.tencent.wetype";
 static const char *const kTriggerName = "com.wcvoicekeep.pip.trigger";
 static const int kCheckIntervalSec = 60;   // 存活轮询间隔
 static const int kBootDelaySec = 10;        // 开机等 SpringBoard 就绪
-static const Boolean kLaunchSuspended = FALSE; // 前台拉起才能建 PiP standby
-static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.log";
+static const Boolean kLaunchSuspended = TRUE;  // 纯后台 suspended 拉起：不进前台=无闪；DidFinishLaunching 触发 dylib 建 PiP
+static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.daemon.log";
 
 // ===== SpringBoardServices 动态加载 =====
 static int (*SBSLaunchApplicationWithIdentifier)(CFStringRef, Boolean) = NULL;

@@ -17,8 +17,8 @@
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>StandardOutPath</key>
-	<string>/var/mobile/wcvoicekeep.out</string>
+	<string>/var/mobile/wcvoicekeep.daemon.out</string>
 	<key>StandardErrorPath</key>
-	<string>/var/mobile/wcvoicekeep.err</string>
+	<string>/var/mobile/wcvoicekeep.daemon.err</string>
 </dict>
 </plist>
