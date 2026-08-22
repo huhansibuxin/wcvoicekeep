@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.0)
+//  wcvoicekeep daemon  (v1.9.1)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -51,17 +51,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>           // time() 预热节流
+#include <signal.h>         // SIGKILL
 
 // notify.h 在 theos iOS SDK 16.5 路径里默认找不全 - 手动声明 Darwin 通知 API
-// 而不依赖 <notify.h>。这是私有 API 但 iOS 13+ 名/segnature 都稳定。
+// 而不依赖 <notify.h>。这是私有 API 但 iOS 13+ 名/签名都稳定。
 extern uint32_t notify_post(const char *name);
+extern uint32_t notify_register_dispatch(const char *name, int *out_token,
+                                         dispatch_queue_t queue, void (^handler)(int));
+extern uint32_t notify_get_state(int token, uint64_t *state);
+
+#define SBS_PATH "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices"
 
 // ===== 配置 =====
 static NSString *const kTargetBundleID = @"com.tencent.wetype";
 static const char    *const kTriggerName = "com.wcvoicekeep.pip.trigger"; // 与 Tweak.xm 一致
-static const int    kBootDelaySec     = 10;        // 开机等 SpringBoard
-static const int    kCheckIntervalSec = 60;        // 守护轮询
-static const int    kRelLaunchDelaySec = 6;        // 拉起后等 dylib 起来
+static const char    *const kPipBuiltName = "com.wcvoicekeep.pip.built";  // dylib->daemon：PiP 已建
+static const int    kBootDelaySec     = 3;        // 开机等 SpringBoard（原 10s，尽早预热）
+static const int    kCheckIntervalSec = 60;       // 守护轮询
+static const int    kFastRetrySec     = 5;        // 预热快循环间隔（锁屏期重试）
+static const int    kPipWaitTimeoutSec = 15;      // 等 dylib 报 pip.built 超时
+static const int    kKillStaleSec     = 25;       // 进程在跑但迟迟无 pip.built -> kill 重试（锁屏僵尸）
 static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.daemon.log";
 
 // ===== 无头启动：SBS 后台 flag=1（首选），LSA active:NO（兜底）=====
@@ -233,34 +242,66 @@ static void postTrigger(void) {
     LOG(@"notify_post(%s) -> %u (0=ok)", kTriggerName, st);
 }
 
-// ===== 主循环：App 活着就只发 trigger；死了才预热（节流防反复闪屏）=====
-// 锁屏期预热失败（App 起不来/不激活）不记入节流 -> 每 60s 重试，锁屏下无闪屏可见；
-// 一旦成功拉起（PiP 自保活）进入 15min 节流，避免中途闪屏打扰。
-static void checkAndLaunch(void) {
+// ===== v1.9.1 状态机：dylib 反向通知 pip.built + 屏幕状态 =====
+// 为什么：isAppRunning 只能判断"进程在"，区分不了"带着 PiP 活着"还是"锁屏期起的僵尸"。
+// 让 dylib 建好 PiP 后反向发 Darwin 通知 com.wcvoicekeep.pip.built，daemon 才知道预热真成功。
+static BOOL gPipUp = NO;      // dylib 确认 PiP 已建（自保活生效）
+static BOOL gScreenBlank = NO; // 屏幕熄灭（hasBlankedScreen 通知）
+static time_t gWarmupLaunchTs = 0;
+
+static void registerNotifs(void) {
+    // pip.built：走后台队列（main 线程在 sleep 轮询，主队列 block 不会执行）
+    static int pipToken = 0;
+    notify_register_dispatch(kPipBuiltName, &pipToken,
+                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
+        gPipUp = YES;
+        gLastWarmup = time(NULL);
+        LOG(@"PIP.BUILT received -> warmup success, self keep-alive active");
+    });
+    // 屏幕状态：1=熄屏（可无感重预热），0=亮屏（绝不中途闪）
+    static int scrToken = 0;
+    notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &scrToken,
+                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
+        uint64_t st = 0;
+        notify_get_state(scrToken, &st);
+        gScreenBlank = (st == 1);
+        LOG(@"screen %@ (state=%llu)", gScreenBlank ? @"BLANK" : @"UNBLANK", (unsigned long long)st);
+    });
+    LOG(@"notifs registered (pip.built + hasBlankedScreen)");
+}
+
+// 杀进程：锁屏期 SBS 拉起可能只起进程不激活（不建 PiP），杀掉让下轮重试激活
+static void killApp(void) {
+    static int (*pidFn)(CFStringRef, pid_t *) = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen(SBS_PATH, RTLD_LAZY);
+        if (h) pidFn = dlsym(h, "SBSProcessIDForDisplayIdentifier");
+    });
+    if (!pidFn) { LOG(@"killApp: SBSProcessIDForDisplayIdentifier unavailable"); return; }
+    pid_t pid = 0;
+    if (pidFn((__bridge CFStringRef)kTargetBundleID, &pid) == 0 && pid > 0) {
+        kill(pid, SIGKILL);
+        LOG(@"kill %@ pid=%d (SIGKILL) - retry activation next cycle", kTargetBundleID, (int)pid);
+    }
+}
+
+// 一次预热尝试：没起 -> 前台拉起等 pip.built；起了但超时无 pip.built -> kill 重试
+static void warmupOnce(void) {
+    if (gPipUp) return;
     if (isAppRunning(kTargetBundleID)) {
-        LOG(@"%@ alive -> only trigger dylib", kTargetBundleID);
-        postTrigger();
+        if (time(NULL) - gWarmupLaunchTs > kKillStaleSec) killApp();
         return;
     }
-    time_t now = time(NULL);
-    if (now - gLastWarmup < kWarmupMinInterval) {
-        LOG(@"%@ NOT running but warmup cooldown (%.0fs left) - skip", kTargetBundleID,
-            (double)(kWarmupMinInterval - (now - gLastWarmup)));
-        return;
-    }
-    LOG(@"%@ NOT running -> foreground warmup", kTargetBundleID);
+    gWarmupLaunchTs = time(NULL);
+    LOG(@"%@ NOT running -> foreground warmup (attempt)", kTargetBundleID);
     warmupForeground();
-    BOOL cameUp = NO;
-    for (int i = 0; i < kRelLaunchDelaySec; i++) {
+    // 等 dylib 报 pip.built（非阻塞轮询，最多 kPipWaitTimeoutSec 秒）
+    for (int i = 0; i < kPipWaitTimeoutSec; i++) {
+        if (gPipUp) return;
         sleep(1);
-        if (isAppRunning(kTargetBundleID)) { cameUp = YES; break; }
     }
-    if (cameUp) {
-        gLastWarmup = now; // 成功拉起才进节流（锁屏期失败不记录，下轮继续重试）
-        LOG(@"%@ up after warmup - dylib will build PiP & auto-background (self keep-alive)", kTargetBundleID);
-    } else {
-        LOG(@"%@ did NOT come up in %ds - retry next tick", kTargetBundleID, kRelLaunchDelaySec);
-    }
+    LOG(@"%@ no pip.built in %ds - will retry", kTargetBundleID, kPipWaitTimeoutSec);
 }
 
 int main(int argc, char *argv[]) {
@@ -274,18 +315,46 @@ int main(int argc, char *argv[]) {
     @autoreleasepool {
         LOG(@"==== daemon boot ====");
         LOG(@"pid=%d uid=%d argv0=%s", getpid(), getuid(), argv[0] ?: "?");
-        LOG(@"target=%@ trigger=%s", kTargetBundleID, kTriggerName);
+        LOG(@"target=%@ trigger=%s pipBuilt=%s", kTargetBundleID, kTriggerName, kPipBuiltName);
         LOG(@"log=%@", kLogPath);
 
-        // 初次启动：给 SpringBoard 时间
+        registerNotifs();
         LOG(@"sleeping %ds for SpringBoard...", kBootDelaySec);
         sleep(kBootDelaySec);
-        @autoreleasepool { checkAndLaunch(); }
+
+        // 快速预热循环：尽早拉起（锁屏期每 ~20s 重试，解锁后 ~5s 内闪屏建 PiP）
+        while (!gPipUp) {
+            @autoreleasepool { warmupOnce(); }
+            if (gPipUp) break;
+            sleep(kFastRetrySec);
+        }
+        LOG(@"warmup complete (gPipUp=YES) -> entering 60s watch");
 
         // 守护循环
         while (1) {
             sleep(kCheckIntervalSec);
-            @autoreleasepool { checkAndLaunch(); }
+            @autoreleasepool {
+                if (isAppRunning(kTargetBundleID)) {
+                    LOG(@"%@ alive -> only trigger dylib", kTargetBundleID);
+                    postTrigger();
+                    continue;
+                }
+                // App 死了：
+                //  - 屏幕亮 -> 绝不自动重预热（老板要求：前台用着别闪），降级到下次注销
+                //  - 屏幕灭 -> 静默重预热（无感），带 15min 节流
+                gPipUp = NO;
+                time_t now = time(NULL);
+                if (gScreenBlank && now - gLastWarmup >= kWarmupMinInterval) {
+                    LOG(@"%@ died & screen BLANK -> silent re-warm", kTargetBundleID);
+                    while (!gPipUp) {
+                        @autoreleasepool { warmupOnce(); }
+                        if (gPipUp) break;
+                        sleep(kFastRetrySec);
+                    }
+                } else {
+                    LOG(@"%@ died & screen ON -> NO auto re-warm (avoid mid-session flash); degraded until respring", kTargetBundleID);
+                }
+            }
         }
     }
     return 0;

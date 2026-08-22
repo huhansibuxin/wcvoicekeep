@@ -79,6 +79,14 @@ static void AutoBackground(void) {
     }
 }
 
+// v1.9.1：预热完成 —— 反向通知 daemon「PiP 已建」（daemon 据此确认预热成功、
+// 停止快循环进入 60s 看护），然后立即自动退后台。
+static void WarmupDone(void) {
+    uint32_t st = notify_post("com.wcvoicekeep.pip.built");
+    WLog(@"WARMUP posted com.wcvoicekeep.pip.built -> %u (0=ok)", st);
+    AutoBackground();
+}
+
 // 探针：记录真实 UIApplication 委托类名，验证「AppDelegate 假设」对不对
 static void ProbeDelegate(void) {
     UIApplication *app = [UIApplication sharedApplication];
@@ -189,18 +197,19 @@ static void EnsureStandbyPiP(void) {
     // 前台窗口内重 prepare+start 2 次（0.8s/1.6s）。一旦滑后台，重试也在后台必败 ——
     // 所以真正关键是首次 start 压到前台尽快执行（见 TriggerOnMain 0 延迟）。
     __block int attempt = 0;
-    for (NSNumber *secs in @[@(0.8), @(1.6)]) {
+    // v1.9.1：首次检测提前到 0.4s（原 0.8s），闪屏更短；起不来再 1.0/1.8 补刀
+    for (NSNumber *secs in @[@(0.4), @(1.0), @(1.8)]) {
         double d = [secs doubleValue];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             BOOL active = [mgr respondsToSelector:isActive] ? ((BOOL(*)(id,SEL))objc_msgSend)(mgr,isActive) : NO;
             WLog(@"PROBE t=%.1fs isActive=%d", d, (int)active);
             if (active) {
-                // v1.9.0：预热拉起 -> 建完 PiP 立即自动退后台（PiP 持续 = 自保活，0 CPU）
-                if (IsWarmup()) AutoBackground();
+                // v1.9.0/1.9.1：预热拉起 -> 建完 PiP 立即报 daemon + 自动退后台（PiP 持续 = 自保活，0 CPU）
+                if (IsWarmup()) WarmupDone();
                 return;
             }
-            if (attempt < 2) {
+            if (attempt < 3) {
                 attempt++;
                 WLog(@"PROBE retry engage (attempt %d) — 冷态 start 偶发失败，重 prepare+start", attempt);
                 EngageOnce(mgr, attempt);
@@ -208,14 +217,14 @@ static void EnsureStandbyPiP(void) {
         });
     }
     // 尾部确认
-    for (NSNumber *secs in @[@(2.0), @(4.0), @(8.0)]) {
+    for (NSNumber *secs in @[@(2.5), @(4.0), @(8.0)]) {
         double d = [secs doubleValue];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             BOOL active = [mgr respondsToSelector:isActive] ? ((BOOL(*)(id,SEL))objc_msgSend)(mgr,isActive) : NO;
             WLog(@"PROBE t=%.1fs isActive=%d", d, (int)active);
             if (active) {
-                if (IsWarmup()) AutoBackground();   // 兜底：PiP 已建但还没退后台
+                if (IsWarmup()) WarmupDone();   // 兜底：PiP 已建但还没退后台
             } else if (IsWarmup() && d >= 4.0) {
                 WLog(@"WARMUP PiP still not active at %.1fs -> background anyway (avoid stuck UI)", d);
                 AutoBackground();   // 安全网：预热时绝不让 UI 一直占屏
