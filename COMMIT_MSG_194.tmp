@@ -1,0 +1,29 @@
+fix(wcvoicekeep): 精确判死(排除键盘扩展进程) + 微信错开无头拉起 + 预热1.5s强退 (v1.9.4)
+
+老板实测发现的核心 bug：杀了主 App 后熄屏也不重拉。
+根因：isAppRunning 用 strstr(comm,"wxkb") 匹配，键盘扩展进程名 wxkb_plugin 也命中
+      -> 主 App(wxkb) 被杀后 daemon 仍以为"活着" -> 永远走 alive 分支不重拉。
+修复（123）：
+  1. isAppRunning 改 strcmp 精确匹配（wxkb / wetype / WxKeyboard），排除 *_plugin。
+  2. 开机预热循环加 2min 超时：超时进 60s 看护，看护里新增"僵尸分支"——
+     进程在但 gPipUp==NO（锁屏期拉起没激活）-> killApp + reWarm，不再无限卡死。
+  3. SBSLaunchApplicationForDebugging 返回 7（参数拉起被拒）-> 保留 fallback
+     SBSLaunchApplicationWithIdentifier(flag=0)（实测可用），dylib 的 <8s 启发式
+     兜底预热判定；日志已打返回码便于观察。
+新增（老板要求）：
+  4. 注销后 wetype 预热完成 -> 错开 5s 无头拉起微信（com.tencent.xin, flag=1 后台
+     不显 UI）待命，仅开机一次（gWechatWarmed）。
+  5. 预热 1.5s 强制退后台：Tweak.xm EnsureStandbyPiP 里 IsWarmup() 时设 1.5s 定时器
+     AutoBackground（幂等，PiP 已退就跳过）——解决"弹出来好几秒才进后台"；
+     手动拉起（IsWarmup=NO）不设，绝不打扰正常使用。
+
+daemon.m：isAppRunning 精确匹配 / boot 2min 超时 + 僵尸分支 / kWechatBundleID +
+         warmWechatHeadless() / gWechatWarmed
+Tweak.xm：1.5s force-background (warmup only)
+control 1.9.3 -> 1.9.4。
+
+老板实测：
+  - 杀 wetype 主 App（键盘扩展还在跑）-> 下个 60s tick 判死 -> 息屏时重拉恢复
+  - 注销 -> wetype 预热完成 -> 5s 后微信无头拉起（无闪屏）
+  - 预热拉起 1.5s 内退后台，看 PiP 能否保活（日志看 isActive / pip.built）
+  - 重注入 WCVoiceKeep-dylib！

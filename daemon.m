@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.3)
+//  wcvoicekeep daemon  (v1.9.4)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -64,6 +64,7 @@ extern uint32_t notify_get_state(int token, uint64_t *state);
 
 // ===== 配置 =====
 static NSString *const kTargetBundleID = @"com.tencent.wetype";
+static NSString *const kWechatBundleID = @"com.tencent.xin"; // 注销后错开无头拉起（老板要求）
 static const char    *const kTriggerName = "com.wcvoicekeep.pip.trigger"; // 与 Tweak.xm 一致
 static const char    *const kPipBuiltName = "com.wcvoicekeep.pip.built";  // dylib->daemon：PiP 已建
 static const int    kBootDelaySec     = 3;        // 开机等 SpringBoard（原 10s，尽早预热）
@@ -118,9 +119,12 @@ static BOOL isAppRunning(NSString *bundleID) {
     for (int i = 0; i < n; i++) {
         const char *comm = procs[i].kp_proc.p_comm;
         if (comm[0] == 0) continue;
-        if (strstr(comm, "wetype") != NULL ||
-            strstr(comm, "WxKeyboard") != NULL ||
-            strstr(comm, "wxkb") != NULL) { found = YES; break; }
+        // v1.9.4：精确匹配主 App。进程名就是 wxkb；键盘扩展进程名是 wxkb_plugin，
+        // 用 strstr("wxkb") 会把扩展进程误判成"活着" -> 主 App 被杀也不重拉（老板实测 bug）。
+        // 必须 strcmp 精确匹配，排除 *_plugin。
+        if (strcmp(comm, "wxkb") == 0 ||
+            strcmp(comm, "wetype") == 0 ||
+            strcmp(comm, "WxKeyboard") == 0) { found = YES; break; }
     }
     free(procs);
     return found;
@@ -324,6 +328,16 @@ static void reWarm(void) {
     }
 }
 
+// v1.9.4：无头拉起微信（后台 flag=1，不显 UI 不闪屏），让微信主 App 后台待命。
+// 仅注销后 wetype 预热完成、错开几秒后执行一次（gWechatWarmed 防重复）。
+static BOOL gWechatWarmed = NO;
+static void warmWechatHeadless(void) {
+    if (!sbsReady() || !g_SBSLaunch) { LOG(@"wechat headless: SBS unavailable"); return; }
+    int r = g_SBSLaunch((__bridge CFStringRef)kWechatBundleID, 1); // SBSApplicationLaunchFlagBackground
+    LOG(@"wechat headless SBSLaunchApplicationWithIdentifier(%@, Background=1) -> %d (0=ok)",
+        kWechatBundleID, r);
+}
+
 int main(int argc, char *argv[]) {
     // 早期 stderr（不依赖 Foundation/ObjC runtime）——
     // launchd 任何阶段拒收(进程类型/entitlement/签名/sandbox)都能立刻看到，
@@ -342,22 +356,40 @@ int main(int argc, char *argv[]) {
         LOG(@"sleeping %ds for SpringBoard...", kBootDelaySec);
         sleep(kBootDelaySec);
 
-        // 注销后立即预热：一直重试到成功（有锁屏密码则等你解锁激活；锁屏期无感）
-        LOG(@"boot warmup loop until pip.built...");
-        while (!gPipUp) {
+        // 注销后立即预热：最多试 ~2 分钟（锁屏期无感重试；有密码则等你解锁激活）。
+        // v1.9.4 加超时，避免极端情况无限卡死；超时后交给 60s 看护（僵尸分支处理）。
+        LOG(@"boot warmup loop until pip.built (max ~2min)...");
+        time_t bootStart = time(NULL);
+        while (!gPipUp && time(NULL) - bootStart < 120) {
             @autoreleasepool { warmupOnce(); }
             if (gPipUp) break;
             sleep(kFastRetrySec);
         }
-        LOG(@"boot warmup complete (gPipUp=YES) -> entering 60s watch");
+        LOG(@"boot warmup done (gPipUp=%d) -> entering 60s watch", (int)gPipUp);
+
+        // 注销后：wetype 预热完成，错开 5s 无头拉起微信（后台、不显 UI）待命；仅一次
+        if (gPipUp && !gWechatWarmed) {
+            LOG(@"sleeping 5s then headless-pull WeChat...");
+            sleep(5);
+            warmWechatHeadless();
+            gWechatWarmed = YES;
+        }
 
         // 守护循环：活着只发 trigger；中途死了只在息屏时重拉（亮屏绝不打扰视频/PiP/使用）
         while (1) {
             sleep(kCheckIntervalSec);
             @autoreleasepool {
                 if (isAppRunning(kTargetBundleID)) {
-                    LOG(@"%@ alive -> only trigger dylib", kTargetBundleID);
-                    postTrigger();
+                    if (gPipUp) {
+                        LOG(@"%@ alive -> only trigger dylib", kTargetBundleID);
+                        postTrigger();
+                    } else {
+                        // 开机超时后残留僵尸：进程在但从未建 PiP（锁屏期拉起没激活）-> 杀掉重试
+                        LOG(@"%@ running but NO pip.built (zombie) -> kill & re-warm", kTargetBundleID);
+                        killApp();
+                        gPipUp = NO;
+                        reWarm();
+                    }
                     continue;
                 }
                 if (gScreenBlank) {
