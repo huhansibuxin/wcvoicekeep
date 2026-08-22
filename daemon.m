@@ -190,6 +190,11 @@ static BOOL sbsReady(void) {
 static time_t gLastWarmup = 0;
 static const time_t kWarmupMinInterval = 900; // 15min：成功拉起后节流，防反复闪屏
 
+// 状态（warmupForeground 里要用，须先声明）
+static BOOL gPipUp = NO;       // dylib 确认 PiP 已建（自保活生效）
+static BOOL gScreenBlank = NO; // 屏幕熄灭（hasBlankedScreen 通知）
+static time_t gWarmupLaunchTs = 0;
+
 static BOOL warmupForeground(void) {
     LOG(@"warmupForeground called");
     // (1) 首选：SBSLaunchApplicationForDebugging 带 --wcvk-warmup 参数（dylib 据此自动退后台）
@@ -249,9 +254,7 @@ static void postTrigger(void) {
 // ===== v1.9.1 状态机：dylib 反向通知 pip.built + 屏幕状态 =====
 // 为什么：isAppRunning 只能判断"进程在"，区分不了"带着 PiP 活着"还是"锁屏期起的僵尸"。
 // 让 dylib 建好 PiP 后反向发 Darwin 通知 com.wcvoicekeep.pip.built，daemon 才知道预热真成功。
-static BOOL gPipUp = NO;      // dylib 确认 PiP 已建（自保活生效）
-static BOOL gScreenBlank = NO; // 屏幕熄灭（hasBlankedScreen 通知）
-static time_t gWarmupLaunchTs = 0;
+// （gPipUp / gScreenBlank / gWarmupLaunchTs 声明在 warmupForeground 之前）
 
 static void registerNotifs(void) {
     // pip.built：走后台队列（main 线程在 sleep 轮询，主队列 block 不会执行）
