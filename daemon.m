@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.8.2)
+//  wcvoicekeep daemon  (v1.8.6)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  能在后台被无头拉起一次，让 dylib 用原生 PiP standby 接住（见 Tweak.xm）。
@@ -28,6 +28,8 @@
 //        在 daemon 上下文仍受 entitlement 管控，缺这个会被拒)。
 //
 #include <Foundation/Foundation.h>
+#include <objc/message.h>   // objc_msgSend (强转调 active: BOOL 参数)
+#include <dlfcn.h>          // dlopen LSApplicationWorkspace 所在 framework
 #include <sys/sysctl.h>
 #include <sys/param.h>      // PATH_MAX
 #include <sys/proc.h>       // struct kinfo_proc / KERN_PROC_*
@@ -101,12 +103,35 @@ static BOOL isAppRunning(NSString *bundleID) {
     return found;
 }
 
+// ===== 关键：daemon 是独立进程，默认不链接 MobileCoreServices/LSApplicationWorkspace
+// framework，NSClassFromString(@"LSApplicationWorkspace") 会返回 NULL → 之前的
+// [FATAL] class not found。必须显式 dlopen 让 dyld 把 ObjC 类注册进 runtime。
+// iOS 16 上 LSApplicationWorkspace 在 MobileCoreServices.framework（旧）里，
+// 同时 iOS 14+ 也独立成 PrivateFrameworks/LSApplicationWorkspace.framework，
+// 两处都试，谁先注册成功就用谁的。
+static void ensureLSFrameworkLoaded(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *cands[] = {
+            "/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices",
+            "/System/Library/PrivateFrameworks/LSApplicationWorkspace.framework/LSApplicationWorkspace",
+            NULL
+        };
+        for (int i = 0; cands[i]; i++) {
+            void *h = dlopen(cands[i], RTLD_LAZY | RTLD_GLOBAL);
+            if (h) LOG(@"dlopen %s OK", cands[i]);
+            else  LOG(@"dlopen %s FAILED: %s", cands[i], dlerror());
+        }
+    });
+}
+
 // ===== 核心：拉 Wetype 到 background =====
 static void launchBackground(void) {
     LOG(@"launchBackground called");
+    ensureLSFrameworkLoaded();   // 先确保 framework 已加载，类才找得到
     Class cls = NSClassFromString(@"LSApplicationWorkspace");
     if (cls == Nil) {
-        LOG(@"[FATAL] LSApplicationWorkspace class not found in this process - cannot launch");
+        LOG(@"[FATAL] LSApplicationWorkspace class not found even after dlopen - check framework path");
         return;
     }
     id ws = nil;
@@ -129,11 +154,13 @@ static void launchBackground(void) {
         return;
     }
 
-    // 关键：active=NO = 后台拉起（不闪前台、不进 UI）
+    // 关键：active=NO = 后台拉起（不闪前台、不进 UI）。
+    // 用 objc_msgSend 强转明确传 BOOL，避免 performSelector:withObject:
+    // 把 CFBoolean 指针当 BOOL 塞进参数寄存器造成错位（之前 active 传值隐患）。
     BOOL ok = NO;
     @try {
-        ok = (BOOL)[ws performSelector:sel withObject:kTargetBundleID
-                            withObject:(__bridge id)kCFBooleanFalse];
+        BOOL (*impl)(id, SEL, id, BOOL) = (BOOL(*)(id, SEL, id, BOOL))objc_msgSend;
+        ok = impl(ws, sel, kTargetBundleID, NO);
     } @catch (NSException *e) { LOG(@"[FATAL] launch threw: %@", e); return; }
     LOG(@"openApplicationWithBundleID:%@ active:NO -> ret=%d",
         kTargetBundleID, ok);

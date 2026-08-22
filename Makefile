@@ -26,7 +26,9 @@ WCVoiceKeep_CFLAGS = -fobjc-arc -fno-modules -w
 TOOL_NAME = wcvoicekeep
 wcvoicekeep_FILES = daemon.m
 wcvoicekeep_INSTALL_PATH = /usr/bin
-wcvoicekeep_FRAMEWORKS = Foundation
+# Foundation + MobileCoreServices：LSApplicationWorkspace 类在 MobileCoreServices
+# framework 里，daemon 独立进程必须显式链接/ dlopen 才能 NSClassFromString 找到。
+wcvoicekeep_FRAMEWORKS = Foundation MobileCoreServices
 # 关键：SBSLaunchApplicationWithIdentifier 需要 com.apple.springboard.launchapplications 权限，
 # 不签这个 entitlement，daemon 拉 App 会被拒/被杀。
 wcvoicekeep_CODESIGN_FLAGS = -S$(THEOS_PROJECT_DIR)/entitlements.plist
