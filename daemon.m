@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.2)
+//  wcvoicekeep daemon  (v1.9.3)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -187,8 +187,7 @@ static BOOL sbsReady(void) {
 //   4) PiP 常驻后台 = 自保活凭证（无 media 服务、0 CPU），点语音按钮不跳转
 // 首选 SBSLaunchApplicationForDebugging 带 --wcvk-warmup 参数；
 // 兜底 SBS flag=0 前台激活 / LSA active:YES。
-static time_t gLastWarmup = 0;
-static const time_t kWarmupMinInterval = 900; // 15min：成功拉起后节流，防反复闪屏
+static time_t gLastWarmup = 0; // pip.built 时间戳（日志参考）
 
 // 状态（warmupForeground 里要用，须先声明）
 static BOOL gPipUp = NO;       // dylib 确认 PiP 已建（自保活生效）
@@ -343,11 +342,16 @@ int main(int argc, char *argv[]) {
         LOG(@"sleeping %ds for SpringBoard...", kBootDelaySec);
         sleep(kBootDelaySec);
 
-        // 开机预热（尽早）：亮屏快试 / 息屏亮屏唤醒试一次
-        reWarm();
-        LOG(@"boot warmup done (gPipUp=%d) -> entering 60s watch", (int)gPipUp);
+        // 注销后立即预热：一直重试到成功（有锁屏密码则等你解锁激活；锁屏期无感）
+        LOG(@"boot warmup loop until pip.built...");
+        while (!gPipUp) {
+            @autoreleasepool { warmupOnce(); }
+            if (gPipUp) break;
+            sleep(kFastRetrySec);
+        }
+        LOG(@"boot warmup complete (gPipUp=YES) -> entering 60s watch");
 
-        // 守护循环：活着只发 trigger；死了重拉（杀了/掉了都能恢复）
+        // 守护循环：活着只发 trigger；中途死了只在息屏时重拉（亮屏绝不打扰视频/PiP/使用）
         while (1) {
             sleep(kCheckIntervalSec);
             @autoreleasepool {
@@ -356,10 +360,13 @@ int main(int argc, char *argv[]) {
                     postTrigger();
                     continue;
                 }
-                LOG(@"%@ NOT running -> re-warm (screen %s)", kTargetBundleID,
-                    gScreenBlank ? "BLANK" : "ON");
-                gPipUp = NO;
-                reWarm();
+                if (gScreenBlank) {
+                    LOG(@"%@ died & screen BLANK -> silent re-warm", kTargetBundleID);
+                    gPipUp = NO;
+                    reWarm();
+                } else {
+                    LOG(@"%@ died & screen ON -> NO re-warm (avoid interrupting video/PiP); degraded until lock/respring", kTargetBundleID);
+                }
             }
         }
     }
