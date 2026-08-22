@@ -1,30 +1,40 @@
-#!/bin/bash
-# wcvoicekeep: 安装完成后自动加载 LaunchDaemon，无需手动操作。
-# iOS 16 rootless 注意：
-#   - plist 必须 root:wheel 且 0644，binary 必须 0755 root:wheel，否则 launchd 拒绝执行。
-#   - 新 launchd 优先用 bootstrap+kickstart；老环境回退到 load+start。
-#   - RunAtLoad 已设：若本次激活失败，重启/重越狱后 launchd 也会自动拉起。
+#!/bin/sh
+# wcvoicekeep: 安装后自动激活 LaunchDaemon（iOS 16 rootless / NathanLR）。
+#
+# 关键教训（v1.8.0 实测失败根因）：
+#   iOS 16 自带 launchctl 对 `bootstrap` 子命令不可靠（社区已知 bug：第三方 daemon 不加载，
+#   bootstrap 会吞错/返回 0 但实际没注册），故 v1.8.0 把 bootstrap 放第一优先 -> daemon 永不起。
+#   修正：优先用最原生的 `launchctl load`（iOS launchctl 最支持），bootstrap 仅作兜底；
+#   两者都跑，最后 enable + kickstart + start 强制拉起。
+#   另：RunAtLoad 已设，重启/重越狱后 launchd 会扫描 /var/jb/Library/LaunchDaemons 自动 RunAtLoad，双保险。
 
 PLIST=/var/jb/Library/LaunchDaemons/com.wcvoicekeep.daemon.plist
 BIN=/var/jb/usr/bin/wcvoicekeep
 LABEL=com.wcvoicekeep.daemon
 
-# 修正属主/权限（rootless daemon 强要求）
+# 1) 修正属主/权限（rootless daemon 强要求，否则 launchd 拒绝执行）
 chown root:wheel "$PLIST" 2>/dev/null || true
 chmod 0644 "$PLIST" 2>/dev/null || true
 chown root:wheel "$BIN" 2>/dev/null || true
 chmod 0755 "$BIN" 2>/dev/null || true
 
-# 先卸后载，确保最新配置生效
+# 2) 清除上一个版本的日志（避免新旧日志混淆，符合“更新清日志”约定；老板在外不必 SSH 手清）
+rm -f /var/mobile/wcvoicekeep.log \
+      /var/mobile/wcvoicekeep.daemon.log \
+      /var/mobile/wcvoicekeep.daemon.out \
+      /var/mobile/wcvoicekeep.daemon.err 2>/dev/null || true
+
+# 3) 先卸后载，避免 "already loaded" 报错
 launchctl unload "$PLIST" >/dev/null 2>&1 || true
 launchctl bootout system "$LABEL" >/dev/null 2>&1 || true
 
-# iOS 16 新 launchd：bootstrap + kickstart（立即拉起）
-if launchctl bootstrap system "$PLIST" >/dev/null 2>&1; then
-    launchctl kickstart -k system/"$LABEL" >/dev/null 2>&1 || true
-# 老 launchd 兜底：load + start
-elif launchctl load "$PLIST" >/dev/null 2>&1; then
-    launchctl start "$LABEL" >/dev/null 2>&1 || true
-fi
+# 4) 激活：iOS 16 优先 launchctl load（原生最稳）；bootstrap 作兜底；都忽略错误
+launchctl load "$PLIST" >/dev/null 2>&1 || true
+launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true
+# 覆盖 override 数据库可能的 Disabled 标记
+launchctl enable system/"$LABEL" >/dev/null 2>&1 || true
+# 立即拉起
+launchctl kickstart -k system/"$LABEL" >/dev/null 2>&1 || true
+launchctl start "$LABEL" >/dev/null 2>&1 || true
 
 exit 0
