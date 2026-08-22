@@ -83,39 +83,18 @@ static void ProbeStateProbe(void) {
     }
 }
 
-// 探测 WBVoiceInputPolicy（standby 模式开关类，主 App 内）
-static void ProbePolicyAndEngage(void) {
-    Class polCls = objc_getClass("WBVoiceInputPolicy");
-    WLog(@"PROBE WBVoiceInputPolicy class = %@", polCls ?: @"(nil)");
-    if (!polCls) return;
-    SEL shared = NSSelectorFromString(@"sharedInstance");
-    SEL recMode = NSSelectorFromString(@"recordingStandbyMode");
-    SEL should  = NSSelectorFromString(@"shouldUsePIPStandbyMode");
-    SEL isPip   = NSSelectorFromString(@"isPipSupported");
-    WLog(@"PROBE Policy responds shared=%d recMode=%d shouldUse=%d isPip=%d",
-         (int)class_respondsToSelector(polCls, shared),
-         (int)class_respondsToSelector(polCls, recMode),
-         (int)class_respondsToSelector(polCls, should),
-         (int)class_respondsToSelector(polCls, isPip));
-    if (!class_respondsToSelector(polCls, shared)) return;
-    id pol = ((id (*)(Class, SEL))objc_msgSend)(polCls, shared);
-    if (!pol) return;
-    if ([pol respondsToSelector:recMode])
-        WLog(@"PROBE Policy.recordingStandbyMode = %ld",
-             (long)((NSInteger (*)(id, SEL))objc_msgSend)(pol, recMode));
-    if ([pol respondsToSelector:isPip])
-        WLog(@"PROBE Policy.isPipSupported = %d",
-             (int)((BOOL (*)(id, SEL))objc_msgSend)(pol, isPip));
-    if ([pol respondsToSelector:should])
-        WLog(@"PROBE Policy.shouldUsePIPStandbyMode = %d",
-             (int)((BOOL (*)(id, SEL))objc_msgSend)(pol, should));
-}
-
-// 幂等触发主 App 自建 PiP standby，并探测每一步是否成功
+// 真正启动 PiP standby 的正确顺序（来自本地 wxkb 二进制的 ObjC 元数据分析）：
+//   开关 gate: WBVoiceInputManager.recordingStandbyMode 必须 =1
+//             (+[WBVoiceInputPolicy shouldUsePIPStandbyMode] = recordingStandbyMode==1 && isPipSupported)
+//   建 controller: WBVoiceInputPIPManager setup (建 pipController/pipSourceView/pipContentVC)
+//   启 standby:    setStandbyPlaybackStateEnabled:1
+//   预备:          preparePictureInPictureForStandby  (gate 过才不早退)
+//   真正起 PiP:    startWithCompletionHandler:        (startPictureInPicture)
+// 之前 v1.4~1.6 死在两点：(1) 开关在 Manager 不在 Policy，从未置 1；(2) 只 prepare 没 setup/start。
 static void EnsureStandbyPiP(void) {
     Class mgrCls = objc_getClass("WBVoiceInputPIPManager");
-    if (!mgrCls) { WLog(@"PROBE WBVoiceInputPIPManager runtime class NOT FOUND"); return; }
-    WLog(@"PROBE WBVoiceInputPIPManager found = %@", mgrCls);
+    if (!mgrCls) { WLog(@"PROBE WBVoiceInputPIPManager NOT FOUND"); return; }
+    WLog(@"PROBE WBVoiceInputPIPManager found");
 
     SEL shared = NSSelectorFromString(@"sharedInstance");
     if (![mgrCls respondsToSelector:shared]) { WLog(@"PROBE no +sharedInstance"); return; }
@@ -124,40 +103,65 @@ static void EnsureStandbyPiP(void) {
 
     SEL isActive    = NSSelectorFromString(@"isActive");
     SEL isSupported = NSSelectorFromString(@"isSupported");
+    SEL isSetup     = NSSelectorFromString(@"isSetup");
+    SEL setup       = NSSelectorFromString(@"setup");
     SEL setStandby  = NSSelectorFromString(@"setStandbyPlaybackStateEnabled:");
+    SEL startSel    = NSSelectorFromString(@"startWithCompletionHandler:");
+    SEL standby     = NSSelectorFromString(@"preparePictureInPictureForStandby");
 
     BOOL vActive    = [mgr respondsToSelector:isActive]    ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isActive) : NO;
     BOOL vSupported = [mgr respondsToSelector:isSupported] ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isSupported) : NO;
-    WLog(@"PROBE mgr isActive(value)=%d isSupported(value)=%d setStandby responds=%d",
-         (int)vActive, (int)vSupported, (int)[mgr respondsToSelector:setStandby]);
+    BOOL vSetup     = [mgr respondsToSelector:isSetup]     ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isSetup) : NO;
+    WLog(@"PROBE mgr isActive=%d isSupported=%d isSetup=%d", (int)vActive, (int)vSupported, (int)vSetup);
 
-    // 先确认 standby 模式开关（WBVoiceInputPolicy.recordingStandbyMode）是不是 0 导致 prepare 早退
-    ProbePolicyAndEngage();
-
-    SEL standby = NSSelectorFromString(@"preparePictureInPictureForStandby");
-    if (![mgr respondsToSelector:standby]) { WLog(@"PROBE no -preparePictureInPictureForStandby"); return; }
-
-    // 若 Policy 存在且 recordingStandbyMode==0，先置 1 再 prepare（假设 shouldUsePIPStandbyMode 门控）
-    Class polCls = objc_getClass("WBVoiceInputPolicy");
-    if (polCls) {
-        SEL pshared = NSSelectorFromString(@"sharedInstance");
-        SEL precMode = NSSelectorFromString(@"recordingStandbyMode");
-        SEL psetMode = NSSelectorFromString(@"setRecordingStandbyMode:");
-        if (class_respondsToSelector(polCls, pshared) && class_respondsToSelector(polCls, psetMode)) {
-            id pol = ((id (*)(Class, SEL))objc_msgSend)(polCls, pshared);
-            if (pol && [pol respondsToSelector:precMode] && [pol respondsToSelector:psetMode]) {
-                NSInteger cur = ((NSInteger (*)(id, SEL))objc_msgSend)(pol, precMode);
-                WLog(@"PROBE Policy pre-set recordingStandbyMode=%ld -> forcing 1", (long)cur);
-                ((void (*)(id, SEL, NSInteger))objc_msgSend)(pol, psetMode, 1);
-            }
+    // (1) 打开 standby 模式开关 —— 在 WBVoiceInputManager 上（不是 Policy）
+    Class vmCls = objc_getClass("WBVoiceInputManager");
+    if (vmCls && [vmCls respondsToSelector:shared]) {
+        id vm = ((id (*)(Class, SEL))objc_msgSend)(vmCls, shared);
+        SEL setMode = NSSelectorFromString(@"setRecordingStandbyMode:");
+        SEL updMode = NSSelectorFromString(@"updateRecordingStandbyMode:");
+        SEL getMode = NSSelectorFromString(@"recordingStandbyMode");
+        if (vm) {
+            if (getMode && [vm respondsToSelector:getMode])
+                WLog(@"PROBE VoiceInputManager.recordingStandbyMode(before)=%ld",
+                     (long)((NSInteger (*)(id,SEL))objc_msgSend)(vm, getMode));
+            if (setMode && [vm respondsToSelector:setMode])
+                ((void (*)(id,SEL,NSInteger))objc_msgSend)(vm, setMode, 1);
+            if (updMode && [vm respondsToSelector:updMode])
+                ((void (*)(id,SEL,NSInteger))objc_msgSend)(vm, updMode, 1);
+            if (getMode && [vm respondsToSelector:getMode])
+                WLog(@"PROBE VoiceInputManager.recordingStandbyMode(after)=%ld",
+                     (long)((NSInteger (*)(id,SEL))objc_msgSend)(vm, getMode));
         }
+    } else {
+        WLog(@"PROBE WBVoiceInputManager NOT found (无法置 recordingStandbyMode)");
     }
 
-    ((void (*)(id, SEL))objc_msgSend)(mgr, standby);
-    WLog(@"PROBE preparePictureInPictureForStandby INVOKED on %@", mgr);
+    // (2) setup：建 pipController / pipSourceView / pipContentVC（若还没建）
+    if (!vSetup && [mgr respondsToSelector:setup]) {
+        WLog(@"PROBE calling setup");
+        ((void (*)(id, SEL))objc_msgSend)(mgr, setup);
+    }
 
-    // 多时间点轮询 isActive，确认是否真建立
-    for (NSNumber *secs in @[@(0.5), @(1.0), @(2.0), @(4.0)]) {
+    // (3) 启 standby 播放状态
+    if ([mgr respondsToSelector:setStandby])
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(mgr, setStandby, YES);
+
+    // (4) prepare standby（gate 过才生效）
+    if (![mgr respondsToSelector:standby]) { WLog(@"PROBE no -preparePictureInPictureForStandby"); return; }
+    ((void (*)(id, SEL))objc_msgSend)(mgr, standby);
+    WLog(@"PROBE preparePictureInPictureForStandby INVOKED");
+
+    // (5) 真正 start PiP；传 NULL 避免 block ABI 风险，靠下面轮询确认
+    if ([mgr respondsToSelector:startSel]) {
+        WLog(@"PROBE calling startWithCompletionHandler:");
+        ((void (*)(id, SEL, id))objc_msgSend)(mgr, startSel, NULL);
+    } else {
+        WLog(@"PROBE no -startWithCompletionHandler: (依赖 prepare 的 auto-start)");
+    }
+
+    // 轮询 isActive 确认是否真建立（0.5/1/2/4/8s）
+    for (NSNumber *secs in @[@(0.5), @(1.0), @(2.0), @(4.0), @(8.0)]) {
         double d = [secs doubleValue];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{

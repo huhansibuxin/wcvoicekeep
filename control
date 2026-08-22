@@ -1,6 +1,6 @@
 Package: com.wcvoicekeep
 Name: wcvoicekeep
-Version: 1.6.0
+Version: 1.7.0
 Architecture: iphoneos-arm64
 Description: WeChat Keyboard (Wetype) zero-jump voice. Tweak links CydiaSubstrate (ellekit) so TrollFools injection works; it establishes the main app's native PiP standby on activation / on daemon Darwin trigger, so the keyboard extension never force-jumps.
 Maintainer: huhansibuxin
