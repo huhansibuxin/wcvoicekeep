@@ -15,7 +15,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = WCVoiceKeep
 
 WCVoiceKeep_FILES = Tweak.xm
-WCVoiceKeep_FRAMEWORKS = UIKit
+WCVoiceKeep_FRAMEWORKS = UIKit AVFAudio
 # 关键：链接 CydiaSubstrate(=ellekit)，TF 注入才能被 ElleKit 加载执行。
 WCVoiceKeep_LDFLAGS = -Wl,-no_warn_inits -F$(THEOS_PROJECT_DIR)/Frameworks -framework CydiaSubstrate
 WCVoiceKeep_CFLAGS = -fobjc-arc -fno-modules -w

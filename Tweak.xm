@@ -15,6 +15,8 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <notify.h>
+#import <AVFAudio/AVFAudio.h>
+#include <stdlib.h>
 
 static NSString *gLogPath = nil;
 static const char *const kTriggerName = "com.wcvoicekeep.pip.trigger";
@@ -50,6 +52,69 @@ static void WLog(NSString *fmt, ...) {
     FILE *f = fopen([gLogPath UTF8String], "a");
     if (f) { fputs([line UTF8String], f); fclose(f); }
     NSLog(@"[WCVK] %@", msg); // 双保险，syslog 也能看到
+}
+
+// ===== 保活：静音音频循环（关键，v1.8.8）=====
+// 实测结论：daemon 无头(SBS background)拉起后，startPictureInPicture 因平台限制
+// 只能在 App 激活态启动 -> 后台拉起时 PiP 永远起不来(isActive=0) -> 无后台保活凭证
+// -> 系统把 App 挂起(?<s)再杀掉 -> daemon 反复重拉死循环。
+// 正解：wetype Info.plist 有 UIBackgroundModes=['audio']，只要真正在播放音频，
+// 后台音频模式即生效 -> App 后台永不被挂起。这里启动 1s 静音 WAV 无限循环保活；
+// 由 daemon 每 60s 的 trigger 反复 re-arm，即使被 wetype 自己打断也能恢复。
+static AVAudioPlayer *gSilencePlayer = nil;
+static void StartSilentKeepAlive(void) {
+    @try {
+        if (gSilencePlayer && [gSilencePlayer isPlaying]) return; // 已在保活
+        if (!gSilencePlayer) {
+            // 生成 1s 静音 WAV（16-bit 44.1kHz mono，全零采样）
+            NSString *wavPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wcvk_silence.wav"];
+            if (![[NSFileManager defaultManager] fileExistsAtPath:wavPath]) {
+                uint32_t sr = 44100; uint32_t dataSize = sr * 2; // 1s * 2bytes
+                NSMutableData *d = [NSMutableData dataWithCapacity:44 + dataSize];
+                uint8_t h[44];
+                memcpy(h, "RIFF", 4);
+                uint32_t v = 36 + dataSize;   memcpy(h+4,  &v, 4);
+                memcpy(h+8, "WAVE", 4);
+                memcpy(h+12, "fmt ", 4);
+                v = 16;                       memcpy(h+16, &v, 4);
+                uint16_t s16 = 1;             memcpy(h+20, &s16, 2); // PCM
+                uint16_t ch = 1;              memcpy(h+22, &ch, 2);  // mono
+                v = sr;                       memcpy(h+24, &v, 4);
+                v = sr*2;                     memcpy(h+28, &v, 4);   // byteRate
+                uint16_t ba = 2;              memcpy(h+32, &ba, 2);  // blockAlign
+                uint16_t bits = 16;           memcpy(h+34, &bits, 2);
+                memcpy(h+36, "data", 4);
+                v = dataSize;                 memcpy(h+40, &v, 4);
+                [d appendBytes:h length:44];
+                uint8_t *zeros = calloc(1, dataSize);
+                [d appendBytes:zeros length:dataSize];
+                free(zeros);
+                [d writeToFile:wavPath atomically:YES];
+            }
+            NSURL *url = [NSURL fileURLWithPath:wavPath];
+            NSError *err = nil;
+            gSilencePlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:&err];
+            if (err) WLog(@"KEEPALIVE player init err: %@", err);
+            if (gSilencePlayer) {
+                gSilencePlayer.numberOfLoops = -1;
+                gSilencePlayer.volume = 0.0f; // 静音即可，后台音频资格看会话不看音量
+                [gSilencePlayer prepareToPlay];
+            }
+        }
+        NSError *err = nil;
+        AVAudioSession *sess = [AVAudioSession sharedInstance];
+        // MixWithOthers：不打断用户正在听的音乐/其他 App 声音
+        [sess setCategory:AVAudioSessionCategoryPlayback
+              withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                    error:&err];
+        if (err) WLog(@"KEEPALIVE setCategory err: %@", err);
+        [sess setActive:YES error:&err];
+        if (err) WLog(@"KEEPALIVE setActive err: %@", err);
+        if ([gSilencePlayer play]) WLog(@"KEEPALIVE silent audio loop (re)STARTED");
+        else WLog(@"KEEPALIVE play FAILED");
+    } @catch (NSException *e) {
+        WLog(@"KEEPALIVE exception: %@", e);
+    }
 }
 
 // 探针：记录真实 UIApplication 委托类名，验证「AppDelegate 假设」对不对
@@ -192,6 +257,15 @@ static void TriggerOnMain(void) {
     // 不存在抢锁风险；延迟越短，前台窗口越大，越不易被滑后台打断。
     dispatch_async(dispatch_get_main_queue(), ^{
         ProbeDelegate();
+        // v1.8.8：保活优先——后台拉起时立刻启动静音音频，App 永不挂起。
+        StartSilentKeepAlive();
+        // PiP 只能在 App 激活态启动（startPictureInPicture 平台限制，实测后台 isActive=0）。
+        // 无头拉起/后台 trigger 时跳过 PiP，避免无效重试刷日志；App 一旦前台激活即建 PiP。
+        UIApplicationState st = [[UIApplication sharedApplication] applicationState];
+        if (st != UIApplicationStateActive) {
+            WLog(@"TRIGGER appState=%ld (not active) -> keep-alive only, PiP deferred", (long)st);
+            return;
+        }
         WLog(@"TRIGGER firing EnsureStandbyPiP (0-delay)");
         EnsureStandbyPiP();
     });
