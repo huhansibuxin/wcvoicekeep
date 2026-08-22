@@ -30,7 +30,9 @@ jobs:
           rm -rf sdks-master master.zip
 
       - name: Build
-        run: make package
+        run: |
+          chmod 755 layout/DEBIAN/postinst
+          make package
 
       - name: Upload deb
         uses: actions/upload-artifact@v4

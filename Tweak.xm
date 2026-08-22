@@ -1,71 +1,79 @@
-// WCIntrospect — 只读探针：枚举微信输入法主App自身可执行镜像里、含关键字的 selector，写文件日志。
-// 不改任何行为（%orig 原样返回），仅打印。配合 wcvoicekeep daemon 在开机拉起主App 时于
-// applicationDidFinishLaunching 触发，真机跑一遍把「进悬浮窗 / 语音启动」的入口 selector 捞出来。
+// wcvoicekeep — 注入微信输入法主 App (com.tencent.wetype)
+// 目标：主 App 一旦前台激活（被 daemon 或用户拉起），立即建立并常驻 PiP standby，
+//       让键盘扩展侧 -[WBVoiceInputService requireJumpToMainAppForRecording] 恒返回 0，
+//       从而语音输入「零前台跳转」。
+//
+// === 逆向依据（capstone 静态分析 wxkb 主二进制）===
+//   键盘扩展: requireJumpToMainAppForRecording
+//              -> isMainAppVoiceStandbyActive
+//              -> [WBVoiceStateProbe pictureInPictureActive] (= appAlive && mask.bit1)
+//   状态由主 App 经 WBWormhole(App Group group.com.tencent.wetype) 心跳上报。
+//   主 App 建 standby 的原生入口:
+//     [[WBVoiceInputPIPManager sharedInstance] preparePictureInPictureForStandby]
+//       -> setStandbyPlaybackStateEnabled:1 -> (自动)startPictureInPicture
+//   PiP 只能在前台 scene 建立(findAnchorWindow 需 foreground)，故必须在
+//   applicationDidBecomeActive 之后触发一次；建成后主 App 靠原生
+//   UIBackgroundModes:audio + PiP 常驻后台。
+//
+// 本 tweak 只调用主 App 自己的公开路径建 standby，不改任何判定逻辑、不伪造状态。
+
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
-static NSString *const kLogPath = @"/var/mobile/wcvoicekeep_introspect.log";
+static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.log";
 
-static void ILog(NSString *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
+static void WLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    NSString *line = [NSString stringWithFormat:@"[%@][tweak] %@\n", [NSDate date], msg];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLogPath];
-    if (!fh) {
-        [line writeToFile:kLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        return;
-    }
-    @try {
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-    } @catch (NSException *e) { }
+    if (!fh) { [line writeToFile:kLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
+    @try { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; }
+    @catch (NSException *e) {}
     [fh closeFile];
 }
 
-// 只关心和「悬浮窗 / 语音 / 保活 / 前后台」相关的名字
-static NSArray<NSString *> *kKeywords = @[
-    @"float", @"floating", @"window", @"voice", @"asr", @"record", @"keep",
-    @"alive", @"background", @"enter", @"present", @"show", @"hide",
-    @"foreground", @"speech", @"audio", @"mic", @"input", @"keyboard",
-    @"suspend", @"resume", @"active", @"launch", @"floatwindow", @"floatingwindow"
-];
+// 幂等触发主 App 自建 PiP standby。私有类/方法一律走 objc_msgSend 强转，避免编译期未知选择器报错。
+static void EnsureStandbyPiP(void) {
+    Class mgrCls = objc_getClass("WBVoiceInputPIPManager");
+    if (!mgrCls) { WLog(@"WBVoiceInputPIPManager not found, skip"); return; }
 
-%hook UIApplication
-- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)options {
-    BOOL r = %orig;
-    ILog(@"=== WCIntrospect start (bid=%@) ===", [[NSBundle mainBundle] bundleIdentifier]);
+    SEL shared = @selector(sharedInstance);
+    if (![mgrCls respondsToSelector:shared]) { WLog(@"no +sharedInstance"); return; }
+    id mgr = ((id (*)(Class, SEL))objc_msgSend)(mgrCls, shared);
+    if (!mgr) { WLog(@"sharedInstance nil"); return; }
 
-    // 仅扫描主App可执行镜像里定义的类（排除系统框架，降噪）
-    const char *mainImg = [[[NSBundle mainBundle] executablePath] fileSystemRepresentation];
-    unsigned int classCount = 0;
-    Class *classes = objc_copyClassList(&classCount);
-    NSUInteger matched = 0;
-    for (unsigned int i = 0; i < classCount; i++) {
-        Class cls = classes[i];
-        const char *img = class_getImageName(cls);
-        if (!img || strcmp(img, mainImg) != 0) continue;
-
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(cls, &methodCount);
-        NSString *clsName = NSStringFromClass(cls);
-        NSString *clsLower = clsName.lowercaseString;
-        for (unsigned int j = 0; j < methodCount; j++) {
-            NSString *selName = NSStringFromSelector(method_getName(methods[j]));
-            NSString *selLower = selName.lowercaseString;
-            for (NSString *kw in kKeywords) {
-                if ([selLower containsString:kw] || [clsLower containsString:kw]) {
-                    ILog(@"[MATCH] -[%@ %@]", clsName, selName);
-                    matched++;
-                    break;
-                }
-            }
-        }
-        if (methods) free(methods);
+    // 已激活就不重复建立
+    SEL isActive = @selector(isActive);
+    if ([mgr respondsToSelector:isActive]) {
+        BOOL active = ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isActive);
+        if (active) { WLog(@"PiP already active, skip"); return; }
     }
-    if (classes) free(classes);
-    ILog(@"=== WCIntrospect done, matched=%lu ===", (unsigned long)matched);
-    return r;
+
+    SEL isSupported = @selector(isSupported);
+    if ([mgr respondsToSelector:isSupported]) {
+        BOOL sup = ((BOOL (*)(id, SEL))objc_msgSend)(mgr, isSupported);
+        if (!sup) { WLog(@"PiP not supported on this device"); return; }
+    }
+
+    SEL prep = @selector(preparePictureInPictureForStandby);
+    if ([mgr respondsToSelector:prep]) {
+        ((void (*)(id, SEL))objc_msgSend)(mgr, prep);
+        WLog(@"preparePictureInPictureForStandby invoked");
+    } else {
+        WLog(@"no -preparePictureInPictureForStandby");
+    }
+}
+
+%hook AppDelegate
+- (void)applicationDidBecomeActive:(UIApplication *)application {
+    %orig;
+    // 延后到 runloop，确保 scene/window 已就绪，PiP anchor 可用
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        EnsureStandbyPiP();
+    });
 }
 %end

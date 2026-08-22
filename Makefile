@@ -10,10 +10,10 @@ wcvoicekeep_CFLAGS = -fobjc-arc
 wcvoicekeep_CODESIGN_FLAGS = -Sentitlements.plist
 wcvoicekeep_INSTALL_PATH = /usr/bin
 
-# --- 只读探针 tweak (注入 com.tencent.wetype，捞入口 selector) ---
-TWEAK_NAME = WCIntrospect
-WCIntrospect_FILES = Tweak.xm
-WCIntrospect_CFLAGS = -fobjc-arc
+# --- tweak (注入 com.tencent.wetype，激活后建立 PiP standby，零跳转) ---
+TWEAK_NAME = WCVoiceKeep
+WCVoiceKeep_FILES = Tweak.xm
+WCVoiceKeep_CFLAGS = -fobjc-arc
 
 include $(THEOS)/makefiles/common.mk
 include $(THEOS_MAKE_PATH)/tool.mk

@@ -1,35 +1,42 @@
 //
 //  wcvoicekeep daemon
 //  目标：微信输入法（Wetype, bundle id com.tencent.wetype）主 App。
-//        用我们的 daemon 替代微信输入法【自身的悬浮窗保活】，从而消除
-//        语音免跳转的「首次前台跳转」。与微信(聊天App)无关。
 //
-//  三件事：
-//   1. 开机自启  -> LaunchDaemon plist RunAtLoad:true（系统 launchd 拉起本 daemon）
-//   2. 死亡重建  -> LaunchDaemon plist KeepAlive:true（daemon 自身崩了自动重启）
-//                 + 主循环监控微信输入法主App，死了就重拉（满足「app 死亡重建」）
-//   3. 直接后台拉起 -> SBSLaunchApplicationWithIdentifier(bundleId, suspended=TRUE)
-//                    suspended=TRUE = 直接后台拉起，不进前台、不在主屏闪。
+//  === 逆向结论（capstone 静态分析 wxkb 主二进制，2026-08-22）===
+//  微信输入法语音「免跳转」= 键盘扩展检测到主 App 的 PiP standby 活着就不跳转：
+//    -[WBVoiceInputService requireJumpToMainAppForRecording]:
+//       if (isMainAppVoiceStandbyActive) return 0;   // standby 活 → 不跳
+//    -[WBVoiceInputService isMainAppVoiceStandbyActive]:
+//       return [WBVoiceStateProbe pictureInPictureActive]  (= appAlive && mask.bit1)
+//    状态经 WBWormhole（App Group group.com.tencent.wetype 共享）由主 App 心跳上报。
 //
-//  本 daemon 不注入、不 hook 微信输入法任何东西，只是让系统去启动它。
-//  因此微信输入法是否加密、Frida 能否附着，与此 daemon 完全无关。
+//  PiP standby 只能在主 App「前台激活」后建立（findAnchorWindow 需 foreground scene，
+//  isPictureInPicturePossible 需前台）—— suspended 后台冷启动建立不了 PiP。
+//  故采用 Plan B：注销/重启后【前台拉起主 App 一次】，让它自建 PiP standby，
+//  之后主 App 原生 UIBackgroundModes:audio + PiP 常驻后台，键盘侧零跳转。
 //
-//  真正要真机验证的点（非 Frida、黑盒功能测试）：
-//   微信输入法被 suspended 后台拉起后，其免跳转语音通道是否能在后台态响应
-//   键盘扩展。能 -> 无需 tweak，直接完工；
-//   不能(冻结太死) -> 配套 ElleKit tweak 把它唤醒到后台运行态 + 保活 + 强制语音 init。
+//  daemon 三件事：
+//   1. 开机自启 -> LaunchDaemon RunAtLoad:true
+//   2. daemon 自身死亡重建 -> LaunchDaemon KeepAlive:true
+//   3. 注销/重启后【前台拉起主 App 一次】-> SBSLaunchApplicationWithIdentifier(bid, FALSE)
+//      配套 tweak（注入主 App）在 didBecomeActive 时强制建立 PiP standby。
+//
+//  本 daemon 不注入、不 hook，只让系统启动主 App。
 //
 
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 #import <unistd.h>
 
-// ===== 配置：微信输入法 主 App 的 bundle id（如与实际不符，改这里）=====
+// ===== 配置：微信输入法 主 App 的 bundle id =====
 static NSString *const kTargetBundleID = @"com.tencent.wetype";
-// 轮询间隔（秒）
-static const int kCheckIntervalSec = 15;
-// 开机后等 SpringBoard 起来的延迟（秒）
-static const int kBootDelaySec = 8;
+// 前台拉起后的存活轮询间隔（秒）：主 App 建立 PiP+audio 后应常驻，
+// 只有被系统整个回收时才需要再拉一次，故用较长间隔，避免频繁打扰。
+static const int kCheckIntervalSec = 60;
+// 开机后等 SpringBoard 就绪的延迟（秒）
+static const int kBootDelaySec = 10;
+// 拉起模式：Plan B 必须前台拉起（suspended=FALSE）才能建立 PiP standby。
+static const Boolean kLaunchSuspended = FALSE;
 // 日志文件路径（SSH 可读）
 static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.log";
 
@@ -90,24 +97,24 @@ static BOOL isAppRunning(NSString *bundleID) {
     return (r == 0 && pid > 0);
 }
 
-// ===== 直接后台拉起（suspended=TRUE：不进前台、不在主屏闪）=====
-static void launchHeadless(NSString *bundleID) {
+// ===== 前台拉起主 App（suspended=FALSE：Plan B 必须前台才能建 PiP standby）=====
+static void launchForeground(NSString *bundleID) {
     if (!sbs_init()) {
         LOG(@"[ERR] SpringBoardServices init failed, cannot launch %@", bundleID);
         return;
     }
-    int r = SBSLaunchApplicationWithIdentifier((__bridge CFStringRef)bundleID, TRUE);
-    LOG(@"launchHeadless %@ (suspended) -> SBS return %d", bundleID, r);
+    int r = SBSLaunchApplicationWithIdentifier((__bridge CFStringRef)bundleID, kLaunchSuspended);
+    LOG(@"launchForeground %@ (suspended=%d) -> SBS return %d", bundleID, kLaunchSuspended, r);
 }
 
-// ===== 检查并在需要时直接后台拉起 =====
+// ===== 检查并在需要时拉起 =====
 static void checkAndLaunch(void) {
     if (isAppRunning(kTargetBundleID)) {
         LOG(@"%@ alive, skip", kTargetBundleID);
         return;
     }
-    LOG(@"%@ NOT running -> direct background launch (no flash)", kTargetBundleID);
-    launchHeadless(kTargetBundleID);
+    LOG(@"%@ NOT running -> foreground launch to establish PiP standby", kTargetBundleID);
+    launchForeground(kTargetBundleID);
 }
 
 int main(int argc, char *argv[]) {
