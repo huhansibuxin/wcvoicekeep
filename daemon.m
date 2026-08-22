@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.8)
+//  wcvoicekeep daemon  (v1.9.9)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -208,7 +208,6 @@ static time_t gLastWarmup = 0; // pip.built 时间戳（日志参考）
 static BOOL gPipUp = NO;       // dylib 确认 PiP 已建（自保活生效）
 static BOOL gScreenBlank = NO; // 屏幕熄灭（hasBlankedScreen 通知）
 static time_t gWarmupLaunchTs = 0;
-static BOOL gBootPhase = YES;  // v1.9.7：开机预热阶段——结束前 wetype 重拉不受屏幕门控（注销后马上拉）
 
 static BOOL warmupForeground(void) {
     LOG(@"warmupForeground called");
@@ -280,7 +279,7 @@ static void registerNotifs(void) {
         gLastWarmup = time(NULL);
         LOG(@"PIP.BUILT received -> warmup success, self keep-alive active");
     });
-    // 屏幕状态：1=熄屏（可无感重预热），0=亮屏（绝不中途闪）
+    // 屏幕状态：1=息屏，0=亮屏/解锁
     static int scrToken = 0;
     notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &scrToken,
                              dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
@@ -288,10 +287,14 @@ static void registerNotifs(void) {
         notify_get_state(scrToken, &st);
         gScreenBlank = (st == 1);
         LOG(@"screen %@ (state=%llu)", gScreenBlank ? @"BLANK" : @"UNBLANK", (unsigned long long)st);
-        // v1.9.8：息屏瞬间若 wetype 没在跑/没 PiP -> 立即重拉（不等 60s tick，
-        // 修"锁屏几秒就解锁、tick 恰好错过"的时机问题）。开机阶段由 boot 循环负责，跳过。
-        if (gScreenBlank && !gBootPhase && !gPipUp) {
-            LOG(@"screen just BLANK & wetype not kept-alive -> immediate re-warm");
+        // v1.9.9：屏幕状态一变（息屏 OR 亮屏/解锁），只要 wetype 还没保活(gPipUp==NO)
+        // 就立即重拉，保证"注销后第一次拉起"：
+        //   - 息屏：无感补拉（锁屏拉起等解锁激活）
+        //   - 亮屏/解锁：注销后锁屏期预热没完成，解锁瞬间立即补完
+        // 重拉内部 gWarmingUp 防并发（回调线程 + 主循环 + 息屏事件可能同时触发）。
+        if (!gPipUp) {
+            LOG(@"screen %s & wetype not kept-alive -> immediate re-warm",
+                gScreenBlank ? @"BLANK" : @"UNBLANK");
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                 gPipUp = NO;
                 reWarm();
@@ -410,7 +413,7 @@ int main(int argc, char *argv[]) {
         sleep(kBootDelaySec);
 
         // 注销后立即预热：最多试 ~2 分钟（锁屏期无感重试；有密码则等你解锁激活）。
-        // v1.9.4 加超时，避免极端情况无限卡死；超时后交给 60s 看护（僵尸分支处理）。
+        // 超时后交给 60s 看护 + 屏幕事件即时重拉（v1.9.9 不再受屏幕门控，保证必拉）。
         LOG(@"boot warmup loop until pip.built (max ~2min)...");
         time_t bootStart = time(NULL);
         while (!gPipUp && time(NULL) - bootStart < 120) {
@@ -420,15 +423,14 @@ int main(int argc, char *argv[]) {
             if (!gWechatWarmed && time(NULL) - bootStart >= 30) maybeWarmWechat();
             sleep(kFastRetrySec);
         }
-        gBootPhase = NO; // 开机预热阶段结束：之后 wetype 重拉全部受息屏门控
-        LOG(@"boot warmup done (gPipUp=%d, bootPhase=NO) -> entering 60s watch", (int)gPipUp);
+        LOG(@"boot warmup done (gPipUp=%d) -> entering 60s watch", (int)gPipUp);
 
         // 兜底：循环结束还没拉过微信就补拉（防 2min 全在锁屏且 30s 点恰好没到）
         maybeWarmWechat();
 
-        // 守护循环：
-        //  - wetype：活着只发 trigger；中途死了/僵尸只在「息屏」或「开机预热阶段」重拉，
-        //    屏幕亮着绝不打扰（老板要求：没息屏不要重拉）
+        // 守护循环（v1.9.9 老板拍板：死了就拉，不看屏幕——注销后第一次必拉，
+        // 接受偶尔亮屏闪一下换可靠拉起）：
+        //  - wetype：活着只发 trigger；死了/僵尸 -> 无条件 kill+重拉
         //  - 微信：被杀就无头拉（不管息屏，无 UI 无打扰），120s 节流
         while (1) {
             sleep(kCheckIntervalSec);
@@ -439,28 +441,20 @@ int main(int argc, char *argv[]) {
                     if (gPipUp) {
                         LOG(@"%@ alive -> only trigger dylib", kTargetBundleID);
                         postTrigger();
-                    } else if (gBootPhase || gScreenBlank) {
+                    } else {
                         // 进程在但从未建 PiP（锁屏期拉起没激活的僵尸）-> 杀掉重试
-                        LOG(@"%@ running but NO pip.built & %s -> kill & re-warm", kTargetBundleID,
-                            gScreenBlank ? "screen BLANK" : "boot phase");
+                        LOG(@"%@ running but NO pip.built (zombie) -> kill & re-warm", kTargetBundleID);
                         killApp();
                         gPipUp = NO;
                         reWarm();
                         if (gPipUp) maybeWarmWechat();
-                    } else {
-                        LOG(@"%@ running, no pip & screen ON -> hold (no flash until blank)", kTargetBundleID);
                     }
                     continue;
                 }
-                if (gBootPhase || gScreenBlank) {
-                    LOG(@"%@ NOT running & %s -> re-warm", kTargetBundleID,
-                        gScreenBlank ? "screen BLANK" : "boot phase");
-                    gPipUp = NO;
-                    reWarm();
-                    if (gPipUp) maybeWarmWechat();
-                } else {
-                    LOG(@"%@ died & screen ON -> NO re-warm (avoid interrupting); degraded until blank", kTargetBundleID);
-                }
+                LOG(@"%@ NOT running -> re-warm", kTargetBundleID);
+                gPipUp = NO;
+                reWarm();
+                if (gPipUp) maybeWarmWechat();
             }
         }
     }
