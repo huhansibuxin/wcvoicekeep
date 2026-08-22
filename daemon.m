@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.5)
+//  wcvoicekeep daemon  (v1.9.6)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -377,8 +377,10 @@ int main(int argc, char *argv[]) {
         }
         LOG(@"boot warmup done (gPipUp=%d) -> entering 60s watch", (int)gPipUp);
 
-        // 注销后：wetype 预热完成，错开 5s 无头拉起微信（后台、不显 UI）待命；仅一次
-        if (gPipUp) maybeWarmWechat();
+        // v1.9.6：微信无头拉起不依赖 wetype 预热成功（顺序≠依赖——锁屏期 wetype 可能
+        // 迟迟不激活建 PiP，若 gate 在 gPipUp 上微信会被无限卡住）。开机循环结束
+        // （成功或 2min 超时）就无条件拉一次；maybeWarmWechat 内部 gWechatWarmed 防重复。
+        maybeWarmWechat();
 
         // 守护循环：活着只发 trigger；中途死了只在息屏时重拉（亮屏绝不打扰视频/PiP/使用）
         while (1) {
