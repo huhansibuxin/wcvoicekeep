@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.8.6)
+//  wcvoicekeep daemon  (v1.8.7)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  能在后台被无头拉起一次，让 dylib 用原生 PiP standby 接住（见 Tweak.xm）。
@@ -19,7 +19,19 @@
 //
 //  修复：用 ObjC runtime 拿 LSApplicationWorkspace.defaultWorkspace，调
 //  openApplicationWithBundleID:active: (Bool)。iOS 13+ 名字稳定、不会 SIGSEGV。
-//  第二参 active=NO = 真无头拉起，不进前台不闪屏；didFinishLaunching 触发 dylib。
+//  第二参 active=NO 本意是后台拉起，但【实测 iOS 16 照样弹 UI】——active:NO 只是
+//  "不抢已运行 App 的前台"，新 App launch 时界面仍渲染。所以这条路做不到真无头。
+//
+//  === v1.8.7 修复（真无头启动）===
+//  要"无头/后台启动不显 UI"（同支付宝静默推送唤醒主 App 进后台），正确做法是
+//  SpringBoardServices 私有 API：
+//      int SBSLaunchApplicationWithIdentifier(CFStringRef bid, int flags);
+//  flags = 1 (SBSApplicationLaunchFlagBackground，sbutils -b 源码佐证 flags|=1)
+//  -> 主 App 收到 didFinishLaunching 即进 background，绝不上前台、不渲染 UI，
+//     dylib 在后台收到通知照样建 PiP standby（PiP 在 background 也能持续）。
+//  需要 entitlement：com.apple.springboard.launchapplications（entitlements.plist 已有）。
+//  iOS 16 上 SpringBoardServices 磁盘二进制被合进 dyld shared cache，dlopen 可能失败，
+//  所以 SBS 不可用时回退 LSA active:NO（仅兜底，会带 UI）。
 //
 //  进程存在检测也由 SBS 改 proc_listpids，避免 dlsym 失败时拿不到 pid 误判"未跑"。
 //
@@ -48,10 +60,8 @@ static const int    kCheckIntervalSec = 60;        // 守护轮询
 static const int    kRelLaunchDelaySec = 6;        // 拉起后等 dylib 起来
 static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.daemon.log";
 
-// ===== 真实无头：active=NO =====
-// LSApplicationWorkspace defaultWorkspace openApplicationWithBundleID:@"x" active:NO
-// 在 iOS 16 daemon 进程里能稳定拉起主 App 到 background(不进 UI、不闪屏)，
-// 主 App 收到 didFinishLaunchingNotification，dylib 接到就建 PiP standby。
+// ===== 无头启动：SBS 后台 flag=1（首选），LSA active:NO（兜底）=====
+// SBS background flag=1 = 真后台启动（不显 UI）。LSA active:NO 仅兜底（会带 UI）。
 @interface LSAppWorkspaceShim : NSObject
 + (id)defaultWorkspace;
 - (BOOL)openApplicationWithBundleID:(id)arg1 active:(BOOL)arg2;
@@ -125,9 +135,49 @@ static void ensureLSFrameworkLoaded(void) {
     });
 }
 
-// ===== 核心：拉 Wetype 到 background =====
+// ===== SBS 后台无头启动（首选）=====
+// SpringBoardServices 私有 API：int SBSLaunchApplicationWithIdentifier(CFStringRef, int)
+// flags=1 (SBSApplicationLaunchFlagBackground) = 真后台启动，不显 UI、不进前台。
+// 需要 com.apple.springboard.launchapplications entitlement（entitlements.plist 已有）。
+// iOS 16 上该 framework 二进制被合进 dyld shared cache，dlopen 可能失败 -> 走 LSA 兜底。
+static int (*g_SBSLaunch)(CFStringRef, int) = NULL;
+static BOOL sbsReady(void) {
+    static dispatch_once_t once; static void *h = NULL; static BOOL ok = NO;
+    dispatch_once(&once, ^{
+        h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+                   RTLD_LAZY);
+        if (h) {
+            g_SBSLaunch = dlsym(h, "SBSLaunchApplicationWithIdentifier");
+            if (g_SBSLaunch) {
+                // 部分版本需先建立 SpringBoard server 端口，建立即可（返回值不用）
+                void (*portfn)(void) = dlsym(h, "SBSSpringBoardServerPort");
+                if (portfn) portfn();
+                ok = YES;
+                LOG(@"SBS ready (SpringBoardServices loaded, SBSLaunchApplicationWithIdentifier found)");
+            } else {
+                LOG(@"SBS dlsym SBSLaunchApplicationWithIdentifier FAILED: %s", dlerror());
+            }
+        } else {
+            LOG(@"SBS dlopen FAILED: %s", dlerror());
+        }
+    });
+    return ok;
+}
+
+// ===== 核心：拉 Wetype 到 background（真无头，不显 UI）=====
 static void launchBackground(void) {
     LOG(@"launchBackground called");
+
+    // 首选：SBS 后台无头启动（flag=1 = SBSApplicationLaunchFlagBackground）
+    if (sbsReady() && g_SBSLaunch) {
+        int flags = 1; // SBSApplicationLaunchFlagBackground（sbutils -b 源码佐证 flags|=1）
+        int r = g_SBSLaunch((__bridge CFStringRef)kTargetBundleID, flags);
+        LOG(@"SBSLaunchApplicationWithIdentifier(%@, Background=1) -> %d (0=ok)", kTargetBundleID, r);
+        if (r == 0) { LOG(@"SBS background launch OK - no UI should appear"); return; }
+        LOG(@"SBS returned non-zero, fallback to LSA");
+    }
+
+    // 兜底：LSA active:NO（iOS16 实测会带 UI，仅兜底用）
     ensureLSFrameworkLoaded();   // 先确保 framework 已加载，类才找得到
     Class cls = NSClassFromString(@"LSApplicationWorkspace");
     if (cls == Nil) {
@@ -154,15 +204,15 @@ static void launchBackground(void) {
         return;
     }
 
-    // 关键：active=NO = 后台拉起（不闪前台、不进 UI）。
+    // active=NO = 不抢前台（但新 App launch 仍会渲染 UI，iOS16 实测）。
     // 用 objc_msgSend 强转明确传 BOOL，避免 performSelector:withObject:
-    // 把 CFBoolean 指针当 BOOL 塞进参数寄存器造成错位（之前 active 传值隐患）。
+    // 把 CFBoolean 指针当 BOOL 塞进参数寄存器造成错位。
     BOOL ok = NO;
     @try {
         BOOL (*impl)(id, SEL, id, BOOL) = (BOOL(*)(id, SEL, id, BOOL))objc_msgSend;
         ok = impl(ws, sel, kTargetBundleID, NO);
     } @catch (NSException *e) { LOG(@"[FATAL] launch threw: %@", e); return; }
-    LOG(@"openApplicationWithBundleID:%@ active:NO -> ret=%d",
+    LOG(@"openApplicationWithBundleID:%@ active:NO -> ret=%d (UI may appear - SBS unavailable)",
         kTargetBundleID, ok);
 }
 
