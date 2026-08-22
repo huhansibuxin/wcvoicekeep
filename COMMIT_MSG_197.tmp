@@ -1,0 +1,26 @@
+fix(wcvoicekeep): 输入法仅息屏重拉 + 微信独立看护被杀就无头拉 (v1.9.7)
+
+老板确认的规则：
+  1. 输入法被杀：没息屏绝不重拉，息屏过后才拉。
+     根因（SSH 实测）：v1.9.5/6 看护"僵尸分支"（进程在但没 pip.built）重拉没查屏幕，
+     锁屏期 gPipUp=0 时每 60s 不管亮灭都 kill+重拉 -> 屏幕亮着也闪。
+     修复：新增 gBootPhase——开机预热阶段（2min 循环内）重拉不受屏幕门控（注销后马上拉）；
+     出循环后【所有】wetype 重拉（僵尸分支 + 未运行分支）都加 gScreenBlank 门控，
+     屏幕亮着绝不拉。
+  2. 微信被杀：不管息屏不息屏都无头拉。
+     新增 watchWechat()：每 60s tick 检查微信进程（procExists("WeChat") 精确匹配），
+     没了就 SBS flag=1 无头拉起（无 UI 无打扰），120s 节流防反复重启刷电。
+  3. 微信拉起时机：开机 30s 先拉（不用等 2min 窗口结束）；循环结束兜底补拉。
+
+daemon.m：
+  - procExists() 通用精确匹配；isAppRunning/isWechatRunning 基于它
+  - gBootPhase 状态；boot 循环 30s 点拉微信；出循环 gBootPhase=NO + 兜底 maybeWarmWechat
+  - watch 循环：tick 开头 watchWechat()；wetype 分支全部加 (gBootPhase||gScreenBlank) 门控
+  - warmWechatHeadless 记录 gLastWechatPull
+
+control 1.9.6 -> 1.9.7。仅 daemon.m，装 deb 即可，无需重注入 dylib。
+
+老板实测：
+  - 屏幕亮着杀输入法 -> 不闪；息屏后自动重拉恢复
+  - 杀微信（或微信被系统清掉）-> 最多 2min 内无头拉回（不管屏幕）
+  - 注销 -> 输入法先尝试，30s 左右微信无头拉起

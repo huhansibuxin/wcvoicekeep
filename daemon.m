@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.6)
+//  wcvoicekeep daemon  (v1.9.7)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -106,8 +106,9 @@ static void LOG(NSString *fmt, ...) {
 // 不用 libproc.h (Theos iOS SDK 找不到头)，手写 sysctl 路径稳如老狗。
 // 主 App 进程名 "wetype"（<=16 字节，正常），扩展进程名 "wxkb" 或 "WxKeyboard"，
 // 模糊匹配任一即认为 Wetype 在跑。
-static BOOL isAppRunning(NSString *bundleID) {
-    (void)bundleID;
+// 通用：进程表里是否有精确匹配 comm 的进程（v1.9.7 抽出来给 wetype/微信共用）
+static BOOL procExists(const char *want) {
+    if (!want || !want[0]) return NO;
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
     size_t sz = 0;
     if (sysctl(mib, 4, NULL, &sz, NULL, 0) != 0 || sz == 0) return NO;
@@ -117,17 +118,23 @@ static BOOL isAppRunning(NSString *bundleID) {
     int n = (int)(sz / sizeof(struct kinfo_proc));
     BOOL found = NO;
     for (int i = 0; i < n; i++) {
-        const char *comm = procs[i].kp_proc.p_comm;
-        if (comm[0] == 0) continue;
-        // v1.9.4：精确匹配主 App。进程名就是 wxkb；键盘扩展进程名是 wxkb_plugin，
-        // 用 strstr("wxkb") 会把扩展进程误判成"活着" -> 主 App 被杀也不重拉（老板实测 bug）。
-        // 必须 strcmp 精确匹配，排除 *_plugin。
-        if (strcmp(comm, "wxkb") == 0 ||
-            strcmp(comm, "wetype") == 0 ||
-            strcmp(comm, "WxKeyboard") == 0) { found = YES; break; }
+        // v1.9.4：必须 strcmp 精确匹配——键盘扩展进程名 wxkb_plugin 含 wxkb 子串，
+        // strstr 会把它误判成"活着"（主 App 被杀也不重拉）。排除 *_plugin。
+        if (strcmp(procs[i].kp_proc.p_comm, want) == 0) { found = YES; break; }
     }
     free(procs);
     return found;
+}
+
+// wetype 主 App 进程名：wxkb（扩展进程 wxkb_plugin 不算）
+static BOOL isAppRunning(NSString *bundleID) {
+    (void)bundleID;
+    return procExists("wxkb") || procExists("wetype") || procExists("WxKeyboard");
+}
+
+// 微信主进程名：WeChat
+static BOOL isWechatRunning(void) {
+    return procExists("WeChat");
 }
 
 // ===== 关键：daemon 是独立进程，默认不链接 MobileCoreServices/LSApplicationWorkspace
@@ -197,6 +204,7 @@ static time_t gLastWarmup = 0; // pip.built 时间戳（日志参考）
 static BOOL gPipUp = NO;       // dylib 确认 PiP 已建（自保活生效）
 static BOOL gScreenBlank = NO; // 屏幕熄灭（hasBlankedScreen 通知）
 static time_t gWarmupLaunchTs = 0;
+static BOOL gBootPhase = YES;  // v1.9.7：开机预热阶段——结束前 wetype 重拉不受屏幕门控（注销后马上拉）
 
 static BOOL warmupForeground(void) {
     LOG(@"warmupForeground called");
@@ -331,9 +339,12 @@ static void reWarm(void) {
 // v1.9.4：无头拉起微信（后台 flag=1，不显 UI 不闪屏），让微信主 App 后台待命。
 // 仅 wetype 预热成功后错开几秒执行一次（gWechatWarmed 防重复）。
 static BOOL gWechatWarmed = NO;
+static time_t gLastWechatPull = 0;   // v1.9.7：微信重拉节流时间戳
+static const time_t kWechatRePullInterval = 120; // 微信被杀重拉最小间隔（防反复重启刷电）
 static void warmWechatHeadless(void) {
     if (!sbsReady() || !g_SBSLaunch) { LOG(@"wechat headless: SBS unavailable"); return; }
     int r = g_SBSLaunch((__bridge CFStringRef)kWechatBundleID, 1); // SBSApplicationLaunchFlagBackground
+    gLastWechatPull = time(NULL);
     LOG(@"wechat headless SBSLaunchApplicationWithIdentifier(%@, Background=1) -> %d (0=ok)",
         kWechatBundleID, r);
 }
@@ -345,6 +356,19 @@ static void maybeWarmWechat(void) {
     gWechatWarmed = YES; // 先置位防重复（sleep 期间若重复进入也只会拉一次）
     LOG(@"sleeping 5s then headless-pull WeChat...");
     sleep(5);
+    warmWechatHeadless();
+}
+
+// v1.9.7：微信看护——被杀就无头拉（不管息屏，无 UI 无打扰），120s 节流
+static void watchWechat(void) {
+    if (isWechatRunning()) return;
+    time_t now = time(NULL);
+    if (now - gLastWechatPull < kWechatRePullInterval) {
+        LOG(@"wechat not running but throttle (%.0fs left)",
+            (double)(kWechatRePullInterval - (now - gLastWechatPull)));
+        return;
+    }
+    LOG(@"wechat killed -> headless re-pull (screen %s)", gScreenBlank ? "BLANK" : "ON");
     warmWechatHeadless();
 }
 
@@ -373,39 +397,50 @@ int main(int argc, char *argv[]) {
         while (!gPipUp && time(NULL) - bootStart < 120) {
             @autoreleasepool { warmupOnce(); }
             if (gPipUp) break;
+            // v1.9.7：开机 30s 先拉微信（顺序仍是输入法先开始尝试，但不等 2min 窗口）
+            if (!gWechatWarmed && time(NULL) - bootStart >= 30) maybeWarmWechat();
             sleep(kFastRetrySec);
         }
-        LOG(@"boot warmup done (gPipUp=%d) -> entering 60s watch", (int)gPipUp);
+        gBootPhase = NO; // 开机预热阶段结束：之后 wetype 重拉全部受息屏门控
+        LOG(@"boot warmup done (gPipUp=%d, bootPhase=NO) -> entering 60s watch", (int)gPipUp);
 
-        // v1.9.6：微信无头拉起不依赖 wetype 预热成功（顺序≠依赖——锁屏期 wetype 可能
-        // 迟迟不激活建 PiP，若 gate 在 gPipUp 上微信会被无限卡住）。开机循环结束
-        // （成功或 2min 超时）就无条件拉一次；maybeWarmWechat 内部 gWechatWarmed 防重复。
+        // 兜底：循环结束还没拉过微信就补拉（防 2min 全在锁屏且 30s 点恰好没到）
         maybeWarmWechat();
 
-        // 守护循环：活着只发 trigger；中途死了只在息屏时重拉（亮屏绝不打扰视频/PiP/使用）
+        // 守护循环：
+        //  - wetype：活着只发 trigger；中途死了/僵尸只在「息屏」或「开机预热阶段」重拉，
+        //    屏幕亮着绝不打扰（老板要求：没息屏不要重拉）
+        //  - 微信：被杀就无头拉（不管息屏，无 UI 无打扰），120s 节流
         while (1) {
             sleep(kCheckIntervalSec);
             @autoreleasepool {
+                watchWechat(); // 微信看护优先
+
                 if (isAppRunning(kTargetBundleID)) {
                     if (gPipUp) {
                         LOG(@"%@ alive -> only trigger dylib", kTargetBundleID);
                         postTrigger();
-                    } else {
-                        // 开机超时后残留僵尸：进程在但从未建 PiP（锁屏期拉起没激活）-> 杀掉重试
-                        LOG(@"%@ running but NO pip.built (zombie) -> kill & re-warm", kTargetBundleID);
+                    } else if (gBootPhase || gScreenBlank) {
+                        // 进程在但从未建 PiP（锁屏期拉起没激活的僵尸）-> 杀掉重试
+                        LOG(@"%@ running but NO pip.built & %s -> kill & re-warm", kTargetBundleID,
+                            gScreenBlank ? "screen BLANK" : "boot phase");
                         killApp();
                         gPipUp = NO;
                         reWarm();
-                        if (gPipUp) maybeWarmWechat(); // 开机锁屏稍后成功 -> 补拉微信
+                        if (gPipUp) maybeWarmWechat();
+                    } else {
+                        LOG(@"%@ running, no pip & screen ON -> hold (no flash until blank)", kTargetBundleID);
                     }
                     continue;
                 }
-                if (gScreenBlank) {
-                    LOG(@"%@ died & screen BLANK -> silent re-warm", kTargetBundleID);
+                if (gBootPhase || gScreenBlank) {
+                    LOG(@"%@ NOT running & %s -> re-warm", kTargetBundleID,
+                        gScreenBlank ? "screen BLANK" : "boot phase");
                     gPipUp = NO;
                     reWarm();
+                    if (gPipUp) maybeWarmWechat();
                 } else {
-                    LOG(@"%@ died & screen ON -> NO re-warm (avoid interrupting video/PiP); degraded until lock/respring", kTargetBundleID);
+                    LOG(@"%@ died & screen ON -> NO re-warm (avoid interrupting); degraded until blank", kTargetBundleID);
                 }
             }
         }
