@@ -86,7 +86,7 @@ static void StartSilentKeepAlive(void) {
                 memcpy(h+36, "data", 4);
                 v = dataSize;                 memcpy(h+40, &v, 4);
                 [d appendBytes:h length:44];
-                uint8_t *zeros = calloc(1, dataSize);
+                uint8_t *zeros = (uint8_t *)calloc(1, dataSize);
                 [d appendBytes:zeros length:dataSize];
                 free(zeros);
                 [d writeToFile:wavPath atomically:YES];
