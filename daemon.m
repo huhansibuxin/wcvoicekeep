@@ -2,58 +2,42 @@
 //  wcvoicekeep daemon
 //  目标：微信输入法（Wetype, bundle id com.tencent.wetype）主 App。
 //
-//  === 逆向结论（capstone 静态分析 wxkb 主二进制，2026-08-22）===
-//  微信输入法语音「免跳转」= 键盘扩展检测到主 App 的 PiP standby 活着就不跳转：
-//    -[WBVoiceInputService requireJumpToMainAppForRecording]:
-//       if (isMainAppVoiceStandbyActive) return 0;   // standby 活 → 不跳
-//    -[WBVoiceInputService isMainAppVoiceStandbyActive]:
-//       return [WBVoiceStateProbe pictureInPictureActive]  (= appAlive && mask.bit1)
-//    状态经 WBWormhole（App Group group.com.tencent.wetype 共享）由主 App 心跳上报。
+//  === 架构（老板 2026-08-22 拍板：TF 注入 + daemon 触发）===
+//  微信主 App 有反注入自杀：MobileSubstrate/dlopen 运行时注入被检测 → 闪退。
+//  改走 TrollFools 注入 dylib（dylib 成为 app 签名一部分，绕过检测）。
+//  分工：
+//    - dylib(inject.m, 由 TF 注入进主 App)：让主 App「自己拉一次悬浮窗」=
+//      建立原生 PiP standby。监听 app active + 监听本 daemon 的 Darwin 通知。
+//    - daemon(本文件, 后台常驻)：注销/重启/重越狱后，① 前台拉起主 App 一次，
+//      ② 发 Darwin 通知 kTriggerName 让 dylib 去建 PiP standby（兜底）。
+//  standby 一旦活，键盘扩展 requireJumpToMainAppForRecording 恒 0 → 零跳转。
 //
-//  PiP standby 只能在主 App「前台激活」后建立（findAnchorWindow 需 foreground scene，
-//  isPictureInPicturePossible 需前台）—— suspended 后台冷启动建立不了 PiP。
-//  故采用 Plan B：注销/重启后【前台拉起主 App 一次】，让它自建 PiP standby，
-//  之后主 App 原生 UIBackgroundModes:audio + PiP 常驻后台，键盘侧零跳转。
-//
-//  daemon 三件事：
-//   1. 开机自启 -> LaunchDaemon RunAtLoad:true
-//   2. daemon 自身死亡重建 -> LaunchDaemon KeepAlive:true
-//   3. 注销/重启后【前台拉起主 App 一次】-> SBSLaunchApplicationWithIdentifier(bid, FALSE)
-//      配套 tweak（注入主 App）在 didBecomeActive 时强制建立 PiP standby。
-//
-//  本 daemon 不注入、不 hook，只让系统启动主 App。
+//  daemon 生命周期：LaunchDaemon RunAtLoad + KeepAlive。
 //
 
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 #import <unistd.h>
+#import <notify.h>
 
-// ===== 配置：微信输入法 主 App 的 bundle id =====
+// ===== 配置 =====
 static NSString *const kTargetBundleID = @"com.tencent.wetype";
-// 前台拉起后的存活轮询间隔（秒）：主 App 建立 PiP+audio 后应常驻，
-// 只有被系统整个回收时才需要再拉一次，故用较长间隔，避免频繁打扰。
-static const int kCheckIntervalSec = 60;
-// 开机后等 SpringBoard 就绪的延迟（秒）
-static const int kBootDelaySec = 10;
-// 拉起模式：Plan B 必须前台拉起（suspended=FALSE）才能建立 PiP standby。
-static const Boolean kLaunchSuspended = FALSE;
-// 日志文件路径（SSH 可读）
+// dylib <-> daemon 约定的 Darwin 通知名（两边必须一致）
+static const char *const kTriggerName = "com.wcvoicekeep.pip.trigger";
+static const int kCheckIntervalSec = 60;   // 存活轮询间隔
+static const int kBootDelaySec = 10;        // 开机等 SpringBoard 就绪
+static const Boolean kLaunchSuspended = FALSE; // 前台拉起才能建 PiP standby
 static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.log";
 
-// ===== SpringBoardServices 动态加载（避免直接链接私有框架）=====
-static int (*SBSLaunchApplicationWithIdentifier)(CFStringRef identifier, Boolean suspended) = NULL;
+// ===== SpringBoardServices 动态加载 =====
+static int (*SBSLaunchApplicationWithIdentifier)(CFStringRef, Boolean) = NULL;
 static mach_port_t (*SBSSpringBoardServerPort)(void) = NULL;
-static int (*SBSSpringBoardServerGetProcessIDForDisplayIdentifier)(mach_port_t port,
-                                                                  CFStringRef identifier,
-                                                                  int *pid) = NULL;
+static int (*SBSSpringBoardServerGetProcessIDForDisplayIdentifier)(mach_port_t, CFStringRef, int *) = NULL;
 
 static BOOL sbs_init(void) {
-    static dispatch_once_t once;
-    static void *sb = NULL;
-    static BOOL ok = NO;
+    static dispatch_once_t once; static void *sb = NULL; static BOOL ok = NO;
     dispatch_once(&once, ^{
-        sb = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
-                    RTLD_LAZY);
+        sb = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
         if (sb) {
             SBSLaunchApplicationWithIdentifier = dlsym(sb, "SBSLaunchApplicationWithIdentifier");
             SBSSpringBoardServerPort = dlsym(sb, "SBSSpringBoardServerPort");
@@ -66,69 +50,54 @@ static BOOL sbs_init(void) {
     return ok;
 }
 
-// ===== 简易文件日志（daemon 里 NSLog 不一定进 oslog，写文件最稳）=====
 static void LOG(NSString *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
+    va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    NSString *line = [NSString stringWithFormat:@"[%@][daemon] %@\n", [NSDate date], msg];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLogPath];
-    if (!fh) {
-        [line writeToFile:kLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        return;
-    }
-    @try {
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-    } @catch (NSException *e) { }
+    if (!fh) { [line writeToFile:kLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
+    @try { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; }
+    @catch (NSException *e) {}
     [fh closeFile];
 }
 
-// ===== 判断目标 App 是否在运行 =====
 static BOOL isAppRunning(NSString *bundleID) {
     if (!sbs_init()) return NO;
     mach_port_t port = SBSSpringBoardServerPort();
     if (!port) return NO;
     int pid = 0;
-    int r = SBSSpringBoardServerGetProcessIDForDisplayIdentifier(port,
-                                                                (__bridge CFStringRef)bundleID,
-                                                                &pid);
+    int r = SBSSpringBoardServerGetProcessIDForDisplayIdentifier(port, (__bridge CFStringRef)bundleID, &pid);
     return (r == 0 && pid > 0);
 }
 
-// ===== 前台拉起主 App（suspended=FALSE：Plan B 必须前台才能建 PiP standby）=====
 static void launchForeground(NSString *bundleID) {
-    if (!sbs_init()) {
-        LOG(@"[ERR] SpringBoardServices init failed, cannot launch %@", bundleID);
-        return;
-    }
+    if (!sbs_init()) { LOG(@"[ERR] SBS init failed"); return; }
     int r = SBSLaunchApplicationWithIdentifier((__bridge CFStringRef)bundleID, kLaunchSuspended);
-    LOG(@"launchForeground %@ (suspended=%d) -> SBS return %d", bundleID, kLaunchSuspended, r);
+    LOG(@"launchForeground %@ (suspended=%d) -> SBS %d", bundleID, kLaunchSuspended, r);
 }
 
-// ===== 检查并在需要时拉起 =====
+// 发 Darwin 通知，dylib 侧收到就建 PiP standby（兜底路 B）
+static void postTrigger(void) {
+    notify_post(kTriggerName);
+    LOG(@"posted darwin trigger %s", kTriggerName);
+}
+
 static void checkAndLaunch(void) {
-    if (isAppRunning(kTargetBundleID)) {
-        LOG(@"%@ alive, skip", kTargetBundleID);
-        return;
-    }
-    LOG(@"%@ NOT running -> foreground launch to establish PiP standby", kTargetBundleID);
+    if (isAppRunning(kTargetBundleID)) { LOG(@"%@ alive", kTargetBundleID); postTrigger(); return; }
+    LOG(@"%@ NOT running -> foreground launch", kTargetBundleID);
     launchForeground(kTargetBundleID);
+    // 拉起后等它起来再发一次触发，dylib 建 PiP
+    sleep(3);
+    postTrigger();
 }
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
-        LOG(@"wcvoicekeep daemon started (uid=%d, target=%@)", getuid(), kTargetBundleID);
-
-        // 开机延迟，等 SpringBoard / launchd 就绪
+        LOG(@"daemon started (uid=%d, target=%@)", getuid(), kTargetBundleID);
         sleep(kBootDelaySec);
-
-        // 主循环：持续监控并保活目标 App（直接后台拉起，不闪）
         while (1) {
-            @autoreleasepool {
-                checkAndLaunch();
-            }
+            @autoreleasepool { checkAndLaunch(); }
             sleep(kCheckIntervalSec);
         }
     }

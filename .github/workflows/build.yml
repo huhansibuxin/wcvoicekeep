@@ -39,3 +39,15 @@ jobs:
         with:
           name: wcvoicekeep-rootless
           path: packages/*.deb
+
+      - name: Collect dylib for TrollFools
+        run: |
+          mkdir -p out
+          find . -name "libwcvoicekeep.dylib" -exec cp {} out/ \;
+          ls -l out
+
+      - name: Upload dylib (TrollFools inject)
+        uses: actions/upload-artifact@v4
+        with:
+          name: libwcvoicekeep-dylib
+          path: out/libwcvoicekeep.dylib
