@@ -62,6 +62,9 @@ static void LOG(NSString *fmt, ...) {
     va_end(ap);
     NSString *line = [NSString stringWithFormat:@"[%@][daemon] %@\n", [NSDate date], msg];
     NSLog(@"[WCVK-daemon] %@", msg);
+    // 镜像到 stderr → launchd StandardErrorPath(/var/mobile/wcvoicekeep.daemon.err)
+    // 进程被 SIGKILL/SIGSEGV/launchd throttle 时不至于丢全部上下文
+    fprintf(stderr, "%s", [line UTF8String]); fflush(stderr);
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLogPath];
     if (!fh) {
         [[NSData data] writeToFile:kLogPath atomically:YES]; // touch
@@ -165,6 +168,13 @@ static void checkAndLaunch(void) {
 }
 
 int main(int argc, char *argv[]) {
+    // 早期 stderr（不依赖 Foundation/ObjC runtime）——
+    // launchd 任何阶段拒收(进程类型/entitlement/签名/sandbox)都能立刻看到，
+    // 否则后面 LOG 走 NSLog + 文件句柄,启动被秒拒时来不及写任何东西。
+    fprintf(stderr, "[WCVK-DAEMON] main() entered pid=%d uid=%d argv0=%s\n",
+            getpid(), getuid(), (argc > 0 && argv[0]) ? argv[0] : "?");
+    fflush(stderr);
+
     @autoreleasepool {
         LOG(@"==== daemon boot ====");
         LOG(@"pid=%d uid=%d argv0=%s", getpid(), getuid(), argv[0] ?: "?");
