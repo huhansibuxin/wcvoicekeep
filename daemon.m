@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.7)
+//  wcvoicekeep daemon  (v1.9.8)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -73,6 +73,9 @@ static const int    kFastRetrySec     = 5;        // 预热快循环间隔（锁
 static const int    kPipWaitTimeoutSec = 15;      // 等 dylib 报 pip.built 超时
 static const int    kKillStaleSec     = 25;       // 进程在跑但迟迟无 pip.built -> kill 重试（锁屏僵尸）
 static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.daemon.log";
+
+// 前向声明：maybeWarmWechat 定义在 registerNotifs 之后，但息屏回调里要用
+static void maybeWarmWechat(void);
 
 // ===== 无头启动：SBS 后台 flag=1（首选），LSA active:NO（兜底）=====
 // SBS background flag=1 = 真后台启动（不显 UI）。LSA active:NO 仅兜底（会带 UI）。
@@ -284,6 +287,16 @@ static void registerNotifs(void) {
         notify_get_state(scrToken, &st);
         gScreenBlank = (st == 1);
         LOG(@"screen %@ (state=%llu)", gScreenBlank ? @"BLANK" : @"UNBLANK", (unsigned long long)st);
+        // v1.9.8：息屏瞬间若 wetype 没在跑/没 PiP -> 立即重拉（不等 60s tick，
+        // 修"锁屏几秒就解锁、tick 恰好错过"的时机问题）。开机阶段由 boot 循环负责，跳过。
+        if (gScreenBlank && !gBootPhase && !gPipUp) {
+            LOG(@"screen just BLANK & wetype not kept-alive -> immediate re-warm");
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                gPipUp = NO;
+                reWarm();
+                if (gPipUp) maybeWarmWechat();
+            });
+        }
     });
     LOG(@"notifs registered (pip.built + hasBlankedScreen)");
 }
@@ -325,7 +338,11 @@ static void warmupOnce(void) {
 // v1.9.2 重预热：不在跑就拉（老板要求：杀了/掉了要能重新拉起）。
 //   - 亮屏：试 3 次，间隔 5s（闪一次建 PiP，成功后自保活不再闪）
 //   - 息屏：只试 1 次（UnlockDevice 亮屏唤醒），失败后放 2min 长间隔，防屏幕反复亮
+// v1.9.8：加 gWarmingUp 防并发（息屏事件回调线程 + 主循环可能同时触发重拉）
+static BOOL gWarmingUp = NO;
 static void reWarm(void) {
+    if (gWarmingUp) { LOG(@"reWarm: already warming, skip"); return; }
+    gWarmingUp = YES;
     int maxAttempts = gScreenBlank ? 1 : 3;
     int attempts = 0;
     while (!gPipUp && attempts < maxAttempts) {
@@ -334,6 +351,7 @@ static void reWarm(void) {
         attempts++;
         sleep(gScreenBlank ? 120 : 5);
     }
+    gWarmingUp = NO;
 }
 
 // v1.9.4：无头拉起微信（后台 flag=1，不显 UI 不闪屏），让微信主 App 后台待命。
