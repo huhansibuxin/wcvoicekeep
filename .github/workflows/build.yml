@@ -43,11 +43,11 @@ jobs:
       - name: Collect dylib for TrollFools
         run: |
           mkdir -p out
-          find . -name "libwcvoicekeep.dylib" -exec cp {} out/ \;
+          find . -name "WCVoiceKeep.dylib" -exec cp {} out/ \;
           ls -l out
 
       - name: Upload dylib (TrollFools inject)
         uses: actions/upload-artifact@v4
         with:
-          name: libwcvoicekeep-dylib
-          path: out/libwcvoicekeep.dylib
+          name: WCVoiceKeep-dylib
+          path: out/WCVoiceKeep.dylib
