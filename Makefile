@@ -15,11 +15,12 @@ wcvoicekeep_CODESIGN_FLAGS = -Sentitlements.plist
 wcvoicekeep_INSTALL_PATH = /usr/bin
 
 # --- dylib (TrollFools 注入进微信输入法主App，无substrate依赖) ---
-# 必须 arm64e：宿主 com.tencent.wetype 在 A16 上以 arm64e 运行，
-# 注入 dylib 架构须与宿主一致，否则 dyld 不加载。
+# 架构必须与宿主一致。实测本机 wxkb 主二进制是纯 arm64 (ARMv8, 无PAC)，
+# 不是 arm64e -> dylib 必须编 arm64，否则 dyld 架构不匹配、根本不加载，
+# constructor 不执行、日志无 injected。(之前误编 arm64e 导致注入无效)
 LIBRARY_NAME = libwcvoicekeep
 libwcvoicekeep_FILES = inject.m
-libwcvoicekeep_ARCHS = arm64e
+libwcvoicekeep_ARCHS = arm64
 libwcvoicekeep_CFLAGS = -fobjc-arc
 libwcvoicekeep_INSTALL_PATH = /usr/lib
 libwcvoicekeep_FRAMEWORKS = UIKit Foundation
