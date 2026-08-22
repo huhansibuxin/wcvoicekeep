@@ -74,8 +74,9 @@ static const int    kPipWaitTimeoutSec = 15;      // 等 dylib 报 pip.built 超
 static const int    kKillStaleSec     = 25;       // 进程在跑但迟迟无 pip.built -> kill 重试（锁屏僵尸）
 static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.daemon.log";
 
-// 前向声明：maybeWarmWechat 定义在 registerNotifs 之后，但息屏回调里要用
+// 前向声明：maybeWarmWechat / reWarm 定义在 registerNotifs 之后，但息屏回调里要用
 static void maybeWarmWechat(void);
+static void reWarm(void);
 
 // ===== 无头启动：SBS 后台 flag=1（首选），LSA active:NO（兜底）=====
 // SBS background flag=1 = 真后台启动（不显 UI）。LSA active:NO 仅兜底（会带 UI）。
