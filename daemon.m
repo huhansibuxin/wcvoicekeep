@@ -29,7 +29,10 @@
 //
 #include <Foundation/Foundation.h>
 #include <sys/sysctl.h>
-#include <libproc.h>
+#include <sys/param.h>      // PATH_MAX
+#include <sys/proc.h>       // struct kinfo_proc / KERN_PROC_*
+#include <stdlib.h>
+#include <string.h>
 
 // ===== 配置 =====
 static NSString *const kTargetBundleID = @"com.tencent.wetype";
@@ -66,26 +69,29 @@ static void LOG(NSString *fmt, ...) {
     @try { [fh closeFile]; } @catch (NSException *e) {}
 }
 
-// ===== 进程存在性：通过 sysctl proc_listpids + proc_pidpath =====
-// 比 SBS 跨进程接口稳(SBS 需要 entitlement 进 Mach port，daemon 上 entitlement 必须严格匹配)，
-// 不依赖 SpringBoard 上下文，iOS 16 上永远可用。
+// ===== 进程存在性：通过 sysctl(KERN_PROC_ALL) + kinfo_proc.kp_proc.p_comm =====
+// 不用 libproc.h (Theos iOS SDK 找不到头)，手写 sysctl 路径稳如老狗。
+// 主 App 进程名 "wetype"（<=16 字节，正常），扩展进程名 "wxkb" 或 "WxKeyboard"，
+// 模糊匹配任一即认为 Wetype 在跑。
 static BOOL isAppRunning(NSString *bundleID) {
-    pid_t pids[1024];
-    int n = proc_listpids(PROC_ALL_PIDS, 0, pids, sizeof(pids));
-    if (n <= 0) return NO;
-    int nPids = n / sizeof(pid_t);
-    char path[PATH_MAX] = {0};
-    for (int i = 0; i < nPids; i++) {
-        if (pids[i] <= 0) continue;
-        if (proc_pidpath(pids[i], path, sizeof(path)) <= 0) continue;
-        // match either Wetype 主 App 或 它的 keyboard extension
-        if (strstr(path, "wetype.app/") != NULL ||
-            strstr(path, "WxKeyboardPlugin.app/") != NULL ||
-            strstr(path, "wxkb.app/") != NULL) {
-            return YES;
-        }
+    (void)bundleID;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t sz = 0;
+    if (sysctl(mib, 4, NULL, &sz, NULL, 0) != 0 || sz == 0) return NO;
+    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(sz);
+    if (!procs) return NO;
+    if (sysctl(mib, 4, procs, &sz, NULL, 0) != 0) { free(procs); return NO; }
+    int n = (int)(sz / sizeof(struct kinfo_proc));
+    BOOL found = NO;
+    for (int i = 0; i < n; i++) {
+        const char *comm = procs[i].kp_proc.p_comm;
+        if (comm[0] == 0) continue;
+        if (strstr(comm, "wetype") != NULL ||
+            strstr(comm, "WxKeyboard") != NULL ||
+            strstr(comm, "wxkb") != NULL) { found = YES; break; }
     }
-    return NO;
+    free(procs);
+    return found;
 }
 
 // ===== 核心：拉 Wetype 到 background =====
