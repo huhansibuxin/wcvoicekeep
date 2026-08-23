@@ -52,8 +52,6 @@
 #include <string.h>
 #include <time.h>           // time() 预热节流
 #include <signal.h>         // SIGKILL
-#include <glob.h>           // v1.9.11：扫容器找 PiP 心跳文件
-#include <sys/stat.h>       // v1.9.11：stat 心跳文件 mtime
 
 // notify.h 在 theos iOS SDK 16.5 路径里默认找不全 - 手动声明 Darwin 通知 API
 // 而不依赖 <notify.h>。这是私有 API 但 iOS 13+ 名/签名都稳定。
@@ -80,7 +78,6 @@ static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.daemon.log";
 static void maybeWarmWechat(void);
 static void reWarm(void);
 static void watchWechat(void);
-static time_t piPHeartbeatAge(void);
 
 // ===== 无头启动：SBS 后台 flag=1（首选），LSA active:NO（兜底）=====
 // SBS background flag=1 = 真后台启动（不显 UI）。LSA active:NO 仅兜底（会带 UI）。
