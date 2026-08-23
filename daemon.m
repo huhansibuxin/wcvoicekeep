@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.16)
+//  wcvoicekeep daemon  (v1.9.17)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -157,32 +157,60 @@ static int procPid(const char *want) {
 }
 
 // 微信主进程名：WeChat
-// v1.9.16：精确判定「官方微信 com.tencent.xin」是否在跑。
-// 不能用 procExists("WeChat")——设备上有两个微信（官方 com.tencent.xin + 企业
-// com.tencent.qy.xin），主进程名都叫 WeChat，企业微信在跑会误判官方微信活着
-// -> 官方微信被杀永不拉（老板实测 bug，14:25）。按 bundle id 精确查 applicationState。
-static void ensureLSFrameworkLoaded(void); // 前向声明（定义在 170 行）
-static BOOL isWechatRunning(void) {
+// v1.9.17：官方微信检测改为「一次性缓存容器路径 + proc_pidpath 轻量判定」。
+// 不能用 procExists("WeChat")——设备两个微信（官方 com.tencent.xin + 企业
+// com.tencent.qy.xin）主进程名都叫 WeChat，企业微信在跑会误判官方微信活着。
+// v1.9.16 的 allApplications 每次 tick 遍历太重 -> 内存暴涨被 jetsam 杀 14 次
+// （last exit reason = JETSAM_REASON_MEMORY_PERPROCESSLIMIT）-> 微信看护失效。
+// 现改为：启动时用 LSApplicationWorkspace 拿一次官方微信容器路径（一次性开销），
+// 之后 isWechatRunning 纯 sysctl + proc_pidpath 路径前缀匹配（轻量、零内存增长）。
+#include <libproc.h>
+static char gWechatPathPrefix[PATH_MAX] = {0}; // 官方微信容器路径前缀（如 .../720ADACF-.../）
+static void cacheWechatPath(void) {
+    if (gWechatPathPrefix[0]) return; // 只做一次
     ensureLSFrameworkLoaded();
     Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
-    if (!wsCls) return procExists("WeChat"); // fallback
+    if (!wsCls) return;
     id ws = ((id(*)(Class,SEL))objc_msgSend)(wsCls, NSSelectorFromString(@"defaultWorkspace"));
-    if (!ws) return procExists("WeChat");
-    NSArray *apps = [ws performSelector:@selector(allApplications)];
-    if (!apps) return procExists("WeChat");
+    NSArray *apps = ws ? [ws performSelector:@selector(allApplications)] : nil;
     for (id proxy in apps) {
         NSString *bid = [proxy performSelector:@selector(bundleIdentifier)];
         if ([bid isEqualToString:kWechatBundleID]) {
-            SEL stSel = NSSelectorFromString(@"applicationState");
-            if ([proxy respondsToSelector:stSel]) {
-                int st = (int)((int(*)(id,SEL))objc_msgSend)(proxy, stSel);
-                LOG(@"wechat(%@) appState=%d (0=not running)", kWechatBundleID, st);
-                return st > 0;
+            NSURL *url = [proxy performSelector:@selector(bundleURL)];
+            NSString *p = [url path]; // .../720ADACF-.../WeChat.app
+            NSString *container = [[p stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+            if (container.length > 0) {
+                strlcpy(gWechatPathPrefix, [container UTF8String], PATH_MAX);
+                LOG(@"wechat(xin) container cached: %@", container);
             }
-            return YES;
+            return;
         }
     }
-    return NO;
+}
+static void ensureLSFrameworkLoaded(void); // 前向声明（定义在 194 行）
+static BOOL isWechatRunning(void) {
+    cacheWechatPath();
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t sz = 0;
+    if (sysctl(mib, 4, NULL, &sz, NULL, 0) != 0 || sz == 0) return NO;
+    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(sz);
+    if (!procs) return NO;
+    if (sysctl(mib, 4, procs, &sz, NULL, 0) != 0) { free(procs); return NO; }
+    int n = (int)(sz / sizeof(struct kinfo_proc));
+    BOOL found = NO;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(procs[i].kp_proc.p_comm, "WeChat") != 0) continue;
+        if (gWechatPathPrefix[0]) {
+            char pathbuf[PATH_MAX];
+            int len = (int)proc_pidpath(procs[i].kp_proc.p_pid, pathbuf, sizeof(pathbuf));
+            if (len > 0 && strncmp(pathbuf, gWechatPathPrefix, strlen(gWechatPathPrefix)) == 0) { found = YES; break; }
+        } else {
+            found = YES; // 缓存失败 fallback：任意 WeChat 进程
+            break;
+        }
+    }
+    free(procs);
+    return found;
 }
 
 // ===== 关键：daemon 是独立进程，默认不链接 MobileCoreServices/LSApplicationWorkspace
