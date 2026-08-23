@@ -155,28 +155,32 @@ static void SwizzleAVPiPActive(void) {
     });
 }
 
-// 兜底：10s 低频纯内存守护（非心跳——不写盘不跨进程，微秒级）
+// 兜底：2s 常驻纯内存守护（v1.9.22，原 10s）——视频关闭（音频消失）后 ≤2s 重建 PiP。
+// 逻辑升级：PiP 没活着 且 无其他音频 -> 立即发 pip.lost 重建（不只翻转检测）。
+// 5s 节流防重建失败反复刷。非心跳：纯内存查询（AudioSessionGetProperty + objc_msgSend
+// 微秒级），不写盘不跨进程。
+static time_t gLastLost = 0;
 static void StartPiPGuard(void) {
     static dispatch_source_t guardTimer = nil;
     if (guardTimer) return;
     guardTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                         dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
-    dispatch_source_set_timer(guardTimer, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
-                              10 * NSEC_PER_SEC, 2 * NSEC_PER_SEC);
+    dispatch_source_set_timer(guardTimer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                              2 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
     dispatch_source_set_event_handler(guardTimer, ^{
         @autoreleasepool {
             Class mc = objc_getClass("WBVoiceInputPIPManager");
             id m = mc ? ((id (*)(Class, SEL))objc_msgSend)(mc, NSSelectorFromString(@"sharedInstance")) : nil;
             BOOL act = m ? ((BOOL (*)(id, SEL))objc_msgSend)(m, NSSelectorFromString(@"isActive")) : NO;
-            static BOOL last = NO;
-            if (act != last) {
-                last = act;
-                if (!act) ReportPiPLost();
+            if (!act && !OtherAudioPlaying() && time(NULL) - gLastLost >= 5) {
+                gLastLost = time(NULL);
+                WLog(@"GUARD PiP down & audio idle -> rebuild (video PiP closed?)");
+                ReportPiPLost();
             }
         }
     });
     dispatch_resume(guardTimer);
-    WLog(@"PIPWATCH guard timer started (10s, in-memory only)");
+    WLog(@"PIPWATCH guard timer started (2s, in-memory only, v1.9.22)");
 }
 
 static void WatchPiPLost(id mgr) {

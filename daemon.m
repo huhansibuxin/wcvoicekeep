@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.21)
+//  wcvoicekeep daemon  (v1.9.22)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -597,21 +597,16 @@ int main(int argc, char *argv[]) {
         LOG(@"sleeping %ds for SpringBoard...", kBootDelaySec);
         sleep(kBootDelaySec);
 
-        // 注销后立即预热：最多试 ~2 分钟。锁屏期不拉输入法（僵尸没 PiP，老板要求），
-        // 等解锁——lockstate 回调会在解锁瞬间立即重拉补完。
-        LOG(@"boot warmup loop until pip.built (max ~2min, skip wetype while LOCKED)...");
+        // 注销后立即预热：最多试 ~2 分钟。
+        // v1.9.22：锁屏也拉 wetype（不再跳过）——SB 保活后锁屏拉起不再是僵尸
+        //（进程不挂起 + scene active），解锁时 DidBecomeActive 自动建 PiP，无需等
+        // lockstate 回调。修"注销后拉起快慢不稳定"（原来拉起时机=用户解锁时机）。
+        LOG(@"boot warmup loop until pip.built (max ~2min)...");
         time_t bootStart = time(NULL);
         while (!gPipUp && time(NULL) - bootStart < 120) {
-            if (gLocked) {
-                // 锁屏不拉输入法（拉起是僵尸没 PiP）；解锁由 lockstate 回调即时重拉。
-                // v1.9.20：微信无头拉起不受锁屏影响，锁屏期也拉（不再被锁屏挡住）
-                if (!gWechatWarmed && time(NULL) - bootStart >= 3) maybeWarmWechat();
-                sleep(3);
-                continue;
-            }
             @autoreleasepool { warmupOnce(); }
             if (gPipUp) break;
-            // v1.9.20：微信提前到 3s（原 30s），注销后尽早拉起；maybeWarmWechat 内部节流防重复
+            // v1.9.20：微信 3s 点尽早拉；maybeWarmWechat 内部节流防重复
             if (!gWechatWarmed && time(NULL) - bootStart >= 3) maybeWarmWechat();
             sleep(kFastRetrySec);
         }
