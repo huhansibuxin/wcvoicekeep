@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.13)
+//  wcvoicekeep daemon  (v1.9.14)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -342,19 +342,16 @@ static void registerNotifs(void) {
     LOG(@"notifs registered (pip.built + hasBlankedScreen + lockstate)");
 }
 
-// 杀进程：锁屏期 SBS 拉起可能只起进程不激活（不建 PiP），杀掉让下轮重试激活
+// 杀进程：锁屏期 SBS 拉起可能只起进程不激活（不建 PiP），杀掉让下轮重试激活。
+// v1.9.14：改用 procPid("wxkb") + kill——实测 SBSProcessIDForDisplayIdentifier 拿不到
+// pid（静默失败），导致 zombie 分支 kill 无效、wetype 永远挂着不重建。
 static void killApp(void) {
-    static int (*pidFn)(CFStringRef, pid_t *) = NULL;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        void *h = dlopen(SBS_PATH, RTLD_LAZY);
-        if (h) pidFn = dlsym(h, "SBSProcessIDForDisplayIdentifier");
-    });
-    if (!pidFn) { LOG(@"killApp: SBSProcessIDForDisplayIdentifier unavailable"); return; }
-    pid_t pid = 0;
-    if (pidFn((__bridge CFStringRef)kTargetBundleID, &pid) == 0 && pid > 0) {
+    int pid = procPid("wxkb");
+    if (pid > 0) {
         kill(pid, SIGKILL);
-        LOG(@"kill %@ pid=%d (SIGKILL) - retry activation next cycle", kTargetBundleID, (int)pid);
+        LOG(@"kill %@ pid=%d (SIGKILL) - retry activation next cycle", kTargetBundleID, pid);
+    } else {
+        LOG(@"killApp: wxkb pid not found (procPid)");
     }
 }
 

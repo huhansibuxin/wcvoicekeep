@@ -1,0 +1,20 @@
+fix(wcvoicekeep): pip.built 上报与自动退后台解耦 + killApp 改 procPid，修僵尸死循环 (v1.9.14)
+
+实测 v1.9.13 根因（dylib 日志 + daemon 日志交叉铁证）：
+1. SBSLaunchApplicationForDebugging 带参拉起失败(7) -> fallback SBSLaunchApplicationWithIdentifier(flags=0) 无参拉起 -> dylib gWarmupArg=NO
+2. PiP 慢启动：t=0.4/1.0/1.8/2.5/4.0s isActive 全 0，4s 安全网强制退后台，t=8.0s 才 isActive=1
+3. isActive=1 时已超 8s 预热窗口（launchTs+8）-> IsWarmup()=NO -> WarmupDone() 不执行
+   -> pip.built 永远不发 -> daemon gPipUp 永 NO -> 走 zombie 分支（kill & re-warm 死循环）
+   -> SUSPENDED 检测（v1.9.13 核心）根本没机会跑
+4. 连带：zombie 分支 killApp 用 SBSProcessIDForDisplayIdentifier 拿不到 pid（静默失败，
+   无 kill 日志）-> wetype 永远挂着（suspend_count=1）不被杀 -> 每次 tick 白杀白拉
+
+修复：
+- Tweak.xm：WarmupDone 解耦——pip.built 无条件发（PiP 建好即上报，gPipUp=YES），
+  AutoBackground 仅 IsWarmup() 时执行（手动打开不打扰）。3 处调用点去掉 IsWarmup 条件。
+- daemon.m：killApp 改用 procPid("wxkb") + kill（不再依赖 SBSProcessIDForDisplayIdentifier）
+- control 1.9.13 -> 1.9.14
+
+注意：Tweak.xm 改了 -> 老板需重注入 dylib（TrollFools）+ 装 deb 双操作！
+验证：装后 wetype 拉起建 PiP 应打 "WARMUP posted com.wcvoicekeep.pip.built -> 0"，
+daemon 日志应出现 PIP.BUILT received；之后打微信视频 PiP 挂断 -> SUSPENDED 分支触发重拉。
