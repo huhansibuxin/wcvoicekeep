@@ -1,12 +1,15 @@
 // SBKeepAlive — SpringBoard 侧注入：让微信输入法(com.tencent.wetype)保持前台态
 //
 // 原理（参考 Immortalizer 开源，iOS 14-16.7.7 验证过的精准 hook 点）：
-//   1) %hook FBScene -updateSettings:withTransitionContext:completion:
-//      当场景属于 wetype 且 transitionContext==nil（非过渡=挂起动作）时 return，
-//      不调用 %orig —— SpringBoard 无法把 wetype 场景切到 deactivated -> 进程不被挂起
-//   2) %hook UIMutableApplicationSceneSettings -setDeactivationReasons:
-//      arg1 != 0 时 return —— 阻止任何"非活跃原因"被设置 -> scene 保持 active
-//      （Immortalizer 原版全局拦截，实测稳定）
+//   %hook FBScene -updateSettings:withTransitionContext:completion:
+//   当场景属于 wetype 且 transitionContext==nil（非过渡=挂起动作）时 return，
+//   不调用 %orig —— SpringBoard 无法把 wetype 场景切到 deactivated -> 进程不被挂起
+//   （FBScene 拦截对 wetype 专属精准，已足够阻止挂起 + scene 保持 active）
+//
+// v1.9.23：删掉 UIMutableApplicationSceneSettings setDeactivationReasons 全局 hook——
+// 它拦截所有 scene 的 deactivation 原因（arg1!=0 全拦），锁屏时系统要给 scene 设
+// 锁屏 deactivation 原因也被拦 -> scene 永不 deactivate -> 自动锁屏被挂起
+// （老板实测：首次解锁后不自动锁屏）。FBScene 专属 hook 已够，全局 hook 有害。
 //
 // 效果：wetype 一直活着且 scene 保持 active（0 CPU，只是不被 SIGSTOP/去激活）
 //   -> 微信视频 PiP 顶掉 wetype PiP 时系统走 suspended（offscreen）而非销毁
@@ -38,16 +41,6 @@ static NSString *const kWetypeBundleID = @"com.tencent.wetype";
             return;
         }
     }
-    %orig;
-}
-
-%end
-
-%hook UIMutableApplicationSceneSettings
-
-// 阻止设置任何"非活跃原因"——scene 保持 active（Immortalizer 原版全局拦截）
-- (void)setDeactivationReasons:(unsigned long long)arg1 {
-    if (arg1 != 0) return;
     %orig;
 }
 

@@ -59,6 +59,13 @@ static void WLog(NSString *fmt, ...) {
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    // v1.9.23：日志上限 3M——超过则清空（防无限增长撑爆沙盒）
+    @autoreleasepool {
+        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:gLogPath error:nil];
+        if ([attr[NSFileSize] unsignedLongLongValue] > 3ull * 1024 * 1024) {
+            [[NSData data] writeToFile:gLogPath atomically:YES]; // 清空
+        }
+    }
     FILE *f = fopen([gLogPath UTF8String], "a");
     if (f) { fputs([line UTF8String], f); fclose(f); }
     NSLog(@"[WCVK] %@", msg); // 双保险，syslog 也能看到

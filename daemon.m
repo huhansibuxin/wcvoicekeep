@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.22)
+//  wcvoicekeep daemon  (v1.9.23)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -52,6 +52,8 @@
 #include <string.h>
 #include <time.h>           // time() 预热节流
 #include <signal.h>         // SIGKILL
+#include <fcntl.h>          // v1.9.23：日志 3M 上限（open O_TRUNC）
+#include <sys/stat.h>       // v1.9.23：stat 日志大小
 
 // notify.h 在 theos iOS SDK 16.5 路径里默认找不全 - 手动声明 Darwin 通知 API
 // 而不依赖 <notify.h>。这是私有 API 但 iOS 13+ 名/签名都稳定。
@@ -89,15 +91,35 @@ static BOOL otherAudioPlaying(void);  // v1.9.21：pip.lost 回调(364)在定义
 @end
 
 // ===== 工具：append 写日志(原子写避免半行) =====
+// v1.9.23：日志上限 3M（kLogPath + stderr 重定向文件），每 30s 检查一次超限清空
+static void TrimDaemonLogs(void) {
+    static time_t lastCheck = 0;
+    time_t now = time(NULL);
+    if (now - lastCheck < 30) return;
+    lastCheck = now;
+    @autoreleasepool {
+        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:kLogPath error:nil];
+        if ([attr[NSFileSize] unsignedLongLongValue] > 3ull * 1024 * 1024) {
+            [[NSData data] writeToFile:kLogPath atomically:YES]; // 清空
+        }
+    }
+    const char *errPath = "/var/log/wcvoicekeep.daemon.err";
+    struct stat est;
+    if (stat(errPath, &est) == 0 && est.st_size > 3ll * 1024 * 1024) {
+        int fd = open(errPath, O_WRONLY | O_TRUNC);
+        if (fd >= 0) close(fd);
+    }
+}
 static void LOG(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSString *line = [NSString stringWithFormat:@"[%@][daemon] %@\n", [NSDate date], msg];
     NSLog(@"[WCVK-daemon] %@", msg);
-    // 镜像到 stderr → launchd StandardErrorPath(/var/mobile/wcvoicekeep.daemon.err)
+    // 镜像到 stderr → launchd StandardErrorPath(/var/log/wcvoicekeep.daemon.err)
     // 进程被 SIGKILL/SIGSEGV/launchd throttle 时不至于丢全部上下文
     fprintf(stderr, "%s", [line UTF8String]); fflush(stderr);
+    TrimDaemonLogs(); // v1.9.23：3M 上限
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLogPath];
     if (!fh) {
         [[NSData data] writeToFile:kLogPath atomically:YES]; // touch
