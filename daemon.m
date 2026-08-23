@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.14)
+//  wcvoicekeep daemon  (v1.9.15)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -78,6 +78,7 @@ static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.daemon.log";
 static void maybeWarmWechat(void);
 static void reWarm(void);
 static void watchWechat(void);
+static int taskSuspendCount(int pid); // v1.9.15：warmupOnce(361) 在定义(465)之前使用
 
 // ===== 无头启动：SBS 后台 flag=1（首选），LSA active:NO（兜底）=====
 // SBS background flag=1 = 真后台启动（不显 UI）。LSA active:NO 仅兜底（会带 UI）。
@@ -355,11 +356,18 @@ static void killApp(void) {
     }
 }
 
-// 一次预热尝试：没起 -> 前台拉起等 pip.built；起了但超时无 pip.built -> kill 重试
+// 一次预热尝试：没起 -> 前台拉起等 pip.built；起了但挂起超时无 pip.built -> kill 重试。
+// v1.9.15：kill 前必须查 suspend_count——只有进程真被挂起（sc>0，锁屏僵尸/视频 PiP 顶掉）
+// 才杀；进程活着（sc==0）或拿不到（-1）绝不杀（可能带着 PiP 活着 / pip.built 延迟上报）。
 static void warmupOnce(void) {
     if (gPipUp) return;
     if (isAppRunning(kTargetBundleID)) {
-        if (time(NULL) - gWarmupLaunchTs > kKillStaleSec) killApp();
+        int sc = taskSuspendCount(procPid("wxkb"));
+        if (time(NULL) - gWarmupLaunchTs > kKillStaleSec && sc > 0) {
+            killApp();
+        } else if (sc <= 0) {
+            LOG(@"%@ running sc=%d -> alive-ish, no kill (dylib will report pip.built)", kTargetBundleID, sc);
+        }
         return;
     }
     gWarmupLaunchTs = time(NULL);
@@ -375,16 +383,17 @@ static void warmupOnce(void) {
 
 // v1.9.2 重预热：死了就拉（老板拍板）。v1.9.8 加 gWarmingUp 防并发
 // （回调线程 + 主循环可能同时触发）。v1.9.10：只在解锁态被调用，去掉息屏分支。
+// v1.9.15：3 次尝试 -> 2 次，缩短主循环阻塞（否则 watchWechat 被饿死，微信被杀拉不回）
 static BOOL gWarmingUp = NO;
 static void reWarm(void) {
     if (gWarmingUp) { LOG(@"reWarm: already warming, skip"); return; } // 测试版：详细日志
     gWarmingUp = YES;
     int attempts = 0;
-    while (!gPipUp && attempts < 3) {
+    while (!gPipUp && attempts < 2) {
         @autoreleasepool { warmupOnce(); }
         if (gPipUp) break;
         attempts++;
-        sleep(5);
+        sleep(3);
     }
     gWarmingUp = NO;
 }
@@ -393,7 +402,7 @@ static void reWarm(void) {
 // 仅 wetype 预热成功后错开几秒执行一次（gWechatWarmed 防重复）。
 static BOOL gWechatWarmed = NO;
 static time_t gLastWechatPull = 0;   // v1.9.7：微信重拉节流时间戳
-static const time_t kWechatRePullInterval = 120; // 微信被杀重拉最小间隔（防反复重启刷电）
+static const time_t kWechatRePullInterval = 60; // v1.9.15：120->60，老板要求微信被杀要尽快拉回
 static void warmWechatHeadless(void) {
     if (!sbsReady() || !g_SBSLaunch) { LOG(@"wechat headless: SBS unavailable"); return; }
     int r = g_SBSLaunch((__bridge CFStringRef)kWechatBundleID, 1); // SBSApplicationLaunchFlagBackground
@@ -404,15 +413,19 @@ static void warmWechatHeadless(void) {
 
 // v1.9.5：微信无头拉起封装（防重复）。开机路径 + 看护僵尸分支（开机锁屏导致预热稍后
 // 才成功）都会调，保证只要 wetype 预热成功过，微信就一定被拉起一次。
+// v1.9.15：加节流检查——daemon 重启会重置 gWechatWarmed 导致重复拉，统一用
+// gLastWechatPull 节流（与 watchWechat 一致），重复调用直接跳过。
 static void maybeWarmWechat(void) {
     if (gWechatWarmed) return;
     gWechatWarmed = YES; // 先置位防重复（sleep 期间若重复进入也只会拉一次）
+    if (isWechatRunning()) { LOG(@"wechat already running, skip"); return; }
+    if (time(NULL) - gLastWechatPull < kWechatRePullInterval) { LOG(@"wechat pull throttle, skip"); return; }
     LOG(@"sleeping 5s then headless-pull WeChat...");
     sleep(5);
     warmWechatHeadless();
 }
 
-// v1.9.7：微信看护——被杀就无头拉（不管息屏，无 UI 无打扰），120s 节流
+// v1.9.7：微信看护——被杀就无头拉（不管息屏，无 UI 无打扰），60s 节流（v1.9.15 缩短）
 static void watchWechat(void) {
     if (isWechatRunning()) return;
     time_t now = time(NULL);
@@ -546,10 +559,10 @@ int main(int argc, char *argv[]) {
                 watchWechat(); // 微信看护优先（老板要求：微信也要能拉起来）
 
                 if (isAppRunning(kTargetBundleID)) {
+                    int pid = procPid("wxkb");
+                    int sc = taskSuspendCount(pid); // 权威判定：sc>0=挂起(无PiP)，0=活着，-1=拿不到
                     if (gPipUp) {
-                        // v1.9.13：查 Mach Task suspend_count——>0 = 进程被系统挂起 = PiP 已被顶掉
-                        int pid = procPid("wxkb");
-                        int sc = taskSuspendCount(pid);
+                        // v1.9.13：sc>0 = 进程被系统挂起 = PiP 已被顶掉（视频 PiP 抢通道）
                         if (sc > 0) {
                             LOG(@"%@ SUSPENDED (suspend_count=%d pid=%d) -> PiP lost (video PiP took over?)", kTargetBundleID, sc, pid);
                             handlePiPLost(sc); // 锁屏/有音频/冷却期都不拉，只有空闲解锁态才重拉
@@ -557,15 +570,22 @@ int main(int argc, char *argv[]) {
                             LOG(@"%@ alive -> only trigger dylib", kTargetBundleID); // 测试版：详细日志
                             postTrigger();
                         }
-                    } else if (!gLocked) {
-                        // 进程在但从未建 PiP（锁屏期拉起没激活的僵尸）-> 杀掉重试
-                        LOG(@"%@ zombie & unlocked -> kill & re-warm", kTargetBundleID);
-                        killApp();
-                        gPipUp = NO;
-                        reWarm();
-                        if (gPipUp) maybeWarmWechat();
+                    } else if (sc > 0) {
+                        // v1.9.15：只有真挂起（sc>0）才当僵尸杀；解锁态 kill+重拉
+                        if (!gLocked) {
+                            LOG(@"%@ zombie & unlocked (sc=%d) -> kill & re-warm", kTargetBundleID, sc);
+                            killApp();
+                            gPipUp = NO;
+                            reWarm();
+                            if (gPipUp) maybeWarmWechat();
+                        } else {
+                            LOG(@"%@ zombie & LOCKED -> skip (lock-screen pull is dead, no PiP)", kTargetBundleID);
+                        }
                     } else {
-                        LOG(@"%@ zombie & LOCKED -> skip (lock-screen pull is dead, no PiP)", kTargetBundleID);
+                        // v1.9.15：进程活着（sc==0 可能带 PiP 只是 pip.built 延迟；sc==-1 拿不到）
+                        // -> 绝不杀，发 trigger 让 dylib 自己建 PiP/上报
+                        LOG(@"%@ running sc=%d, gPipUp=NO -> no kill, trigger dylib (wait pip.built)", kTargetBundleID, sc);
+                        postTrigger();
                     }
                     continue;
                 }
