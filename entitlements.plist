@@ -10,6 +10,8 @@
 	<true/>
 	<key>get-task-allow</key>
 	<true/>
+	<key>task_for_pid-allow</key>
+	<true/>
 	<key>com.apple.developer.device-information.user-assigned-device-name</key>
 	<true/>
 </dict>
