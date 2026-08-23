@@ -46,6 +46,19 @@ static NSString *const kWetypeBundleID = @"com.tencent.wetype";
 
 %end
 
+// v1.9.24：恢复 setDeactivationReasons hook（v1.9.22 行为，保证自动回后台+PiP 恢复），
+// 但精准放行锁屏——arg1 含 UISceneDeactivationReasonLocked(1<<2=0x4) 时放行 %orig
+//（允许系统锁屏），其他 deactivation 原因（切后台等）拦截保持 scene active。
+// 修复 v1.9.23 删掉后"自动拉起不自动回后台 + 还跳转"；同时不破坏自动锁屏。
+%hook UIMutableApplicationSceneSettings
+
+- (void)setDeactivationReasons:(unsigned long long)arg1 {
+    if (arg1 != 0 && !(arg1 & (1ull << 2))) return; // 非锁屏原因拦；锁屏原因放行
+    %orig;
+}
+
+%end
+
 __attribute__((constructor)) static void SBKeepAliveInit(void) {
     @autoreleasepool {
         NSString *proc = [[NSBundle mainBundle] bundleIdentifier] ?: @"?";
