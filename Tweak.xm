@@ -117,6 +117,10 @@ static void WarmupDone(void) {
 //   兜底：10s 低频纯内存守护（objc_msgSend 微秒级，不写盘不跨进程，非心跳）——
 //       防 AVKit 内部不读 getter 的漏网
 // daemon 收到 pip.lost -> 立即回发 pip.trigger -> dylib 在 scene active 下后台重建（无跳转）
+// v1.9.25：守护按需启动（前向声明，定义在下方）
+static void ReportPiPLost(void);
+static void StartPiPGuard(void);
+static void StopPiPGuard(void);
 @interface WCVKPiPWatcher : NSObject
 @end
 static WCVKPiPWatcher *gPiPWatcher = nil;
@@ -126,7 +130,8 @@ static WCVKPiPWatcher *gPiPWatcher = nil;
     if (![nv respondsToSelector:@selector(boolValue)]) return;
     if (![nv boolValue]) {
         WLog(@"PIPLOST KVO(pipController) isActive->NO -> notify daemon");
-        notify_post("com.wcvoicekeep.pip.lost");
+        ReportPiPLost();
+        StartPiPGuard(); // v1.9.25：按需守护
     }
 }
 @end
@@ -153,7 +158,10 @@ static void SwizzleAVPiPActive(void) {
             BOOL last = lastN ? [lastN boolValue] : NO;
             if (v != last) {
                 objc_setAssociatedObject(self, &kLastKey, @(v), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                if (!v) ReportPiPLost(); // 1->0：PiP 被顶掉
+                if (!v) { // 1->0：PiP 被顶掉 -> 立即上报 + 按需守护
+                    ReportPiPLost();
+                    StartPiPGuard();
+                }
             }
             return v;
         });
@@ -162,37 +170,47 @@ static void SwizzleAVPiPActive(void) {
     });
 }
 
-// 兜底：2s 常驻纯内存守护（v1.9.22，原 10s）——视频关闭（音频消失）后 ≤2s 重建 PiP。
-// 逻辑升级：PiP 没活着 且 无其他音频 -> 立即发 pip.lost 重建（不只翻转检测）。
-// 5s 节流防重建失败反复刷。非心跳：纯内存查询（AudioSessionGetProperty + objc_msgSend
-// 微秒级），不写盘不跨进程。
+// 兜底：按需守护（v1.9.25，替代常驻 2s）——平时零定时器零查询，
+// 只有 swizzle/KVO 检测到 PiP 掉（1->0）才启动 2s 守护做重建重试，PiP 回来即停。
+// 音频门控保持：PiP 没活着 且 无其他音频 才重发 pip.lost（微信视频 PiP 在播不抢）。
 static time_t gLastLost = 0;
+static dispatch_source_t gGuardTimer = nil;
+static BOOL gGuardRunning = NO;
+static void StopPiPGuard(void) {
+    if (gGuardRunning && gGuardTimer) {
+        dispatch_source_cancel(gGuardTimer);
+        gGuardTimer = nil;
+        gGuardRunning = NO;
+        WLog(@"PIPWATCH guard stopped (PiP back, zero-timer again)");
+    }
+}
 static void StartPiPGuard(void) {
-    static dispatch_source_t guardTimer = nil;
-    if (guardTimer) return;
-    guardTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
-    dispatch_source_set_timer(guardTimer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+    if (gGuardRunning) return;
+    gGuardTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                         dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    dispatch_source_set_timer(gGuardTimer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                               2 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
-    dispatch_source_set_event_handler(guardTimer, ^{
+    dispatch_source_set_event_handler(gGuardTimer, ^{
         @autoreleasepool {
             Class mc = objc_getClass("WBVoiceInputPIPManager");
             id m = mc ? ((id (*)(Class, SEL))objc_msgSend)(mc, NSSelectorFromString(@"sharedInstance")) : nil;
             BOOL act = m ? ((BOOL (*)(id, SEL))objc_msgSend)(m, NSSelectorFromString(@"isActive")) : NO;
-            if (!act && !OtherAudioPlaying() && time(NULL) - gLastLost >= 5) {
+            if (act) { StopPiPGuard(); return; } // 重建成功，停守护回零定时器
+            if (!OtherAudioPlaying() && time(NULL) - gLastLost >= 5) {
                 gLastLost = time(NULL);
-                WLog(@"GUARD PiP down & audio idle -> rebuild (video PiP closed?)");
+                WLog(@"GUARD PiP down & audio idle -> rebuild retry");
                 ReportPiPLost();
             }
         }
     });
-    dispatch_resume(guardTimer);
-    WLog(@"PIPWATCH guard timer started (2s, in-memory only, v1.9.22)");
+    dispatch_resume(gGuardTimer);
+    gGuardRunning = YES;
+    WLog(@"PIPWATCH guard started (on-demand, PiP lost)");
 }
 
 static void WatchPiPLost(id mgr) {
-    SwizzleAVPiPActive(); // 主：swizzle AVKit getter
-    StartPiPGuard();      // 兜底：低频守护
+    SwizzleAVPiPActive(); // 主：swizzle AVKit getter（事件驱动，零定时器待命）
+    // v1.9.25：守护按需启动——swizzle/KVO 检测到 PiP 掉才 StartPiPGuard，平时零定时器
     // 附：尝试 KVO pipController（AVKit 属性 KVO 兼容，能拿到就双保险）
     if (gPiPWatcher) return;
     @try {
