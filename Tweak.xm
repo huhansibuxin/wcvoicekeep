@@ -21,8 +21,9 @@ static const char *const kTriggerName = "com.wcvoicekeep.pip.trigger";
 
 // v1.9.21：其他 App 音频在播（微信视频 PiP）——此时重建 wetype PiP 会抢唯一通道、
 // 顶掉微信视频 PiP（老板实测：微信 pip 被回调关闭 + 恶性循环）。有音频绝不重建，
-// 等视频结束（无音频）再建。AudioSessionGetProperty 已 deprecated，手写声明防 -Werror。
-extern int AudioSessionGetProperty(unsigned int inID, unsigned int *ioDataSize, void *outData);
+// 等视频结束（无音频）再建。AudioSessionGetProperty 已 deprecated，手写声明防 -Werror；
+// .xm 按 ObjC++ 编译，C 符号必须 extern "C"。
+extern "C" int AudioSessionGetProperty(unsigned int inID, unsigned int *ioDataSize, void *outData);
 static BOOL OtherAudioPlaying(void) {
     unsigned int playing = 0;
     unsigned int sz = sizeof(playing);
