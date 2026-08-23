@@ -166,6 +166,7 @@ static int procPid(const char *want) {
 // 之后 isWechatRunning 纯 sysctl + proc_pidpath 路径前缀匹配（轻量、零内存增长）。
 // theos SDK 缺 libproc.h，手写声明（libproc 系统库符号稳定）。
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+static void ensureLSFrameworkLoaded(void); // 前向声明（定义在 194 行，cacheWechatPath 先于其调用）
 static char gWechatPathPrefix[PATH_MAX] = {0}; // 官方微信容器路径前缀（如 .../720ADACF-.../）
 static void cacheWechatPath(void) {
     if (gWechatPathPrefix[0]) return; // 只做一次
@@ -188,7 +189,6 @@ static void cacheWechatPath(void) {
         }
     }
 }
-static void ensureLSFrameworkLoaded(void); // 前向声明（定义在 194 行）
 static BOOL isWechatRunning(void) {
     cacheWechatPath();
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
