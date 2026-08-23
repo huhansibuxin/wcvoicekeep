@@ -164,7 +164,8 @@ static int procPid(const char *want) {
 // （last exit reason = JETSAM_REASON_MEMORY_PERPROCESSLIMIT）-> 微信看护失效。
 // 现改为：启动时用 LSApplicationWorkspace 拿一次官方微信容器路径（一次性开销），
 // 之后 isWechatRunning 纯 sysctl + proc_pidpath 路径前缀匹配（轻量、零内存增长）。
-#include <libproc.h>
+// theos SDK 缺 libproc.h，手写声明（libproc 系统库符号稳定）。
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 static char gWechatPathPrefix[PATH_MAX] = {0}; // 官方微信容器路径前缀（如 .../720ADACF-.../）
 static void cacheWechatPath(void) {
     if (gWechatPathPrefix[0]) return; // 只做一次
