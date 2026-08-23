@@ -52,6 +52,8 @@
 #include <string.h>
 #include <time.h>           // time() 预热节流
 #include <signal.h>         // SIGKILL
+#include <glob.h>           // v1.9.11：扫容器找 PiP 心跳文件
+#include <sys/stat.h>       // v1.9.11：stat 心跳文件 mtime
 
 // notify.h 在 theos iOS SDK 16.5 路径里默认找不全 - 手动声明 Darwin 通知 API
 // 而不依赖 <notify.h>。这是私有 API 但 iOS 13+ 名/签名都稳定。
@@ -78,6 +80,7 @@ static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.daemon.log";
 static void maybeWarmWechat(void);
 static void reWarm(void);
 static void watchWechat(void);
+static time_t piPHeartbeatAge(void);
 
 // ===== 无头启动：SBS 后台 flag=1（首选），LSA active:NO（兜底）=====
 // SBS background flag=1 = 真后台启动（不显 UI）。LSA active:NO 仅兜底（会带 UI）。
@@ -264,7 +267,7 @@ static BOOL warmupForeground(void) {
 // ===== 触发：发 Darwin 通知让 dylib 兜底建 PiP =====
 static void postTrigger(void) {
     uint32_t st = notify_post(kTriggerName);
-    if (st != 0) LOG(@"notify_post(%s) FAILED (%u)", kTriggerName, st); // 静默：成功不刷屏，失败才记
+    LOG(@"notify_post(%s) -> %u (0=ok)", kTriggerName, st); // 测试版：详细日志
 }
 
 // ===== v1.9.1 状态机：dylib 反向通知 pip.built + 屏幕状态 =====
@@ -361,9 +364,8 @@ static void warmupOnce(void) {
 // v1.9.2 重预热：死了就拉（老板拍板）。v1.9.8 加 gWarmingUp 防并发
 // （回调线程 + 主循环可能同时触发）。v1.9.10：只在解锁态被调用，去掉息屏分支。
 static BOOL gWarmingUp = NO;
-static BOOL gLastAliveLogged = NO; // 日志静默：alive 状态只在翻转时打一次，不每 60s 刷屏
 static void reWarm(void) {
-    if (gWarmingUp) { return; } // 静默：防并发重试不刷屏
+    if (gWarmingUp) { LOG(@"reWarm: already warming, skip"); return; } // 测试版：详细日志
     gWarmingUp = YES;
     int attempts = 0;
     while (!gPipUp && attempts < 3) {
@@ -411,6 +413,26 @@ static void watchWechat(void) {
     warmWechatHeadless();
 }
 
+// ===== v1.9.11 测试：task_for_pid 能否拿其他进程 task port =====
+// 用途：判定「纯 daemon 用 Mach Task State 检测 wetype 是否被挂起」方案是否可行。
+// 用法：wcvoicekeep --tfp-check <pid>  （真实 daemon 环境 root+platform-application）
+#include <mach/mach.h>
+#include <mach/task_info.h>
+static int tfpCheck(int pid) {
+    mach_port_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    fprintf(stderr, "[TFP-CHECK] task_for_pid(%d) -> %d (%s)\n", pid, kr,
+            kr == KERN_SUCCESS ? "OK" : mach_error_string(kr));
+    if (kr != KERN_SUCCESS) return 1;
+    struct task_basic_info info;
+    mach_msg_type_number_t cnt = TASK_BASIC_INFO_COUNT;
+    kr = task_info(task, TASK_BASIC_INFO, (task_info_t)&info, &cnt);
+    fprintf(stderr, "[TFP-CHECK] task_info -> %d suspend_count=%d resident=%lluKB\n",
+            kr, info.suspend_count, (unsigned long long)(info.resident_size / 1024));
+    mach_port_deallocate(mach_task_self(), task);
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     // 早期 stderr（不依赖 Foundation/ObjC runtime）——
     // launchd 任何阶段拒收(进程类型/entitlement/签名/sandbox)都能立刻看到，
@@ -418,6 +440,13 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "[WCVK-DAEMON] main() entered pid=%d uid=%d argv0=%s\n",
             getpid(), getuid(), (argc > 0 && argv[0]) ? argv[0] : "?");
     fflush(stderr);
+
+    // v1.9.11：--tfp-check <pid> 测试分支（真实 daemon 环境），测完即退不影响正常功能
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--tfp-check") == 0 && i + 1 < argc) {
+            return tfpCheck(atoi(argv[i + 1]));
+        }
+    }
 
     @autoreleasepool {
         LOG(@"==== daemon boot ====");
@@ -460,14 +489,9 @@ int main(int argc, char *argv[]) {
 
                 if (isAppRunning(kTargetBundleID)) {
                     if (gPipUp) {
-                        // 静默：alive 状态只在从非 alive 翻转时打一次，周期性 tick 不刷屏
-                        if (!gLastAliveLogged) {
-                            gLastAliveLogged = YES;
-                            LOG(@"%@ alive -> keep-alive active (only trigger dylib)", kTargetBundleID);
-                        }
+                        LOG(@"%@ alive -> only trigger dylib", kTargetBundleID); // 测试版：详细日志
                         postTrigger();
                     } else if (!gLocked) {
-                        gLastAliveLogged = NO;
                         // 进程在但从未建 PiP（锁屏期拉起没激活的僵尸）-> 杀掉重试
                         LOG(@"%@ zombie & unlocked -> kill & re-warm", kTargetBundleID);
                         killApp();
@@ -475,12 +499,10 @@ int main(int argc, char *argv[]) {
                         reWarm();
                         if (gPipUp) maybeWarmWechat();
                     } else {
-                        gLastAliveLogged = NO;
                         LOG(@"%@ zombie & LOCKED -> skip (lock-screen pull is dead, no PiP)", kTargetBundleID);
                     }
                     continue;
                 }
-                gLastAliveLogged = NO;
                 if (!gLocked) {
                     LOG(@"%@ NOT running & unlocked -> re-warm", kTargetBundleID);
                     gPipUp = NO;
