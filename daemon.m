@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.15)
+//  wcvoicekeep daemon  (v1.9.16)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -157,8 +157,32 @@ static int procPid(const char *want) {
 }
 
 // 微信主进程名：WeChat
+// v1.9.16：精确判定「官方微信 com.tencent.xin」是否在跑。
+// 不能用 procExists("WeChat")——设备上有两个微信（官方 com.tencent.xin + 企业
+// com.tencent.qy.xin），主进程名都叫 WeChat，企业微信在跑会误判官方微信活着
+// -> 官方微信被杀永不拉（老板实测 bug，14:25）。按 bundle id 精确查 applicationState。
+static void ensureLSFrameworkLoaded(void); // 前向声明（定义在 170 行）
 static BOOL isWechatRunning(void) {
-    return procExists("WeChat");
+    ensureLSFrameworkLoaded();
+    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
+    if (!wsCls) return procExists("WeChat"); // fallback
+    id ws = ((id(*)(Class,SEL))objc_msgSend)(wsCls, NSSelectorFromString(@"defaultWorkspace"));
+    if (!ws) return procExists("WeChat");
+    NSArray *apps = [ws performSelector:@selector(allApplications)];
+    if (!apps) return procExists("WeChat");
+    for (id proxy in apps) {
+        NSString *bid = [proxy performSelector:@selector(bundleIdentifier)];
+        if ([bid isEqualToString:kWechatBundleID]) {
+            SEL stSel = NSSelectorFromString(@"applicationState");
+            if ([proxy respondsToSelector:stSel]) {
+                int st = (int)((int(*)(id,SEL))objc_msgSend)(proxy, stSel);
+                LOG(@"wechat(%@) appState=%d (0=not running)", kWechatBundleID, st);
+                return st > 0;
+            }
+            return YES;
+        }
+    }
+    return NO;
 }
 
 // ===== 关键：daemon 是独立进程，默认不链接 MobileCoreServices/LSApplicationWorkspace
