@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.17)
+//  wcvoicekeep daemon  (v1.9.18)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -166,28 +166,28 @@ static int procPid(const char *want) {
 // 之后 isWechatRunning 纯 sysctl + proc_pidpath 路径前缀匹配（轻量、零内存增长）。
 // theos SDK 缺 libproc.h，手写声明（libproc 系统库符号稳定）。
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
-static void ensureLSFrameworkLoaded(void); // 前向声明（定义在 194 行，cacheWechatPath 先于其调用）
 static char gWechatPathPrefix[PATH_MAX] = {0}; // 官方微信容器路径前缀（如 .../720ADACF-.../）
+// v1.9.18：文件系统扫描找官方微信容器——读每个 WeChat.app/Info.plist 的
+// CFBundleIdentifier，匹配 com.tencent.xin 即记录其容器路径。
+// 不用 LSApplicationWorkspace（v1.9.17 实测 allApplications 遍历拿不到/不触发，
+// container cached 日志=0，fallback 回"任意 WeChat"-> 企业微信顶替 bug 复活）。
 static void cacheWechatPath(void) {
     if (gWechatPathPrefix[0]) return; // 只做一次
-    ensureLSFrameworkLoaded();
-    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
-    if (!wsCls) return;
-    id ws = ((id(*)(Class,SEL))objc_msgSend)(wsCls, NSSelectorFromString(@"defaultWorkspace"));
-    NSArray *apps = ws ? [ws performSelector:@selector(allApplications)] : nil;
-    for (id proxy in apps) {
-        NSString *bid = [proxy performSelector:@selector(bundleIdentifier)];
-        if ([bid isEqualToString:kWechatBundleID]) {
-            NSURL *url = [proxy performSelector:@selector(bundleURL)];
-            NSString *p = [url path]; // .../720ADACF-.../WeChat.app
-            NSString *container = [[p stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
-            if (container.length > 0) {
-                strlcpy(gWechatPathPrefix, [container UTF8String], PATH_MAX);
-                LOG(@"wechat(xin) container cached: %@", container);
-            }
+    NSArray *dirs = [[NSFileManager defaultManager]
+                     contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:nil];
+    for (NSString *uuid in dirs) {
+        NSString *plistPath = [NSString stringWithFormat:
+            @"/var/containers/Bundle/Application/%@/WeChat.app/Info.plist", uuid];
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+        if ([info[@"CFBundleIdentifier"] isEqualToString:kWechatBundleID]) {
+            NSString *container = [NSString stringWithFormat:
+                @"/var/containers/Bundle/Application/%@/", uuid];
+            strlcpy(gWechatPathPrefix, [container UTF8String], PATH_MAX);
+            LOG(@"wechat(xin) container cached: %@", container);
             return;
         }
     }
+    LOG(@"wechat(xin) container NOT FOUND in filesystem scan");
 }
 static BOOL isWechatRunning(void) {
     cacheWechatPath();

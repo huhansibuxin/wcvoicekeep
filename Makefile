@@ -12,13 +12,22 @@ export LOGOS_DEFAULT_GENERATOR = internal
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = WCVoiceKeep
+TWEAK_NAME = WCVoiceKeep wetypekeepalive
 
 WCVoiceKeep_FILES = Tweak.xm
 WCVoiceKeep_FRAMEWORKS = UIKit
 # 关键：链接 CydiaSubstrate(=ellekit)，TF 注入才能被 ElleKit 加载执行。
 WCVoiceKeep_LDFLAGS = -Wl,-no_warn_inits -F$(THEOS_PROJECT_DIR)/Frameworks -framework CydiaSubstrate
 WCVoiceKeep_CFLAGS = -fobjc-arc -fno-modules -w
+
+# ===== SpringBoard 侧注入：让 wetype 永不被挂起 + scene 保持 active =====
+# 参考 Immortalizer（iOS14-16.7.7 开源验证）：FBScene updateSettings 拦截去激活
+# （进程不挂起）+ UIMutableApplicationSceneSettings setDeactivationReasons 拦截
+# （scene 保持 active）-> 微信视频 PiP 顶掉后 PiP 可自动恢复/后台重建。
+# v1.9.18 融合进本 deb（老板要求：不要单独插件避免冲突）。
+wetypekeepalive_FILES = SBKeepAlive.xm
+wetypekeepalive_LDFLAGS = -Wl,-no_warn_inits -F$(THEOS_PROJECT_DIR)/Frameworks -framework CydiaSubstrate
+wetypekeepalive_CFLAGS = -fobjc-arc -fno-modules -w
 
 # ===== 守护进程（注销/重启后自动把 Wetype 主 App 后台拉起，触发 dylib 建 PiP standby）=====
 # rootless 下 TOOL_INSTALL_PATH=/usr/bin -> 实际落到 /var/jb/usr/bin/wcvoicekeep，
