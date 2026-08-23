@@ -19,6 +19,17 @@
 static NSString *gLogPath = nil;
 static const char *const kTriggerName = "com.wcvoicekeep.pip.trigger";
 
+// v1.9.21：其他 App 音频在播（微信视频 PiP）——此时重建 wetype PiP 会抢唯一通道、
+// 顶掉微信视频 PiP（老板实测：微信 pip 被回调关闭 + 恶性循环）。有音频绝不重建，
+// 等视频结束（无音频）再建。AudioSessionGetProperty 已 deprecated，手写声明防 -Werror。
+extern int AudioSessionGetProperty(unsigned int inID, unsigned int *ioDataSize, void *outData);
+static BOOL OtherAudioPlaying(void) {
+    unsigned int playing = 0;
+    unsigned int sz = sizeof(playing);
+    int st = AudioSessionGetProperty('othr', &sz, &playing);
+    return (st == 0) && (playing != 0);
+}
+
 // 抗双注入 / 抗重复触发：
 //   1) gRegistered —— 构造器若被两个 dylib 各跑一次，只注册一次通知，避免事件被触发 N 遍（日志打 24 遍的根因）
 //   2) gLastEngage —— 同一进程内短间隔不要反复 setup/start 同一个 PiP 单例，避免状态互相踩导致崩
@@ -117,7 +128,8 @@ static void ReportPiPLost(void) {
     notify_post("com.wcvoicekeep.pip.lost");
 }
 
-// 主：swizzle AVKit getter（事件驱动零轮询）
+// 主：swizzle AVKit getter（事件驱动零轮询）。
+// v1.9.21：翻转状态 last 用关联对象按 controller 隔离（防同进程多 controller 互扰）。
 static void SwizzleAVPiPActive(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -126,17 +138,19 @@ static void SwizzleAVPiPActive(void) {
         Method m = class_getInstanceMethod(cls, NSSelectorFromString(@"isPictureInPictureActive"));
         if (!m) { WLog(@"PIPWATCH no isPictureInPictureActive method"); return; }
         IMP orig = method_getImplementation(m);
+        static char kLastKey;
         IMP newImp = imp_implementationWithBlock(^(id self) {
             BOOL v = ((BOOL (*)(id, SEL))orig)(self, NSSelectorFromString(@"isPictureInPictureActive"));
-            static BOOL last = NO;
+            NSNumber *lastN = objc_getAssociatedObject(self, &kLastKey);
+            BOOL last = lastN ? [lastN boolValue] : NO;
             if (v != last) {
-                last = v;
+                objc_setAssociatedObject(self, &kLastKey, @(v), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 if (!v) ReportPiPLost(); // 1->0：PiP 被顶掉
             }
             return v;
         });
         method_setImplementation(m, newImp);
-        WLog(@"PIPWATCH swizzled AVPictureInPictureController.isPictureInPictureActive (v1.9.20)");
+        WLog(@"PIPWATCH swizzled AVPictureInPictureController.isPictureInPictureActive (v1.9.21)");
     });
 }
 
@@ -418,6 +432,12 @@ __attribute__((constructor)) static void __wcVKInit(void) {
 
         int token = 0;
         notify_register_dispatch(kTriggerName, &token, dispatch_get_main_queue(), ^(int t) {
+            // v1.9.21：后台 trigger 前查音频——微信视频 PiP 在播（有声音）时跳过重建，
+            // 避免 wetype 抢通道顶掉微信视频 PiP。前台激活（DidBecomeActive）不受此限。
+            if (OtherAudioPlaying()) {
+                WLog(@"EVT darwin trigger but OTHER AUDIO playing (WeChat video PiP?) -> skip rebuild");
+                return;
+            }
             WLog(@"EVT darwin trigger -> TriggerOnMain");
             TriggerOnMain();
         });
