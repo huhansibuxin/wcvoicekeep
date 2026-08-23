@@ -90,11 +90,14 @@ static void WarmupDone(void) {
     if (IsWarmup()) AutoBackground(); // 仅预热才自动退后台（手动打开不打扰）
 }
 
-// ===== v1.9.19：PiP 丢失秒级重建 =====
-// SB 保活（FBScene hook）后 wetype 进程永不挂起 -> dylib 能持续感知 PiP 状态。
-// KVO 观察 WBVoiceInputPIPManager.isActive：1->0（被微信视频 PiP 顶掉）瞬间
-// 发 Darwin 通知 com.wcvoicekeep.pip.lost，daemon 收到立即回发 pip.trigger，
-// dylib 在 scene active 下后台重建 PiP（无跳转）。事件驱动，零轮询零定时器。
+// ===== v1.9.20：PiP 丢失秒级重建（换方案：KVO 私有类不兼容已证伪）=====
+// 实测 v1.9.19：KVO registered 成功但 WBVoiceInputPIPManager.isActive 是手动 getter
+// 不触发回调（PIPLOST 永远不打）-> 换组合方案：
+//   主：swizzle AVPictureInPictureController.isPictureInPictureActive getter——
+//       wetype 内部每次读 PiP 状态都经过它，翻转 1->0 瞬间发 pip.lost（事件驱动零轮询）
+//   兜底：10s 低频纯内存守护（objc_msgSend 微秒级，不写盘不跨进程，非心跳）——
+//       防 AVKit 内部不读 getter 的漏网
+// daemon 收到 pip.lost -> 立即回发 pip.trigger -> dylib 在 scene active 下后台重建（无跳转）
 @interface WCVKPiPWatcher : NSObject
 @end
 static WCVKPiPWatcher *gPiPWatcher = nil;
@@ -102,22 +105,80 @@ static WCVKPiPWatcher *gPiPWatcher = nil;
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
     NSNumber *nv = change[NSKeyValueChangeNewKey];
     if (![nv respondsToSelector:@selector(boolValue)]) return;
-    BOOL active = [nv boolValue];
-    if (!active) {
-        WLog(@"PIPLOST isActive->NO -> notify daemon (immediate rebuild)");
+    if (![nv boolValue]) {
+        WLog(@"PIPLOST KVO(pipController) isActive->NO -> notify daemon");
         notify_post("com.wcvoicekeep.pip.lost");
     }
 }
 @end
+
+static void ReportPiPLost(void) {
+    WLog(@"PIPLOST detected -> notify daemon (immediate rebuild)");
+    notify_post("com.wcvoicekeep.pip.lost");
+}
+
+// 主：swizzle AVKit getter（事件驱动零轮询）
+static void SwizzleAVPiPActive(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = objc_getClass("AVPictureInPictureController");
+        if (!cls) { WLog(@"PIPWATCH AVPictureInPictureController class nil"); return; }
+        Method m = class_getInstanceMethod(cls, NSSelectorFromString(@"isPictureInPictureActive"));
+        if (!m) { WLog(@"PIPWATCH no isPictureInPictureActive method"); return; }
+        IMP orig = method_getImplementation(m);
+        IMP newImp = imp_implementationWithBlock(^(id self) {
+            BOOL v = ((BOOL (*)(id, SEL))orig)(self, NSSelectorFromString(@"isPictureInPictureActive"));
+            static BOOL last = NO;
+            if (v != last) {
+                last = v;
+                if (!v) ReportPiPLost(); // 1->0：PiP 被顶掉
+            }
+            return v;
+        });
+        method_setImplementation(m, newImp);
+        WLog(@"PIPWATCH swizzled AVPictureInPictureController.isPictureInPictureActive (v1.9.20)");
+    });
+}
+
+// 兜底：10s 低频纯内存守护（非心跳——不写盘不跨进程，微秒级）
+static void StartPiPGuard(void) {
+    static dispatch_source_t guardTimer = nil;
+    if (guardTimer) return;
+    guardTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    dispatch_source_set_timer(guardTimer, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+                              10 * NSEC_PER_SEC, 2 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(guardTimer, ^{
+        @autoreleasepool {
+            Class mc = objc_getClass("WBVoiceInputPIPManager");
+            id m = mc ? ((id (*)(Class, SEL))objc_msgSend)(mc, NSSelectorFromString(@"sharedInstance")) : nil;
+            BOOL act = m ? ((BOOL (*)(id, SEL))objc_msgSend)(m, NSSelectorFromString(@"isActive")) : NO;
+            static BOOL last = NO;
+            if (act != last) {
+                last = act;
+                if (!act) ReportPiPLost();
+            }
+        }
+    });
+    dispatch_resume(guardTimer);
+    WLog(@"PIPWATCH guard timer started (10s, in-memory only)");
+}
+
 static void WatchPiPLost(id mgr) {
+    SwizzleAVPiPActive(); // 主：swizzle AVKit getter
+    StartPiPGuard();      // 兜底：低频守护
+    // 附：尝试 KVO pipController（AVKit 属性 KVO 兼容，能拿到就双保险）
     if (gPiPWatcher) return;
-    gPiPWatcher = [WCVKPiPWatcher new];
     @try {
-        [mgr addObserver:gPiPWatcher forKeyPath:@"isActive"
-                 options:NSKeyValueObservingOptionNew context:nil];
-        WLog(@"PIPWATCH KVO registered on isActive (v1.9.19)");
+        id pipCtl = [mgr valueForKey:@"pipController"];
+        if (pipCtl) {
+            gPiPWatcher = [WCVKPiPWatcher new];
+            [pipCtl addObserver:gPiPWatcher forKeyPath:@"pictureInPictureActive"
+                        options:NSKeyValueObservingOptionNew context:nil];
+            WLog(@"PIPWATCH KVO pipController.pictureInPictureActive registered");
+        }
     } @catch (NSException *e) {
-        WLog(@"PIPWATCH KVO failed: %@ (fallback: daemon 60s tick)", e);
+        WLog(@"PIPWATCH KVO pipController failed: %@", e);
     }
 }
 

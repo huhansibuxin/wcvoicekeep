@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.19)
+//  wcvoicekeep daemon  (v1.9.20)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -67,7 +67,7 @@ static NSString *const kTargetBundleID = @"com.tencent.wetype";
 static NSString *const kWechatBundleID = @"com.tencent.xin"; // 注销后错开无头拉起（老板要求）
 static const char    *const kTriggerName = "com.wcvoicekeep.pip.trigger"; // 与 Tweak.xm 一致
 static const char    *const kPipBuiltName = "com.wcvoicekeep.pip.built";  // dylib->daemon：PiP 已建
-static const int    kBootDelaySec     = 3;        // 开机等 SpringBoard（原 10s，尽早预热）
+static const int    kBootDelaySec     = 1;        // v1.9.20：1s（原 3s），注销后尽早开始预热
 static const int    kCheckIntervalSec = 60;       // 守护轮询
 static const int    kFastRetrySec     = 5;        // 预热快循环间隔（锁屏期重试）
 static const int    kPipWaitTimeoutSec = 15;      // 等 dylib 报 pip.built 超时
@@ -592,18 +592,20 @@ int main(int argc, char *argv[]) {
 
         // 注销后立即预热：最多试 ~2 分钟。锁屏期不拉输入法（僵尸没 PiP，老板要求），
         // 等解锁——lockstate 回调会在解锁瞬间立即重拉补完。
-        LOG(@"boot warmup loop until pip.built (max ~2min, skip while LOCKED)...");
+        LOG(@"boot warmup loop until pip.built (max ~2min, skip wetype while LOCKED)...");
         time_t bootStart = time(NULL);
         while (!gPipUp && time(NULL) - bootStart < 120) {
             if (gLocked) {
-                // 锁屏不拉输入法（拉起是僵尸没 PiP）；解锁由 lockstate 回调即时重拉
-                sleep(5);
+                // 锁屏不拉输入法（拉起是僵尸没 PiP）；解锁由 lockstate 回调即时重拉。
+                // v1.9.20：微信无头拉起不受锁屏影响，锁屏期也拉（不再被锁屏挡住）
+                if (!gWechatWarmed && time(NULL) - bootStart >= 3) maybeWarmWechat();
+                sleep(3);
                 continue;
             }
             @autoreleasepool { warmupOnce(); }
             if (gPipUp) break;
-            // v1.9.7：开机 30s 先拉微信（顺序仍是输入法先开始尝试，但不等 2min 窗口）
-            if (!gWechatWarmed && time(NULL) - bootStart >= 30) maybeWarmWechat();
+            // v1.9.20：微信提前到 3s（原 30s），注销后尽早拉起；maybeWarmWechat 内部节流防重复
+            if (!gWechatWarmed && time(NULL) - bootStart >= 3) maybeWarmWechat();
             sleep(kFastRetrySec);
         }
         LOG(@"boot warmup done (gPipUp=%d) -> entering 60s watch", (int)gPipUp);
