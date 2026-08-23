@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.18)
+//  wcvoicekeep daemon  (v1.9.19)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -352,6 +352,15 @@ static void registerNotifs(void) {
         gPipUp = YES;
         gLastWarmup = time(NULL);
         LOG(@"PIP.BUILT received -> warmup success, self keep-alive active");
+    });
+    // v1.9.19：pip.lost（dylib KVO 检测 PiP 被视频顶掉）-> 立即回发 trigger 让 dylib
+    // 在 scene active 下后台重建 PiP（秒级，不等 60s tick，无跳转）
+    static int lostToken = 0;
+    notify_register_dispatch("com.wcvoicekeep.pip.lost", &lostToken,
+                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
+        LOG(@"PIP.LOST received -> immediate re-trigger (dylib rebuilds PiP in background)");
+        gPipUp = NO;
+        postTrigger();
     });
     // 屏幕状态：1=息屏，0=亮屏
     static int scrToken = 0;

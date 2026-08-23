@@ -90,6 +90,37 @@ static void WarmupDone(void) {
     if (IsWarmup()) AutoBackground(); // 仅预热才自动退后台（手动打开不打扰）
 }
 
+// ===== v1.9.19：PiP 丢失秒级重建 =====
+// SB 保活（FBScene hook）后 wetype 进程永不挂起 -> dylib 能持续感知 PiP 状态。
+// KVO 观察 WBVoiceInputPIPManager.isActive：1->0（被微信视频 PiP 顶掉）瞬间
+// 发 Darwin 通知 com.wcvoicekeep.pip.lost，daemon 收到立即回发 pip.trigger，
+// dylib 在 scene active 下后台重建 PiP（无跳转）。事件驱动，零轮询零定时器。
+@interface WCVKPiPWatcher : NSObject
+@end
+static WCVKPiPWatcher *gPiPWatcher = nil;
+@implementation WCVKPiPWatcher
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    NSNumber *nv = change[NSKeyValueChangeNewKey];
+    if (![nv respondsToSelector:@selector(boolValue)]) return;
+    BOOL active = [nv boolValue];
+    if (!active) {
+        WLog(@"PIPLOST isActive->NO -> notify daemon (immediate rebuild)");
+        notify_post("com.wcvoicekeep.pip.lost");
+    }
+}
+@end
+static void WatchPiPLost(id mgr) {
+    if (gPiPWatcher) return;
+    gPiPWatcher = [WCVKPiPWatcher new];
+    @try {
+        [mgr addObserver:gPiPWatcher forKeyPath:@"isActive"
+                 options:NSKeyValueObservingOptionNew context:nil];
+        WLog(@"PIPWATCH KVO registered on isActive (v1.9.19)");
+    } @catch (NSException *e) {
+        WLog(@"PIPWATCH KVO failed: %@ (fallback: daemon 60s tick)", e);
+    }
+}
+
 // 探针：记录真实 UIApplication 委托类名，验证「AppDelegate 假设」对不对
 static void ProbeDelegate(void) {
     UIApplication *app = [UIApplication sharedApplication];
@@ -207,6 +238,7 @@ static void EnsureStandbyPiP(void) {
 
     WLog(@"PROBE WBVoiceInputPIPManager found");
     EngageOnce(mgr, 0);
+    WatchPiPLost(mgr); // v1.9.19：PiP 丢失秒级重建（KVO 事件驱动）
 
     // v1.9.4 曾加 1.5s 强制定时退后台 —— 实测失败（01:17:12 日志：WillResignActive 时
     // isActive=0，PiP 未建好就被退，App 挂起被清无法保活）。v1.9.5 回退：
