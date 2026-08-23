@@ -79,6 +79,7 @@ static void maybeWarmWechat(void);
 static void reWarm(void);
 static void watchWechat(void);
 static int taskSuspendCount(int pid); // v1.9.15：warmupOnce(361) 在定义(465)之前使用
+static BOOL otherAudioPlaying(void);  // v1.9.21：pip.lost 回调(364)在定义(551)之前使用
 
 // ===== 无头启动：SBS 后台 flag=1（首选），LSA active:NO（兜底）=====
 // SBS background flag=1 = 真后台启动（不显 UI）。LSA active:NO 仅兜底（会带 UI）。
