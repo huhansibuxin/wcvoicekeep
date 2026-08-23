@@ -28,7 +28,9 @@ wcvoicekeep_FILES = daemon.m
 wcvoicekeep_INSTALL_PATH = /usr/bin
 # Foundation + MobileCoreServices：LSApplicationWorkspace 类在 MobileCoreServices
 # framework 里，daemon 独立进程必须显式链接/ dlopen 才能 NSClassFromString 找到。
-wcvoicekeep_FRAMEWORKS = Foundation MobileCoreServices
+# AudioToolbox：v1.9.13 otherAudioPlaying() 用 AudioSessionGetProperty 查其他 App 是否在播音频
+#（有音频（视频 PiP/音乐）时不重拉，避免打断）。
+wcvoicekeep_FRAMEWORKS = Foundation MobileCoreServices AudioToolbox
 # 关键：SBSLaunchApplicationWithIdentifier 需要 com.apple.springboard.launchapplications 权限，
 # 不签这个 entitlement，daemon 拉 App 会被拒/被杀。
 wcvoicekeep_CODESIGN_FLAGS = -S$(THEOS_PROJECT_DIR)/entitlements.plist

@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.10)
+//  wcvoicekeep daemon  (v1.9.13)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
@@ -135,6 +135,24 @@ static BOOL procExists(const char *want) {
 static BOOL isAppRunning(NSString *bundleID) {
     (void)bundleID;
     return procExists("wxkb") || procExists("wetype") || procExists("WxKeyboard");
+}
+
+// v1.9.13：返回匹配 comm 的第一个进程 pid（找不到 -1）。wetype 主 App = wxkb
+static int procPid(const char *want) {
+    if (!want || !want[0]) return -1;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t sz = 0;
+    if (sysctl(mib, 4, NULL, &sz, NULL, 0) != 0 || sz == 0) return -1;
+    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(sz);
+    if (!procs) return -1;
+    if (sysctl(mib, 4, procs, &sz, NULL, 0) != 0) { free(procs); return -1; }
+    int n = (int)(sz / sizeof(struct kinfo_proc));
+    int pid = -1;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(procs[i].kp_proc.p_comm, want) == 0) { pid = procs[i].kp_proc.p_pid; break; }
+    }
+    free(procs);
+    return pid;
 }
 
 // 微信主进程名：WeChat
@@ -430,6 +448,51 @@ static int tfpCheck(int pid) {
     return 0;
 }
 
+// ===== v1.9.13 核心：读 wetype 的 Mach Task suspend_count 判定是否被系统挂起 =====
+// 微信视频 PiP 顶掉 wetype PiP -> wetype 无保活凭证 -> 系统挂起进程(S▲B, suspend_count>0)
+// -> PiP 失效 -> daemon 重拉。entitlements 需 platform-application + task_for_pid-allow
+// （v1.9.12 实测 OK：root daemon -> mobile wetype task_for_pid 0、suspend_count 可读）。
+// 挂在 60s 守护 tick 上查一次，微秒级，不增加任何独立轮询/定时器/磁盘写。
+static int taskSuspendCount(int pid) {
+    if (pid <= 0) return -1;
+    mach_port_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) return -1;
+    struct task_basic_info info;
+    mach_msg_type_number_t cnt = TASK_BASIC_INFO_COUNT;
+    kr = task_info(task, TASK_BASIC_INFO, (task_info_t)&info, &cnt);
+    mach_port_deallocate(mach_task_self(), task);
+    if (kr != KERN_SUCCESS) return -1;
+    return info.suspend_count;
+}
+
+// 其他 App 是否在播音频（视频 PiP/音乐）——有声音时绝不重拉（避免打断看视频）。
+// AudioSessionGetProperty 已被 SDK 标记 deprecated，include 头会触发 -Wdeprecated-declarations
+// 被 tool 目标的 -Werror 判死，故手写声明绕过（kAudioSessionProperty_OtherAudioIsPlaying='othr'）。
+extern int AudioSessionGetProperty(unsigned int inID, unsigned int *ioDataSize, void *outData);
+static BOOL otherAudioPlaying(void) {
+    unsigned int playing = 0;
+    unsigned int sz = sizeof(playing);
+    int st = AudioSessionGetProperty('othr', &sz, &playing);
+    if (st != 0) { LOG(@"audio check err=%d", st); return NO; }
+    return playing != 0;
+}
+
+// v1.9.13：PiP 失效重拉冷却（挂起检测到 -> 拉一次失败 -> 5min 内不再试，防反复闪）
+static time_t gPiPLostCooldownUntil = 0;
+static const time_t kPiPLostCooldownSec = 300;
+static void handlePiPLost(int sc) {
+    time_t now = time(NULL);
+    if (gLocked) { LOG(@"  PiP lost & LOCKED -> wait unlock"); return; }
+    if (now < gPiPLostCooldownUntil) { LOG(@"  PiP lost cooldown (%.0fs left) -> skip", (double)(gPiPLostCooldownUntil - now)); return; }
+    if (otherAudioPlaying()) { LOG(@"  PiP lost but other audio playing (video/music) -> hold, no flash"); return; }
+    gPiPLostCooldownUntil = now + kPiPLostCooldownSec; // 先置冷却，失败也不反复闪
+    LOG(@"  PiP lost (suspend_count=%d) & idle & unlocked -> re-warm to rebuild PiP", sc);
+    gPipUp = NO;
+    reWarm();
+    if (gPipUp) maybeWarmWechat();
+}
+
 int main(int argc, char *argv[]) {
     // 早期 stderr（不依赖 Foundation/ObjC runtime）——
     // launchd 任何阶段拒收(进程类型/entitlement/签名/sandbox)都能立刻看到，
@@ -476,18 +539,27 @@ int main(int argc, char *argv[]) {
         // 兜底：循环结束还没拉过微信就补拉（防 2min 全在锁屏且 30s 点恰好没到）
         maybeWarmWechat();
 
-        // 守护循环（v1.9.10 老板拍板）：
-        //  - wetype：解锁态死了/僵尸 -> 无条件 kill+重拉（锁屏拉起是僵尸没 PiP，锁屏不拉）
+        // 守护循环（v1.9.10 老板拍板 + v1.9.13 PiP 失效检测）：
+        //  - wetype：解锁态死了/僵尸 -> kill+重拉；活着但被系统挂起（suspend_count>0，
+        //    微信视频 PiP 顶掉保活凭证）-> PiP 失效 -> 择机重拉（锁屏等解锁/有音频不拉/5min 冷却）
         //  - 微信：被杀就无头拉（不管锁屏/息屏，无 UI 无打扰），120s 节流
         while (1) {
             sleep(kCheckIntervalSec);
             @autoreleasepool {
-                watchWechat(); // 微信看护优先
+                watchWechat(); // 微信看护优先（老板要求：微信也要能拉起来）
 
                 if (isAppRunning(kTargetBundleID)) {
                     if (gPipUp) {
-                        LOG(@"%@ alive -> only trigger dylib", kTargetBundleID); // 测试版：详细日志
-                        postTrigger();
+                        // v1.9.13：查 Mach Task suspend_count——>0 = 进程被系统挂起 = PiP 已被顶掉
+                        int pid = procPid("wxkb");
+                        int sc = taskSuspendCount(pid);
+                        if (sc > 0) {
+                            LOG(@"%@ SUSPENDED (suspend_count=%d pid=%d) -> PiP lost (video PiP took over?)", kTargetBundleID, sc, pid);
+                            handlePiPLost(sc); // 锁屏/有音频/冷却期都不拉，只有空闲解锁态才重拉
+                        } else {
+                            LOG(@"%@ alive -> only trigger dylib", kTargetBundleID); // 测试版：详细日志
+                            postTrigger();
+                        }
                     } else if (!gLocked) {
                         // 进程在但从未建 PiP（锁屏期拉起没激活的僵尸）-> 杀掉重试
                         LOG(@"%@ zombie & unlocked -> kill & re-warm", kTargetBundleID);
