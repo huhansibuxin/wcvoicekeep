@@ -120,6 +120,7 @@ static void WarmupDone(void) {
 // v1.9.25：守护按需启动（前向声明，定义在下方）
 static void ReportPiPLost(void);
 static void StartPiPGuard(void);
+static void EnsureStandbyPiP(void); // v1.9.31：guard 本地直接 rebuild（定义在 368 行）
 static void StopPiPGuard(void);
 @interface WCVKPiPWatcher : NSObject
 @end
@@ -196,20 +197,21 @@ static void StartPiPGuard(void) {
             id m = mc ? ((id (*)(Class, SEL))objc_msgSend)(mc, NSSelectorFromString(@"sharedInstance")) : nil;
             BOOL act = m ? ((BOOL (*)(id, SEL))objc_msgSend)(m, NSSelectorFromString(@"isActive")) : NO;
             if (act) {
-                // v1.9.30：PiP 回来了——若是系统自动恢复（没经过 rebuild），这里直接停守护
+                // v1.9.30 实验结论（16:10 实测）：系统自动恢复不存在（15s 窗口 FAILED），
+                // PiP 回来只可能来自我们自己的 rebuild。这里打日志后停守护。
                 WLog(@"GUARD PiP back (isActive=YES) -> stop guard");
                 StopPiPGuard(); return;
             }
-            // v1.9.30 实验：系统自动恢复优先——Apple 文档：PiP 被顶是 suspended 不是销毁，
-            // 对方结束系统应自动 resume。现在进程保活（SB+SCENEHOOK）后条件已满足，
-            // 先给系统 15s 自动恢复窗口，恢复则零重建；没恢复才 rebuild 兜底。
-            if (!OtherAudioPlaying()) {
-                time_t now = time(NULL);
-                if (now - gLastLost >= 15) {
-                    gLastLost = now;
-                    WLog(@"GUARD no auto-resume in 15s & audio idle -> rebuild retry (system resume FAILED)");
-                    ReportPiPLost();
-                }
+            // v1.9.31：系统自动恢复已证伪（v1.9.30 实验 15s FAILED），不再等——
+            // 音频 idle（视频结束）后立即 rebuild，节流 2s（原 5s，恢复窗口更短；
+            // EnsureStandbyPiP 内部还有 2s cooldown 双保险，不会反复刷）。
+            // v1.9.31 加速：本地主线程直接 rebuild（跳过 daemon 通知往返），
+            // 同时仍通知 daemon 更新 gPipUp 状态。
+            if (!OtherAudioPlaying() && time(NULL) - gLastLost >= 2) {
+                gLastLost = time(NULL);
+                WLog(@"GUARD PiP down & audio idle -> local rebuild (v1.9.31)");
+                dispatch_async(dispatch_get_main_queue(), ^{ EnsureStandbyPiP(); });
+                ReportPiPLost(); // 通知 daemon：gPipUp=NO，等 pip.built
             }
         }
     });
@@ -351,6 +353,37 @@ static void EngageOnce(id mgr, int attempt) {
     if (![mgr respondsToSelector:standby]) { WLog(@"PROBE no -preparePictureInPictureForStandby"); return; }
     ((void(*)(id,SEL))objc_msgSend)(mgr,standby);
     WLog(@"PROBE preparePictureInPictureForStandby INVOKED");
+
+    // (4.5) v1.9.31 加速：先试 resume 快速路径——PiP 被顶 = suspended 而非销毁，
+    // AVPictureInPictureController resumePictureInPicture（iOS 15+ 公开 API）应远快于
+    // 重新 start（start 冷启动 ~4s）。resume 后 0.6s 确认 isActive，生效则跳过 start。
+    SEL iaSel = NSSelectorFromString(@"isActive");
+    @try {
+        id pipCtl = [mgr valueForKey:@"pipController"];
+        if (pipCtl && [pipCtl respondsToSelector:NSSelectorFromString(@"resumePictureInPicture")]) {
+            WLog(@"PROBE resumePictureInPicture (fast path) attempt");
+            ((void(*)(id,SEL))objc_msgSend)(pipCtl, NSSelectorFromString(@"resumePictureInPicture"));
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                BOOL act = [mgr respondsToSelector:iaSel] ? ((BOOL(*)(id,SEL))objc_msgSend)(mgr,iaSel) : NO;
+                WLog(@"PROBE after resume 0.6s isActive=%d", (int)act);
+                if (act) { WarmupDone(); return; } // resume 生效：上报（不退后台，rebuild 场景）
+                WLog(@"PROBE resume not effective -> full start (fallback)");
+                if ([mgr respondsToSelector:startSel]) {
+                    void (^completion)(BOOL) = ^(BOOL ok) {
+                        BOOL a2 = [mgr respondsToSelector:iaSel] ? ((BOOL(*)(id,SEL))objc_msgSend)(mgr,iaSel) : NO;
+                        WLog(@"PROBE startWithCompletionHandler fired ok=%d isActive=%d", (int)ok, (int)a2);
+                        if (a2) WarmupDone();
+                    };
+                    ((void(*)(id,SEL,id))objc_msgSend)(mgr,startSel,completion);
+                }
+            });
+            return; // resume 路径已接管，本函数结束（0.6s 后要么 resume 生效要么 full start）
+        }
+    } @catch (NSException *e) {
+        WLog(@"PROBE resume failed: %@", e);
+    }
+
     // (5) 真正 start PiP —— v1.9.2：传完成回调，PiP 一建好立刻报 daemon + 退后台（零轮询延迟）。
     // 安全：block 体忽略参数语义（不读入参，防 wetype 真实签名是 ^(void)/^(NSError*) 时崩），
     // 且回调内再核 isActive 实况 —— 若回调是"将要开始"而非"已完成"，isActive=0 则跳过，
@@ -358,8 +391,7 @@ static void EngageOnce(id mgr, int attempt) {
     if ([mgr respondsToSelector:startSel]) {
         WLog(@"PROBE calling startWithCompletionHandler:(completion)");
         void (^completion)(BOOL) = ^(BOOL ok) {
-            SEL ia = NSSelectorFromString(@"isActive");
-            BOOL act = [mgr respondsToSelector:ia] ? ((BOOL(*)(id,SEL))objc_msgSend)(mgr,ia) : NO;
+            BOOL act = [mgr respondsToSelector:iaSel] ? ((BOOL(*)(id,SEL))objc_msgSend)(mgr,iaSel) : NO;
             WLog(@"PROBE startWithCompletionHandler fired ok=%d isActive=%d", (int)ok, (int)act);
             if (act) WarmupDone(); // v1.9.14：PiP 建好即上报（解耦，见 WarmupDone 注释）
         };

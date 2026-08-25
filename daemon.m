@@ -1,5 +1,5 @@
 //
-//  wcvoicekeep daemon  (v1.9.30)
+//  wcvoicekeep daemon  (v1.9.31)
 //
 //  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
 //  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
