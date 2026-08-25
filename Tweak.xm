@@ -208,8 +208,42 @@ static void StartPiPGuard(void) {
     WLog(@"PIPWATCH guard started (on-demand, PiP lost)");
 }
 
+// v1.9.28：hook UIScene.activationState——wetype 后台时伪装 ForegroundActive。
+// 背景：SB 标记法漏拦独立路径 deactivationReasons -> scene 实际被系统 deactivate
+// -> AVKit startPictureInPicture 进程内检查 UISceneActivationStateForegroundActive
+// 不通过 -> 后台重建 PiP 永远失败（打断要跳转）。这里直接让 AVKit 检查放行。
+// 只影响 wetype 进程内对 scene 状态的读取；仅 App 非 Active 时伪装，前台返回真实值。
+static void SwizzleSceneActivationState(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = objc_getClass("UIScene");
+        if (!cls) { WLog(@"SCENEHOOK UIScene class nil"); return; }
+        Method m = class_getInstanceMethod(cls, NSSelectorFromString(@"activationState"));
+        if (!m) { WLog(@"SCENEHOOK no activationState method"); return; }
+        IMP orig = method_getImplementation(m);
+        IMP newImp = imp_implementationWithBlock(^(id self) {
+            NSInteger v = ((NSInteger (*)(id, SEL))orig)(self, NSSelectorFromString(@"activationState"));
+            UIApplicationState st = [[UIApplication sharedApplication] applicationState];
+            if (st != UIApplicationStateActive && v != UISceneActivationStateForegroundActive) {
+                // 后台：伪装前台激活（UISceneActivationStateForegroundActive = 0），
+                // 翻转节流打日志（避免每次读取都刷）
+                static NSInteger lastLogged = -999;
+                if (lastLogged != v) {
+                    lastLogged = v;
+                    WLog(@"SCENEHOOK bg actState=%ld -> force ForegroundActive", (long)v);
+                }
+                return (NSInteger)UISceneActivationStateForegroundActive;
+            }
+            return v;
+        });
+        method_setImplementation(m, newImp);
+        WLog(@"SCENEHOOK swizzled UIScene.activationState (force ForegroundActive when bg, v1.9.28)");
+    });
+}
+
 static void WatchPiPLost(id mgr) {
     SwizzleAVPiPActive(); // 主：swizzle AVKit getter（事件驱动，零定时器待命）
+    SwizzleSceneActivationState(); // v1.9.28：后台伪装 scene 激活态，AVKit 检查放行
     // v1.9.25：守护按需启动——swizzle/KVO 检测到 PiP 掉才 StartPiPGuard，平时零定时器
     // 附：尝试 KVO pipController（AVKit 属性 KVO 兼容，能拿到就双保险）
     if (gPiPWatcher) return;
@@ -395,15 +429,13 @@ static void TriggerOnMain(void) {
     // 不存在抢锁风险；延迟越短，前台窗口越大，越不易被滑后台打断。
     dispatch_async(dispatch_get_main_queue(), ^{
         ProbeDelegate();
-        // PiP 只能在 App 激活态启动（startPictureInPicture 平台限制，后台 isActive=0）。
-        // v1.9.0 预热(frontground)拉起时 App 是激活态 -> 正常建 PiP + 自动退后台；
-        // 后台 trigger（daemon 60s 轮询）时跳过 PiP，避免无效重试刷日志。
+        // v1.9.28：去掉 applicationState 一刀切跳过——SB 标记法漏洞导致 scene 可能
+        // 被系统部分 deactivate（applicationState=Background），PiP 丢失时也必须重建。
+        // 配合 SwizzleSceneActivationState（后台伪装 ForegroundActive）+ 音频门控，
+        // 后台重建 PiP 现在能成功；重复触发由 EnsureStandbyPiP 的 vActive/2s cooldown
+        // 幂等把关，不会反复建。
         UIApplicationState st = [[UIApplication sharedApplication] applicationState];
-        if (st != UIApplicationStateActive) {
-            WLog(@"TRIGGER appState=%ld (not active) -> skip PiP (warmup handles PiP)", (long)st);
-            return;
-        }
-        WLog(@"TRIGGER firing EnsureStandbyPiP (0-delay)");
+        WLog(@"TRIGGER appState=%ld -> EnsureStandbyPiP (audio-gated, v1.9.28)", (long)st);
         EnsureStandbyPiP();
     });
 }
