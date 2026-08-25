@@ -208,11 +208,15 @@ static void StartPiPGuard(void) {
     WLog(@"PIPWATCH guard started (on-demand, PiP lost)");
 }
 
-// v1.9.28：hook UIScene.activationState——wetype 后台时伪装 ForegroundActive。
+// v1.9.29：hook UIScene.activationState——wetype 后台时伪装 ForegroundActive。
 // 背景：SB 标记法漏拦独立路径 deactivationReasons -> scene 实际被系统 deactivate
 // -> AVKit startPictureInPicture 进程内检查 UISceneActivationStateForegroundActive
 // 不通过 -> 后台重建 PiP 永远失败（打断要跳转）。这里直接让 AVKit 检查放行。
-// 只影响 wetype 进程内对 scene 状态的读取；仅 App 非 Active 时伪装，前台返回真实值。
+// ⚠️ v1.9.28 崩溃根因：block 里调 [[UIApplication sharedApplication] applicationState]
+// 造成递归（applicationState 内部读 scene activationState = 我们 hook 的方法 -> 栈溢出）。
+// v1.9.29 修：block 内绝不调任何 UIKit API，只读静态标志 gWCVKAppActive
+//（由 DidBecomeActive/DidEnterBackground 通知维护，见 CTOR）。
+static BOOL gWCVKAppActive = NO; // 前台激活标志（通知维护，hook block 只读它）
 static void SwizzleSceneActivationState(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -222,22 +226,16 @@ static void SwizzleSceneActivationState(void) {
         if (!m) { WLog(@"SCENEHOOK no activationState method"); return; }
         IMP orig = method_getImplementation(m);
         IMP newImp = imp_implementationWithBlock(^(id self) {
+            // 只读 static 标志 + 调原始实现——禁止任何 UIKit 调用（递归崩溃根因）
             NSInteger v = ((NSInteger (*)(id, SEL))orig)(self, NSSelectorFromString(@"activationState"));
-            UIApplicationState st = [[UIApplication sharedApplication] applicationState];
-            if (st != UIApplicationStateActive && v != UISceneActivationStateForegroundActive) {
-                // 后台：伪装前台激活（UISceneActivationStateForegroundActive = 0），
-                // 翻转节流打日志（避免每次读取都刷）
-                static NSInteger lastLogged = -999;
-                if (lastLogged != v) {
-                    lastLogged = v;
-                    WLog(@"SCENEHOOK bg actState=%ld -> force ForegroundActive", (long)v);
-                }
+            if (!gWCVKAppActive && v != UISceneActivationStateForegroundActive) {
+                // 后台：伪装前台激活（UISceneActivationStateForegroundActive = 0）
                 return (NSInteger)UISceneActivationStateForegroundActive;
             }
             return v;
         });
         method_setImplementation(m, newImp);
-        WLog(@"SCENEHOOK swizzled UIScene.activationState (force ForegroundActive when bg, v1.9.28)");
+        WLog(@"SCENEHOOK swizzled UIScene.activationState (gWCVKAppActive flag, v1.9.29)");
     });
 }
 
@@ -467,8 +465,20 @@ __attribute__((constructor)) static void __wcVKInit(void) {
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *note) {
-            WLog(@"EVT UIApplicationDidBecomeActive -> TriggerOnMain");
+            // v1.9.29：更新前台标志（SCENEHOOK 只读它，不调 UIKit 防递归崩溃）
+            gWCVKAppActive = YES;
+            WLog(@"EVT UIApplicationDidBecomeActive -> TriggerOnMain (appActive=YES)");
             TriggerOnMain();
+        }];
+
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidEnterBackgroundNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            // v1.9.29：退后台置 NO -> SCENEHOOK 开始伪装 ForegroundActive
+            gWCVKAppActive = NO;
+            WLog(@"EVT UIApplicationDidEnterBackground -> appActive=NO (SCENEHOOK fake active)");
         }];
 
         // 退后台前探针：确认 PiP 是否已在建。若退后台前 isActive=0，说明用户滑太快/没建起来
