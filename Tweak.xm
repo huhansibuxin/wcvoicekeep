@@ -195,11 +195,21 @@ static void StartPiPGuard(void) {
             Class mc = objc_getClass("WBVoiceInputPIPManager");
             id m = mc ? ((id (*)(Class, SEL))objc_msgSend)(mc, NSSelectorFromString(@"sharedInstance")) : nil;
             BOOL act = m ? ((BOOL (*)(id, SEL))objc_msgSend)(m, NSSelectorFromString(@"isActive")) : NO;
-            if (act) { StopPiPGuard(); return; } // 重建成功，停守护回零定时器
-            if (!OtherAudioPlaying() && time(NULL) - gLastLost >= 5) {
-                gLastLost = time(NULL);
-                WLog(@"GUARD PiP down & audio idle -> rebuild retry");
-                ReportPiPLost();
+            if (act) {
+                // v1.9.30：PiP 回来了——若是系统自动恢复（没经过 rebuild），这里直接停守护
+                WLog(@"GUARD PiP back (isActive=YES) -> stop guard");
+                StopPiPGuard(); return;
+            }
+            // v1.9.30 实验：系统自动恢复优先——Apple 文档：PiP 被顶是 suspended 不是销毁，
+            // 对方结束系统应自动 resume。现在进程保活（SB+SCENEHOOK）后条件已满足，
+            // 先给系统 15s 自动恢复窗口，恢复则零重建；没恢复才 rebuild 兜底。
+            if (!OtherAudioPlaying()) {
+                time_t now = time(NULL);
+                if (now - gLastLost >= 15) {
+                    gLastLost = now;
+                    WLog(@"GUARD no auto-resume in 15s & audio idle -> rebuild retry (system resume FAILED)");
+                    ReportPiPLost();
+                }
             }
         }
     });
