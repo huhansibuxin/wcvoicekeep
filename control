@@ -1,6 +1,6 @@
 Package: com.wcvoicekeep
 Name: wcvoicekeep
-Version: 1.9.26
+Version: 1.9.27
 Architecture: iphoneos-arm64
 Description: WeChat Keyboard (Wetype) zero-jump voice. Tweaks: WCVoiceKeep (inject into wetype via TrollFools) builds native PiP standby; wetypekeepalive (SpringBoard-side) keeps wetype scene foreground-active so video PiP takeover auto-recovers the PiP; rootless LaunchDaemon auto-raises Wetype on boot/respring. Depends: ellekit.
 Maintainer: huhansibuxin
