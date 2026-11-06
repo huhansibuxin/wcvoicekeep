@@ -42,8 +42,9 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #import <time.h>
 #import <stdio.h>
 #import <stdlib.h>   // calloc / free
+#import <dlfcn.h>    // dlopen/dlsym：v2.0.18 原生前台激活用
 
-#define WCVK_BUILD_TAG "v2.0.4-roothide"
+#define WCVK_BUILD_TAG "v2.0.18-roothide"
 
 // 键盘扩展进程的精确特征：可执行文件路径以 /wxkb_plugin.appex/wxkb_plugin 结尾
 static NSString *const kKbdExtPathSuffix = @"/wxkb_plugin.appex/wxkb_plugin";
@@ -354,6 +355,58 @@ static void WCVKPrewarmNotifyCallback(CFNotificationCenterRef center, void *obse
     WCVKMarker("prewarm-ctor");
 }
 
+// ===== v2.0.18：原生「黑屏转显示」通道 =====
+// 老板 2026-11-07 02:40 定调：黑屏必须走微信原生恢复，不许我们自己在进程内硬搬窗口/
+// 硬改 windowScene（那样微信内部状态不一致，界面出来了但通讯录读不出来）。
+// 这里做的是「原生」那一步：从 SpringBoard 用 SBSLaunchApplicationWithIdentifier(bid, false)
+// 发起一次**前台激活** —— 和用户手指点图标完全同一条系统路径：
+//   SpringBoard -> 前台 scene 激活 -> app 收到 willEnterForeground/didBecomeActive
+//   -> 微信自己的生命周期代码把界面显示出来。
+// 微信侧检测到黑屏时发 com.wcvoicekeep.prewarm.reveal，这里收到就执行；同一 App 2 秒内去重。
+typedef int (*WCVKSBSLaunchFn)(CFStringRef, Boolean);
+static WCVKSBSLaunchFn gWCVKSBSLaunch = NULL;
+static CFAbsoluteTime gWCVKLastReveal = 0;
+
+static void WCVKRevealRun(const char *bid) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - gWCVKLastReveal < 2.0) {
+        SBLog(@"[REVEAL] 去重：2s 内已激活过，忽略");
+        return;
+    }
+    gWCVKLastReveal = now;
+    if (!bid || !bid[0]) bid = "com.tencent.xin";
+    if (!gWCVKSBSLaunch) {
+        void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+                         RTLD_LAZY);
+        if (h) gWCVKSBSLaunch = (WCVKSBSLaunchFn)dlsym(h, "SBSLaunchApplicationWithIdentifier");
+        if (!gWCVKSBSLaunch) {
+            SBLog(@"[REVEAL] 取不到 SBSLaunchApplicationWithIdentifier，放弃");
+            return;
+        }
+    }
+    CFStringRef cf = CFStringCreateWithCString(NULL, bid, kCFStringEncodingUTF8);
+    // 第二个参数 false = 前台启动（原生，等同点图标）；true 才是我们后台拉起用的挂起启动
+    int rc = gWCVKSBSLaunch(cf, false);
+    SBLog(@"[REVEAL] 原生前台激活 %s rc=%d（0=已受理）", bid, rc);
+    CFRelease(cf);
+}
+
+// userInfo 里带 bundleId 就用它，不带默认微信
+static void WCVKRevealNotifyCallback(CFNotificationCenterRef center, void *observer,
+                                     CFStringRef name, const void *object,
+                                     CFDictionaryRef userInfo) {
+    const char *bid = "com.tencent.xin";
+    char buf[256] = {0};
+    if (userInfo) {
+        CFStringRef v = CFDictionaryGetValue(userInfo, CFSTR("bid"));
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+            if (CFStringGetCString(v, buf, sizeof(buf), kCFStringEncodingUTF8)) bid = buf;
+        }
+    }
+    SBLog(@"[REVEAL] 收到原生激活请求 bid=%s", bid);
+    WCVKRevealRun(bid);
+}
+
 __attribute__((constructor))
 static void WCVKInit(void) {
     WCVKMarker("ctor");
@@ -376,4 +429,14 @@ static void WCVKInit(void) {
                                     CFSTR("com.wcvoicekeep.prewarm.ctor"),
                                     NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     SBLog(@"[KBDWARM] prewarm probe registered (com.wcvoicekeep.prewarm.ctor)");
+
+    // ★ v2.0.18：原生「黑屏转显示」通道。
+    //   微信侧检测到黑屏就发 com.wcvoicekeep.prewarm.reveal，这里用 SpringBoard 原生
+    //   前台激活接口把微信重新激活一次 —— 等价于用户点图标，让微信自己把界面显示出来，
+    //   全程不碰 window / windowScene，微信内部状态保持一致。
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                    NULL, WCVKRevealNotifyCallback,
+                                    CFSTR("com.wcvoicekeep.prewarm.reveal"),
+                                    NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    SBLog(@"[KBDWARM] reveal channel registered (com.wcvoicekeep.prewarm.reveal)");
 }

@@ -38,7 +38,7 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.17-roothide"
+#define WCVK_BUILD_TAG "v2.0.18-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = NO;    // v2.0.17：不再 exit(0)。杀了微信用户更难受，
                                              // 而且实测 L1~L4 全失败时 exit 会让 daemon 立刻再拉一次，
@@ -56,7 +56,6 @@ static int  gRepairLevel   = 0;    // 实际生效的修复级别（0=没修）
 static int  gCheckRetries  = 0;    // 非 Active 态复查次数
 static int  gCheckCount    = 0;    // 本进程已做过的检查次数
 static double gLastCheckAt = 0;    // 上次检查的绝对时间（节流）
-static UIWindow *gTakeoverWindow = nil;   // L2c 新建的接管窗口（必须强引用，否则立刻释放）
 static int  gL1Attempts = 0;       // L1 实际执行次数（防抖动，同一进程最多 2 次）
 static int  gL2Attempts = 0;       // L2 实际执行次数
 
@@ -401,7 +400,7 @@ static void WPFDumpState(NSString *tag) {
     WPFLog(@"---- END %@ ----", tag);
 }
 
-// ===== L1~L4 修复 =====
+// ===== L1/L2 原生修复（v2.0.18 起只保留这两级，非原生的 L3/L4 已删除）=====
 // 返回 YES = 这一级做过了（是否真修好由调用方复查）
 static BOOL WPFRepairLevel1(UIWindow *w) {
     if (!w) return NO;
@@ -428,117 +427,94 @@ static BOOL WPFRepairLevel1(UIWindow *w) {
     return YES;
 }
 
-// ⭐ v2.0.17 L2 重写：这是黑屏的唯一确定病根对应的修法。
-// v2.0.16 日志铁证（pid 10823）：
-//   scenes(2): 0x11dd08f90(state=0 前台)  0x118a367e0(state=2 后台)
-//     MMSubSceneWindow hidden=1 rootVC=(nil)   挂在前台 scene  ← 空壳
-//     iConsoleWindow   hidden=0 rootVC=MainTabBarViewController  挂在后台 scene  ← 真正的界面在这
-// 前台 scene 上一个能显示的窗口都没有 → 用户看到纯黑。
-// 三级手段按序试：改 windowScene → 改私有 ivar → 新建窗口把 rootVC 搬过去接管。
+// ⭐ v2.0.18 L2：**只走原生**。
+// 老板 2026-11-07 02:40 定调：「必须调用微信原生的黑屏转显示才行」。
+// 背景：v2.0.17 用 setWindowScene: 把 iConsoleWindow 从后台 scene 硬搬到前台 scene，
+// 黑屏确实亮了（日志 healthy=1 / 非黑像素 100%），但微信内部状态不一致 ——
+// 通讯录下拉刷新后弹「系统环境可能存在异常」且好友列表变空。
+// 所以硬搬窗口这条路整个删掉，改为让**系统/微信自己**走原生激活路径，三级：
+//   ① requestSceneSessionActivation: 请求系统激活「主窗口所在的那个 UISceneSession」
+//      —— 这是 UIKit 公开 API，系统会按原生流程把该 scene 提到前台，微信照常收生命周期回调。
+//   ② requestSceneSessionRefresh:   让系统刷新该 scene，UI 由微信自己重建。
+//   ③ 发 darwin notify 给 SpringBoard 侧（com.wcvoicekeep.prewarm.reveal），
+//      由 SpringBoard 用 SBSLaunchApplicationWithIdentifier(bid, false) 做原生前台激活，
+//      等同用户用手指点图标 —— 最彻底的原生路径。
+static void WPFRevealViaSpringBoard(void) {
+    // 只发 darwin notify（不带 payload，SB 侧默认操作 com.tencent.xin）。
+    // 之所以不在这里直接调 SBSLaunchApplicationWithIdentifier：那个私有函数在沙盒 App 进程里
+    // 没有权限，必须在 SpringBoard 进程里调才合法 —— 这就是 wetypekeepalive 的职责。
+    int rc = notify_post("com.wcvoicekeep.prewarm.reveal");
+    WPFLog(@"L2③ 已请求 SpringBoard 原生前台激活 notify rc=%d", rc);
+}
+
 static BOOL WPFRepairLevel2(UIWindow *w) {
-    UIWindowScene *scene = WPFActiveScene();
-    if (!w || !scene) { WPFLog(@"L2: 跳过（window 或前台 scene 缺失）"); return NO; }
-    if (gL2Attempts >= 2 && !gTakeoverWindow) { WPFLog(@"L2: 已执行 %d 次仍无效，本次跳过（防抖动）", gL2Attempts); return NO; }
-    if (w.windowScene == scene && WPFSceneOnStage(w)) {
-        WPFLog(@"L2: 已经在前台 scene，跳过");
-        return NO;
-    }
+    if (!w) { WPFLog(@"L2: 跳过（没有主窗口）"); return NO; }
+    if (gL2Attempts >= 2) { WPFLog(@"L2: 已执行 %d 次仍无效，本次跳过（防抖动）", gL2Attempts); return NO; }
     gL2Attempts++;
-    WPFLog(@"L2: 把 %@ 从 %p(state=%ld) 迁到前台 scene %p(state=%ld)",
-           NSStringFromClass([w class]),
-           (__bridge void *)w.windowScene, (long)w.windowScene.activationState,
-           (__bridge void *)scene, (long)scene.activationState);
 
-    // ① 公开/半公开 setter
-    @try {
-        if ([w respondsToSelector:NSSelectorFromString(@"setWindowScene:")]) {
-            ((void (*)(id, SEL, id))objc_msgSend)(w, NSSelectorFromString(@"setWindowScene:"), scene);
-        }
-    } @catch (NSException *e) { WPFLog(@"L2① 异常: %@", e.reason); }
-    if (w.windowScene == scene) {
-        WPFLog(@"L2① 成功（setWindowScene:）");
-        @try { [w makeKeyAndVisible]; [w layoutIfNeeded]; } @catch (NSException *e) {}
-        return YES;
-    }
-
-    // ② KVC 打私有 ivar
-    for (NSString *key in @[@"windowScene", @"_windowScene"]) {
-        @try { [w setValue:scene forKey:key]; } @catch (NSException *e) { }
-        if (w.windowScene == scene) {
-            WPFLog(@"L2② 成功（KVC %@）", key);
-            @try { [w makeKeyAndVisible]; [w layoutIfNeeded]; } @catch (NSException *e) {}
-            return YES;
-        }
-    }
-    WPFLog(@"L2①② 都改不动 windowScene，改走 L2③ 新建接管窗口");
-
-    // ③ 新建一个绑在前台 scene 的窗口，把主窗口的 rootVC 搬过来
-    UIViewController *vc = w.rootViewController;
-    if (!vc) { WPFLog(@"L2③ 跳过（主窗口没有 rootViewController，没东西可搬）"); return NO; }
-    @try {
-        if (gTakeoverWindow) { gTakeoverWindow.hidden = YES; gTakeoverWindow = nil; }
-        UIWindow *nw = [[UIWindow alloc] initWithWindowScene:scene];
-        nw.frame = scene.coordinateSpace.bounds;
-        nw.windowLevel = UIWindowLevelNormal;
-        nw.backgroundColor = [UIColor blackColor];
-        nw.rootViewController = vc;          // re-parent：vc.view 会从旧窗口移除
-        nw.hidden = NO;
-        [nw makeKeyAndVisible];
-        [nw layoutIfNeeded];
-        gTakeoverWindow = nw;
-        WPFLog(@"L2③ 已新建接管窗口 %p(rootVC=%@) 挂到前台 scene", (__bridge void *)nw,
-               NSStringFromClass([vc class]));
-        return YES;
-    } @catch (NSException *e) {
-        WPFLog(@"L2③ 异常: %@", e.reason);
-        return NO;
-    }
-}
-
-
-static BOOL WPFRepairLevel3(UIWindow *w) {
-    if (!w) return NO;
-    UIViewController *vc = w.rootViewController;
-    if (!vc) { WPFLog(@"L3: 跳过（根本没有 rootViewController）"); return NO; }
-    WPFLog(@"L3: 重新挂 rootVC=%@ 并补 appear 回调", NSStringFromClass([vc class]));
-    @try {
-        w.rootViewController = vc;
-        [vc viewWillAppear:NO];
-        [vc viewDidAppear:NO];
-        [vc.view setNeedsLayout];
-        [vc.view layoutIfNeeded];
-        [w makeKeyAndVisible];
-    } @catch (NSException *e) { WPFLog(@"L3 异常: %@", e.reason); return NO; }
-    return YES;
-}
-
-static BOOL WPFRepairLevel4(void) {
     UIApplication *app = [UIApplication sharedApplication];
-    WPFLog(@"L4: 重放前台生命周期（通知 + delegate），逼微信自己把界面建起来");
-    @try {
-        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-        [nc postNotificationName:UIApplicationWillEnterForegroundNotification object:app];
-        [nc postNotificationName:UIApplicationDidBecomeActiveNotification object:app];
-        id d = app.delegate;
-        if ([d respondsToSelector:@selector(applicationWillEnterForeground:)])
-            ((void (*)(id, SEL, id))objc_msgSend)(d, @selector(applicationWillEnterForeground:), app);
-        if ([d respondsToSelector:@selector(applicationDidBecomeActive:)])
-            ((void (*)(id, SEL, id))objc_msgSend)(d, @selector(applicationDidBecomeActive:), app);
-    } @catch (NSException *e) { WPFLog(@"L4 异常: %@", e.reason); return NO; }
+    UIWindowScene *owned = w.windowScene;          // 主窗口自己那个 scene（现在是后台态）
+    UIWindowScene *front = WPFActiveScene();       // 系统当前认的前台 scene
+    WPFLog(@"L2(%d): 主窗口 scene=%p(state=%ld) 前台 scene=%p(state=%ld) — 只走原生，不搬窗口",
+           gL2Attempts,
+           (__bridge void *)owned, (long)owned.activationState,
+           (__bridge void *)front, (long)front.activationState);
+
+    // ① 请系统原生激活「主窗口所属的 session」
+    if (owned.session) {
+        @try {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            [app requestSceneSessionActivation:owned.session
+                                  userActivity:nil
+                                     options:nil
+                                  errorHandler:^(NSError *e) {
+                WPFLog(@"L2① requestSceneSessionActivation 失败: %@", e.localizedDescription);
+            }];
+            #pragma clang diagnostic pop
+            WPFLog(@"L2① 已请求系统原生激活主窗口 session (%@)",
+                   owned.session.persistentIdentifier ?: @"(no id)");
+        } @catch (NSException *e) { WPFLog(@"L2① 异常: %@", e.reason); }
+    } else {
+        WPFLog(@"L2① 跳过（主窗口没有 session）");
+    }
+
+    // ② 让系统刷新该 scene，UI 由微信自己重建
+    if (owned) {
+        @try {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            [app requestSceneSessionRefresh:owned.session];
+            #pragma clang diagnostic pop
+            WPFLog(@"L2② 已请求系统刷新主窗口 scene");
+        } @catch (NSException *e) { WPFLog(@"L2② 异常: %@", e.reason); }
+    }
+
+    // ③ SpringBoard 原生前台激活（等同点图标）
+    @try { WPFRevealViaSpringBoard(); } @catch (NSException *e) { WPFLog(@"L2③ 异常: %@", e.reason); }
+
     return YES;
 }
+
+
+// v2.0.18：L3（重挂 rootVC + 手补 viewWillAppear/viewDidAppear）和
+// L4（伪造 UIApplicationWillEnterForeground/DidBecomeActive 通知 + 手调 delegate）
+// 整套删除。它们和 setWindowScene 一样属于「自己动手造一个看起来正常的界面」，
+// 老板定调只走原生。真要重建界面，就靠 L2 让系统/微信自己走一遍原生激活流程。
+// ⛔ 不要再加回来。
 
 // 逐级修复：每级做完等一会儿复查，修好立即停
 static void WPFRepairChain_(int level);
 
-// 当前应该修/检查的目标窗口：L2③ 建过接管窗口就用它，否则用微信主窗口
+// 当前应该修/检查的目标窗口（v2.0.18：不再自造窗口，永远就是微信自己的主窗口）
 static UIWindow *WPFTargetWindow(UIApplication *app) {
-    if (gTakeoverWindow && WPFWindowAlive(gTakeoverWindow)) return gTakeoverWindow;
     return WPFMainWindow(app);
 }
 
 static void WPFCheckAfterRepair(UIApplication *app, int nextLevel, int doneLevel) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+    // L2 是系统层原生激活，异步生效，等久一点；L1 是进程内的，0.6s 够
+    double wait = (doneLevel >= 2) ? 1.5 : 0.6;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIWindow *w = WPFTargetWindow(app);
         BOOL alive = WPFWindowAlive(w);
@@ -552,19 +528,10 @@ static void WPFCheckAfterRepair(UIApplication *app, int nextLevel, int doneLevel
             WPFDumpState(@"修复后");
             return;
         }
-        if (nextLevel > 4) {
-            WPFLog(@"*** L1~L4 全部无效 ***");
+        if (nextLevel > 2) {
+            WPFLog(@"*** 原生修复（L1/L2）无效 ***");
             WPFDumpState(@"修复失败");
-            WPFLog(@"exitFallback=%d（v2.0.17 默认关，保持现状等下次前台再试）", kWPFExitFallback ? 1 : 0);
-            if (!kWPFExitFallback) return;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kWPFRetryDelay * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                UIWindow *w2 = WPFTargetWindow(app);
-                if (WPFHealthy(w2, YES)) { WPFLog(@"最终复查: 已恢复，不退出"); return; }
-                WPFLog(@"!!! 界面确实起不来，exit(0) !!!");
-                WPFDumpState(@"退出前");
-                exit(0);
-            });
+            WPFLog(@"保持现状，等用户下次前台激活再试（不 exit、不硬改 UI）");
             return;
         }
         WPFRepairChain_(nextLevel);
@@ -578,8 +545,6 @@ static void WPFRepairChain_(int level) {
     switch (level) {
         case 1: did = WPFRepairLevel1(w); break;
         case 2: did = WPFRepairLevel2(w); break;
-        case 3: did = WPFRepairLevel3(w); break;
-        case 4: did = WPFRepairLevel4();  break;
         default: did = NO; break;
     }
     if (!did) WPFLog(@"L%d 未执行（条件不满足）", level);
@@ -609,7 +574,7 @@ static void WPFDoCheck(NSString *reason) {
 
     // 窗口结构都不成立 → 从 L1 起
     if (!alive) {
-        WPFLog(@"判定黑屏（窗口结构不成立）-> L1~L4");
+        WPFLog(@"判定黑屏（窗口结构不成立）-> L1/L2 原生");
         WPFRepairChain_(1);
         return;
     }
@@ -621,7 +586,7 @@ static void WPFDoCheck(NSString *reason) {
     }
     // 结构和 scene 都像样，最后用像素定死：真没画面才动
     if (WPFSnapshotBlank(w)) {
-        WPFLog(@"判定黑屏（快照无画面）-> L1~L4");
+        WPFLog(@"判定黑屏（快照无画面）-> L1/L2 原生");
         WPFRepairChain_(1);
         return;
     }
