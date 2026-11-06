@@ -38,7 +38,7 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.19-roothide"
+#define WCVK_BUILD_TAG "v2.0.20-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC_EXIT 里 kRelaunchDelaySec
                                              // 秒后就会主动再拉，形成「杀-拉-黑」死循环。
@@ -66,6 +66,7 @@ static int  gCheckCount    = 0;    // 本进程已做过的检查次数
 static double gLastCheckAt = 0;    // 上次检查的绝对时间（节流）
 static int  gL1Attempts = 0;       // L1 实际执行次数（防抖动，同一进程最多 2 次）
 static int  gL2Attempts = 0;       // L2 实际执行次数
+static int  gL3Attempts = 0;       // L3（拆子场景）实际执行次数，每进程最多 1 次
 
 // ===== 日志（v2.0.14）=====
 // 老板连续三次反馈「日志还是没有」。照 wctweak 的 WCPLLogger 对比，我旧版差在三个地方：
@@ -469,6 +470,118 @@ static BOOL WPFRepairLevel1(UIWindow *w) {
 //        微信侧同一时刻的「L2 之后复查」也被从 1.5s 拖到 10s（02:57:43.364 → 02:57:53.675），
 //        说明两边互锁：SB 等微信响应，微信主线程在等 SB。
 // 所以 ①③ 整段删除，只留 ②（requestSceneSessionRefresh：纯异步、无返回值、不改任何状态）。
+// ===== v2.0.20 L3：请系统拆掉「冒充前台的子场景」 =====
+// v2.0.19 实机日志（31 个 dump 块精确统计）第一次把黑屏的形态定死了：
+//   正常 18 次：scenes=1，delegate=MMMainSceneDelegate，state=0，窗口 iConsoleWindow，可用=1
+//   黑屏  8 次：scenes=2
+//      前台 state=0/1 → delegate=MMSubSceneDelegate，可用窗口=0，只有 MMSubSceneWindow(hidden)
+//      后台 state=2   → delegate=MMMainSceneDelegate，可用窗口=1，iConsoleWindow 就挂在它上面
+// ⇒ **主窗口从来没有挂错 scene**！错的是「系统把 sub scene 激活成了前台」。
+//   （v2.0.17 用 setWindowScene 把主窗口从 main scene 搬到 sub scene，等于把主界面塞进
+//     微信的子场景里，所以界面亮了但微信内部状态全乱、通讯录读不出来。那条路彻底作废。）
+// 处理：请系统销毁那个「没有任何可用窗口、却占着前台态」的子 session。
+//       剩下的 main session 只有它一个，系统必须重新激活它 → 界面回来。
+//       全程不碰任何 window / windowScene 属性，只发一个标准的 UIApplication 请求。
+static NSUInteger WPFUsableWindowCount(UIWindowScene *ws) {
+    NSUInteger n = 0;
+    for (UIWindow *w in ws.windows) {
+        if (w.isHidden || !w.rootViewController) continue;
+        if (w.rootViewController.view.window != w) continue;
+        if (w.bounds.size.width < 1 || w.bounds.size.height < 1) continue;
+        n++;
+    }
+    return n;
+}
+
+// 返回「占着前台态却没有任何可用窗口」的 scene；outMainScene = 另一个有可用窗口的 scene
+static UIWindowScene *WPFEmptyForegroundScene(UIWindowScene **outMainScene) {
+    UIWindowScene *mainScene = nil, *emptyFg = nil;
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)s;
+        NSUInteger usable = WPFUsableWindowCount(ws);
+        if (usable > 0) {
+            // 有可用窗口的就是"真正有界面的那个"
+            if (!mainScene || ws.activationState == UISceneActivationStateForegroundActive) mainScene = ws;
+        } else {
+            UISceneActivationState st = ws.activationState;
+            if ((st == UISceneActivationStateForegroundActive ||
+                 st == UISceneActivationStateForegroundInactive) && !emptyFg) {
+                emptyFg = ws;
+            }
+        }
+    }
+    if (outMainScene) *outMainScene = mainScene;
+    return emptyFg;
+}
+
+static BOOL WPFRepairLevel3(UIWindow *w) {
+    if (gL3Attempts >= 1) { WPFLog(@"L3: 本进程已试过，跳过"); return NO; }
+    UIWindowScene *mainScene = nil;
+    UIWindowScene *bad = WPFEmptyForegroundScene(&mainScene);
+    if (!bad || !bad.session) {
+        WPFLog(@"L3: 跳过（没有「占前台但无可用窗口」的 scene）");
+        return NO;
+    }
+    if (!mainScene) {
+        WPFLog(@"L3: 跳过（找不到有可用窗口的主 scene，不能乱拆）");
+        return NO;
+    }
+    if (mainScene == bad) { WPFLog(@"L3: 跳过（同一 scene）"); return NO; }
+    gL3Attempts++;
+
+    NSUInteger badN = WPFUsableWindowCount(bad), mainN = WPFUsableWindowCount(mainScene);
+    WPFLog(@"L3(%d): 拆子场景 —— 待销毁 scene=%p state=%ld session=%@ 可用=%lu 窗口=[%@]",
+           gL3Attempts, (__bridge void *)bad, (long)bad.activationState,
+           bad.session.persistentIdentifier ?: @"(nil)", (unsigned long)badN,
+           bad.windows.count ? NSStringFromClass([bad.windows.firstObject class]) : @"(空)");
+    WPFLog(@"L3(%d): 保留主场景 scene=%p state=%ld session=%@ 可用=%lu 窗口=[%@]",
+           gL3Attempts, (__bridge void *)mainScene, (long)mainScene.activationState,
+           mainScene.session.persistentIdentifier ?: @"(nil)", (unsigned long)mainN,
+           mainScene.windows.count ? NSStringFromClass([mainScene.windows.firstObject class]) : @"(空)");
+
+    UIApplication *app = [UIApplication sharedApplication];
+    @try {
+        // 公开 API：请系统销毁这个 session。不传 options（不需要任何转场/快照行为）。
+        [app requestSceneSessionDestruction:bad.session options:nil errorHandler:^(NSError *e) {
+            WPFLog(@"L3: requestSceneSessionDestruction 失败: %@ (%@)", e.localizedDescription, e.domain);
+        }];
+        WPFLog(@"L3: 已请系统销毁该子场景 session");
+    } @catch (NSException *e) {
+        WPFLog(@"L3 异常: %@", e.reason);
+        return NO;
+    }
+
+    // 销毁是异步的：0.9s 后若界面还没回来，再请系统激活 main session 一次
+    // （此时只剩它一个 session，"不支持多场景"的拒绝条件已经不成立）
+    NSString *mainSessionID = mainScene.session.persistentIdentifier;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UIApplication *a = [UIApplication sharedApplication];
+        UIWindow *mw = WPFMainWindow(a);
+        if (WPFHealthy(mw, YES)) { WPFLog(@"L3: 拆完子场景后界面已恢复"); return; }
+        UISceneSession *ms = mainScene.session;
+        if (!ms) {
+            for (UIScene *s in a.connectedScenes) {
+                if (![s isKindOfClass:[UIWindowScene class]]) continue;
+                if (WPFUsableWindowCount((UIWindowScene *)s) > 0) { ms = s.session; break; }
+            }
+        }
+        if (!ms) { WPFLog(@"L3: 兜底激活跳过（找不到可用的 main session）"); return; }
+        WPFLog(@"L3: 兜底——请系统激活 main session %@", ms.persistentIdentifier ?: mainSessionID ?: @"(nil)");
+        @try {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            [a requestSceneSessionActivation:ms userActivity:nil options:nil errorHandler:^(NSError *e) {
+                WPFLog(@"L3 兜底激活失败: %@", e.localizedDescription);
+            }];
+            #pragma clang diagnostic pop
+        } @catch (NSException *e) { WPFLog(@"L3 兜底激活异常: %@", e.reason); }
+    });
+
+    return YES;
+}
+
 static BOOL WPFRepairLevel2(UIWindow *w) {
     if (!w) { WPFLog(@"L2: 跳过（没有主窗口）"); return NO; }
     if (gL2Attempts >= 1) { WPFLog(@"L2: 本进程已试过 %d 次，不再重复（防抖动）", gL2Attempts); return NO; }
@@ -513,8 +626,8 @@ static UIWindow *WPFTargetWindow(UIApplication *app) {
 }
 
 static void WPFCheckAfterRepair(UIApplication *app, int nextLevel, int doneLevel) {
-    // L2 是系统层原生激活，异步生效，等久一点；L1 是进程内的，0.6s 够
-    double wait = (doneLevel >= 2) ? 1.5 : 0.6;
+    // L3 是「销毁子 session + 兜底激活」，要等销毁真正落地；L2 是系统刷新；L1 是进程内的
+    double wait = (doneLevel >= 3) ? 2.5 : ((doneLevel >= 2) ? 1.5 : 0.6);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIWindow *w = WPFTargetWindow(app);
@@ -529,8 +642,8 @@ static void WPFCheckAfterRepair(UIApplication *app, int nextLevel, int doneLevel
             WPFDumpState(@"修复后");
             return;
         }
-        if (nextLevel > 2) {
-            WPFLog(@"*** 原生修复（L1/L2）无效 ***");
+        if (nextLevel > 3) {
+            WPFLog(@"*** 原生修复（L1/L2/L3）无效 ***");
             WPFDumpState(@"修复失败");
             WPFLog(@"保持现状，等用户下次前台激活再试（不 exit、不硬改 UI）");
             return;
@@ -546,6 +659,7 @@ static void WPFRepairChain_(int level) {
     switch (level) {
         case 1: did = WPFRepairLevel1(w); break;
         case 2: did = WPFRepairLevel2(w); break;
+        case 3: did = WPFRepairLevel3(w); break;
         default: did = NO; break;
     }
     if (!did) WPFLog(@"L%d 未执行（条件不满足）", level);
@@ -579,9 +693,14 @@ static void WPFDoCheck(NSString *reason) {
         WPFRepairChain_(1);
         return;
     }
-    // ⭐ 结构完全健康、只是没挂在台上 → L1 无意义，直接从 L2 起
+    // ⭐ 结构完全健康、只是没挂在台上 → 这就是本机唯一的黑屏形态：
+    //    系统把 MMMainSceneDelegate 的主场景压到后台，却把 MMSubSceneDelegate 的子场景
+    //    激活成前台（上面只有一个 hidden 空窗口）。L1 无意义，从 L2 起，L2 无效再走 L3 拆子场景。
     if (!staged) {
-        WPFLog(@"判定黑屏（窗口挂在非前台 scene）-> 直接从 L2 起修");
+        UIWindowScene *ms = nil;
+        UIWindowScene *bad = WPFEmptyForegroundScene(&ms);
+        WPFLog(@"判定黑屏（主界面在后台、前台是空场景=%d）-> 从 L2 起修，再走 L3",
+               bad ? 1 : 0);
         WPFRepairChain_(2);
         return;
     }
