@@ -38,7 +38,7 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.25-roothide"
+#define WCVK_BUILD_TAG "v2.0.26-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC_EXIT 里 kRelaunchDelaySec
                                              // 秒后就会主动再拉，形成「杀-拉-黑」死循环。
@@ -51,7 +51,8 @@ static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC
 //         期间整个系统卡死、切不了后台；而 rc=11 说明这次启动根本没被受理。
 //    所以这两级在 v2.0.19 里彻底删除，微信侧不再发 notify、SpringBoard 侧不再调该 API。
 static BOOL const kWPFSafeMode      = YES;   // YES = 只做无害动作（refresh），绝不做任何可能阻塞/搬窗口的事
-static double const kWPFCheckDelay  = 1.0;   // 首次前台激活后多久检查
+static double const kWPFCheckDelay  = 0.4;   // v2.0.26: 1.0→0.4，缩短黑屏停留时间（04:38 实测
+                                             // 0.4s 时 iConsoleWindow 已建好、scene 已连完）
 static double const kWPFRetryDelay  = 1.0;   // 非 Active 态复查间隔
 static int    const kWPFRetryMax    = 6;     // 非 Active 态最多复查次数（原来的 3 次太短，
                                              // 日志里 10814 就是复查 2 次进程就换掉了）
@@ -725,16 +726,47 @@ static void WPFRollbackMainScene(UIWindow *main) {
 
 static BOOL WPFRepairLevel2(UIWindow *w) {
     if (!w) { WPFLog(@"L2: 跳过（没有主窗口）"); return NO; }
-    if (gL2Attempts >= 3) { WPFLog(@"L2: 本进程已试过 %d 次，不再重复（防抖动）", gL2Attempts); return NO; }
+    if (gL2Attempts >= 6) { WPFLog(@"L2: 本进程已试过 %d 次，不再重复（防抖动）", gL2Attempts); return NO; }
     gL2Attempts++;
 
     UIWindowScene *owned = w.windowScene;
     UIWindowScene *front = WPFActiveScene();
-    WPFLog(@"L2(%d): 主窗口 scene=%p(state=%ld) 前台 scene=%p(state=%ld) 全部窗口=%lu",
+    NSUInteger frontUsable = front ? WPFUsableWindowCount(front) : 0;
+    WPFLog(@"L2(%d): 主窗口 scene=%p(state=%ld) 前台 scene=%p(state=%ld) 前台可用窗口=%lu 全部窗口=%lu",
            gL2Attempts,
            (__bridge void *)owned, owned ? (long)owned.activationState : (long)-1,
            (__bridge void *)front, front ? (long)front.activationState : (long)-1,
+           (unsigned long)frontUsable,
            (unsigned long)[UIApplication sharedApplication].windows.count);
+
+    // ⭐⭐ v2.0.26 快速路径（依据 04:38:19 实机日志定论）：
+    //   生效的动作只有 L2c 搬家；L2a 压制 0 个窗口、L2b 提层后 sceneOnStage 仍然是 0 —— 都没用。
+    //   而「主窗口在别的 scene + 前台 scene 一个可用窗口都没有」这个组合一旦成立，
+    //   a/b 必然无效（提层改变不了"窗口挂在后台 scene 就不渲染"这件事）。
+    //   ⇒ 命中就直接搬家，不再白等 0.7s，把黑屏时间从 ~2.5s 压到 ~0.3s。
+    BOOL mustMove = (front != nil) && (front != owned) && (frontUsable == 0);
+    if (mustMove) {
+        WPFLog(@"L2: 快速路径 —— 主窗口挂在 scene %p(state=%ld)，前台 scene %p(state=%ld) 可用窗口=0，直接搬家",
+               (__bridge void *)owned, owned ? (long)owned.activationState : (long)-1,
+               (__bridge void *)front, (long)front.activationState);
+        WPFOppressOtherWindows(w);           // 顺手压掉可能存在的覆盖窗（成本极低）
+        if (WPFMoveMainWindowToFrontScene(w)) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                UIApplication *a = [UIApplication sharedApplication];
+                UIWindow *mw = WPFMainWindow(a);
+                if (WPFHealthy(mw, YES)) {
+                    WPFLog(@"L2c(快速) 成功：搬完 %.2fs 内界面恢复", 0.35);
+                    return;
+                }
+                WPFRollbackMainScene(mw);
+                WPFLog(@"L2c(快速) 搬家后仍未恢复，已回滚");
+                WPFDumpState(@"L2 快速路径失败");
+            });
+            return YES;
+        }
+        WPFLog(@"L2: 快速路径搬家失败，回落到通用流程");
+    }
 
     // a) 先把可疑覆盖窗压掉
     WPFOppressOtherWindows(w);
@@ -915,7 +947,7 @@ static void WPFOnDidBecomeActive(void) {
     gLastCheckAt = now;
     gCheckCount++;
     gCheckRetries = 0;
-    double delay = (gCheckCount == 1) ? kWPFCheckDelay : 0.35;   // 首次等界面建好，后续快速复核
+    double delay = (gCheckCount == 1) ? kWPFCheckDelay : 0.15;   // 首次等界面建好，后续快速复核
     WPFLog(@"前台激活 #%d，%.2fs 后检查界面健康度", gCheckCount, delay);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ WPFDoCheck(@"前台激活"); });
