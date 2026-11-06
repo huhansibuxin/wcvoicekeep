@@ -73,7 +73,7 @@ static void SBLog(NSString *fmt, ...) {
 //   通道 1  open/write  —— 原始文件（保留，若沙盒放行最直观）
 //   通道 2  CFPreferences —— SB 必然有权写自己的 prefs domain
 //   通道 3  Darwin 通知 —— 由 root 的 wcvoicekeep daemon 收到后落盘（必定成功）
-#define WCVK_BUILD_TAG "v1.9.42-roothide"
+#define WCVK_BUILD_TAG "v1.9.43-roothide"
 
 // 通道 3：Darwin 通知（名字区分阶段，daemon 侧监听后写自己的日志）
 static void WCVKPostNotify(const char *name) {
@@ -292,6 +292,10 @@ static BOOL gKbdOkPosted = NO;      // 本次预热是否已回报"成功"给 da
 // v1.9.42：这两个函数定义在后面（键盘隐藏 / 成功回报），前面多处引用，先声明
 static void KbdSetKeyboardWindowsAlpha(CGFloat alpha, const char *tag);
 static void KbdReportOkIfRunning(const char *tag);
+// v1.9.43：同上（定义在文件后半部）
+static void KbdForceHideBegin(const char *tag);
+static void KbdForceHideEnd(const char *tag);
+static void KbdDumpWindows(const char *tag);
 
 static void KbdStartKbWatch(void) {
     if (gKbdShowObs) return;
@@ -306,15 +310,8 @@ static void KbdStartKbWatch(void) {
         notify_post("com.wcvoicekeep.kbd.up");
         // v1.9.42：藏键盘（只在"我们自己预热"期间藏，用户真打字时不动）
         if (gKbdWarmBusy) {
-            KbdSetKeyboardWindowsAlpha(0.0, "DidShow");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (gKbdWarmBusy) KbdSetKeyboardWindowsAlpha(0.0, "DidShow+20ms");
-            });
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (gKbdWarmBusy) KbdSetKeyboardWindowsAlpha(0.0, "DidShow+60ms");
-            });
+            KbdDumpWindows("DidShow");          // v1.9.43：把当时所有窗口打出来做证据
+            KbdForceHideBegin("DidShow");       // v1.9.43：20ms 持续压制，不再只写三次
         }
     }];
     gKbdHideObs = [nc addObserverForName:UIKeyboardDidHideNotification
@@ -323,7 +320,8 @@ static void KbdStartKbWatch(void) {
         gKbdDidShow = NO;
         SBLog(@"[KBDWARM] *** UIKeyboardDidHide 收到");
         // v1.9.42：只要键盘收起就把 alpha 还原，绝不让"隐形键盘"留到用户真打字时
-        KbdSetKeyboardWindowsAlpha(1.0, "DidHide-restore");
+        // v1.9.43：压制还在进行中就先别还原，否则会中途露出来；交给 KbdForceHideEnd 收尾
+        if (!gKbdHideActive) KbdSetKeyboardWindowsAlpha(1.0, "DidHide-restore");
     }];
     SBLog(@"[KBDWARM] keyboard show/hide observers installed");
 }
@@ -396,9 +394,10 @@ static void KbdWarmupFinish(NSString *tag) {
         gKbdPrevKeyWindow = nil;
     }
     // v1.9.42：键盘窗口 alpha 还原（等收起动画走完再还原，避免动画期间露出来）
+    // v1.9.43：先停掉持续压制，再还原（否则还原立刻被压制循环改回 0）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        KbdSetKeyboardWindowsAlpha(1.0, "finish-restore");
+        KbdForceHideEnd("finish");
     });
 }
 
@@ -486,6 +485,9 @@ static void KbdWarmupRun(NSString *reason) {
         w.rootViewController = [[UIViewController alloc] init];
         w.rootViewController.view.backgroundColor = [UIColor clearColor];
         gKbdPrevKeyWindow = [[UIApplication sharedApplication] keyWindow];
+        // v1.9.43：**弹键盘之前就开始压制**。键盘窗口可能在上一轮就存在（alpha=1、尺寸 0），
+        // 提前压住 alpha，等系统显示时第一帧就是不可见的，理论上连一帧都不闪。
+        KbdForceHideBegin("pre-hide");
         [w makeKeyAndVisible];                        // 必须：可见且 key，键盘才会真弹
 
         UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 160, 40)];
@@ -562,7 +564,13 @@ static void KbdWarmupRun(NSString *reason) {
 //  3) **必须还原**（resign 之后 / DidHide 时），否则以后真用键盘也会是隐形的。
 static BOOL KbdIsKeyboardWindow(UIWindow *w) {
     NSString *cn = NSStringFromClass([w class]);
-    return [cn containsString:@"KeyboardWindow"];      // UIRemoteKeyboardWindow(_Hosted)
+    // v1.9.43：桌面实测命中的是 SBMedusaHostedKeyboardWindow（SpringBoard 宿主键盘窗口），
+    // 不是 App 内那种 UIRemoteKeyboardWindow。这里把两类都算上，另外把
+    // UITextEffectsWindow（系统文本效果宿主，键盘常挂它下面）也算进来，
+    // 由 KbdDumpWindows 的日志确认到底哪个才是屏幕上真正画键盘的那个。
+    if ([cn containsString:@"Keyboard"] && [cn containsString:@"Window"]) return YES;
+    if ([cn containsString:@"TextEffectsWindow"]) return YES;
+    return NO;
 }
 
 static NSArray *KbdKeyboardWindows(void) {
@@ -587,6 +595,112 @@ static void KbdSetKeyboardWindowsAlpha(CGFloat alpha, const char *tag) {
         w.alpha = alpha;
         SBLog(@"[KBDHIDE] %s -> %s alpha=%.0f", tag, object_getClassName(w), alpha);
     }
+}
+
+// ===== v1.9.43：桌面"有头"排查 —— 全窗口快照 =====
+// 老板实测（2026-11-06 20:54 桌面 5 次）：alpha=0 只写了一次日志，键盘照样完整显示。
+// 两种可能必须靠数据分开：
+//   A) 系统在动画/布局过程中把 alpha 又改回 1（我们只写了 0/20/60ms 三次，动画要 250ms）
+//   B) 我们改的那个窗口根本不是屏幕上显示键盘的那个（真正显示的窗口类名不含 KeyboardWindow）
+// 所以这里把 DidShow 时刻 SpringBoard 里**所有**窗口的类名/level/alpha/hidden/frame 全打出来。
+static void KbdDumpWindows(const char *tag) {
+    UIApplication *app = [UIApplication sharedApplication];
+    NSMutableString *s = [NSMutableString string];
+    for (UIScene *sc in app.connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)sc;
+        [s appendFormat:@"\n  <%s act=%ld windows=%lu>", NSStringFromClass([sc class]).UTF8String,
+             (long)sc.activationState, (unsigned long)ws.windows.count];
+        for (UIWindow *w in ws.windows) {
+            CGRect f = w.frame;
+            [s appendFormat:@"\n    %s lvl=%.1f alpha=%.2f hidden=%d key=%d frame=(%.0f,%.0f,%.0f,%.0f) rvc=%s",
+                 object_getClassName(w), (double)w.windowLevel, (double)w.alpha,
+                 (int)w.hidden, (int)w.isKeyWindow, f.origin.x, f.origin.y,
+                 f.size.width, f.size.height,
+                 w.rootViewController ? object_getClassName(w.rootViewController) : "nil"];
+        }
+    }
+    SBLog(@"[KBDWINDOW] ===== %s windows=%lu =====%s", tag,
+          (unsigned long)app.windows.count, s.UTF8String ?: "");
+}
+
+// ===== v1.9.43：持续性压制（替代"只写三次 alpha"）=====
+// 假设 A 的解法：键盘显示动画约 250ms，期间 SB/arbiter 会反复布局并可能把 alpha 写回 1。
+// 这里在预热全程（~1.6s）每 20ms 重新压一次 alpha=0，并统计"被系统改回去"的次数 ——
+// 这个次数就是假设 A 成立与否的直接证据（>0 = 系统在覆盖我们；=0 = 那就不是 alpha 的问题）。
+static BOOL gKbdHideActive = NO;
+static int  gKbdHideTicks  = 0;
+static int  gKbdHideResets = 0;
+static NSMutableSet *gKbdHideSeen = nil;      // 已压制过的窗口地址（判断"被改回去"）
+static NSMutableDictionary *gKbdHideFrames = nil;  // 窗口地址 -> 原始 frame（收尾还原）
+
+static void KbdForceHideTick(void);
+
+static void KbdForceHideBegin(const char *tag) {
+    if (gKbdHideActive) return;
+    gKbdHideActive = YES;
+    gKbdHideTicks = 0;
+    gKbdHideResets = 0;
+    gKbdHideSeen = [NSMutableSet set];
+    gKbdHideFrames = [NSMutableDictionary dictionary];
+    SBLog(@"[KBDHIDE] force-hide begin (%s)：预热全程每 20ms 压 alpha=0", tag);
+    KbdForceHideTick();
+}
+
+static void KbdForceHideTick(void) {
+    if (!gKbdHideActive) return;
+    gKbdHideTicks++;
+    for (UIWindow *w in KbdKeyboardWindows()) {
+        NSValue *k = [NSValue valueWithPointer:(__bridge const void *)w];
+        BOOL seen = [gKbdHideSeen containsObject:k];
+        if (!seen) {
+            [gKbdHideSeen addObject:k];
+            gKbdHideFrames[k] = [NSValue valueWithCGRect:w.frame];
+            SBLog(@"[KBDHIDE] seen #%d %s alpha=%.2f lvl=%.1f hidden=%d frame=(%.0f,%.0f,%.0f,%.0f)",
+                  gKbdHideTicks, object_getClassName(w), (double)w.alpha,
+                  (double)w.windowLevel, (int)w.hidden,
+                  w.frame.origin.x, w.frame.origin.y, w.frame.size.width, w.frame.size.height);
+        } else if (w.alpha != 0.0) {
+            gKbdHideResets++;
+            if (gKbdHideResets <= 8)
+                SBLog(@"[KBDHIDE] !! 系统把 alpha 改回 %.2f（第 %d 次）-> 再压 0 (%s)",
+                      (double)w.alpha, gKbdHideResets, object_getClassName(w));
+        }
+        w.alpha = 0.0;
+        // v1.9.43 双保险：万一屏幕上显示的不是"能被 alpha 缩放"的那个窗口
+        // （真正画键盘的可能是子层/远端场景），把窗口整体挪到屏幕上方屏外，
+        // 位置一律强制，收尾时按记录的原始 frame 还原。
+        CGRect f = w.frame;
+        if (f.origin.y > -5000.0)
+            w.frame = CGRectMake(f.origin.x, -f.size.height - 400.0, f.size.width, f.size.height);
+    }
+    if (gKbdHideTicks >= 80) {     // 1.6s 足够覆盖显示+收起
+        SBLog(@"[KBDHIDE] force-hide tick 到顶（ticks=%d resets=%d）", gKbdHideTicks, gKbdHideResets);
+        gKbdHideActive = NO;
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ KbdForceHideTick(); });
+}
+
+static void KbdForceHideEnd(const char *tag) {
+    BOOL was = gKbdHideActive;
+    gKbdHideActive = NO;
+    SBLog(@"[KBDHIDE] force-hide end (%s) was_active=%d ticks=%d resets=%d -> 还原 alpha/frame",
+          tag, (int)was, gKbdHideTicks, gKbdHideResets);
+    for (UIWindow *w in KbdKeyboardWindows()) {
+        w.alpha = 1.0;
+        NSValue *k = [NSValue valueWithPointer:(__bridge const void *)w];
+        NSValue *of = gKbdHideFrames[k];
+        if (of) {
+            w.frame = of.CGRectValue;
+            SBLog(@"[KBDHIDE] restore %s frame=(%.0f,%.0f,%.0f,%.0f)", object_getClassName(w),
+                  of.CGRectValue.origin.x, of.CGRectValue.origin.y,
+                  of.CGRectValue.size.width, of.CGRectValue.size.height);
+        }
+    }
+    gKbdHideSeen = nil;
+    gKbdHideFrames = nil;
 }
 
 // ===== v1.9.42：拉起成功立即回报 daemon =====
