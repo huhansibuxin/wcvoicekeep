@@ -720,6 +720,20 @@ static void WCVKRebuildTargets(void) {
 
     LOG(@"targets 重建：共 %lu 个（键盘扩展 + App %lu）",
         (unsigned long)gTargets.count, (unsigned long)(gTargets.count ? gTargets.count - 1 : 0));
+
+    // v2.0.7（老板要求）：**重建时目标不在运行，就必须把它拉起来**。
+    // 重建发生在：daemon 启动、注销/重启后、设置变更。
+    // 以前这里只会向下走 WCVKArmTarget 的 2/5/10/20/40s 重试去找 pid，找不到就放弃 ——
+    // 之后再也没有任何触发点（退出事件不存在，因为进程根本没起来），
+    // 于是那个 App 就彻底不保活了，直到用户再改一次设置。老板实测就撞到这个。
+    // 注意：键盘扩展那条链（退出事件 + kbd.up + 重试挂监视）是好的，这里**不碰**。
+    for (WCVKTarget *t in gTargets) {
+        if ([t.kind isEqualToString:@"kbd"]) continue;
+        if (t.disabled || t.pid > 0 || t.src || t.lastRelaunch) continue;
+        LOG(@"%@ 重建时不在运行 -> 主动后台拉起", t.display);
+        WCVKDoRelaunch(t);
+    }
+
     for (WCVKTarget *t in gTargets) {
         if (t.src && t.pid > 0 && WCVKTargetPid(t) == t.pid) continue;
         WCVKArmTarget(t, 0);
