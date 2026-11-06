@@ -56,7 +56,7 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 }
 #endif
 
-#define WCVK_BUILD_TAG "v2.0.31-roothide"
+#define WCVK_BUILD_TAG "v2.0.32-roothide"
 
 // 键盘扩展进程的精确特征：可执行文件路径以 /wxkb_plugin.appex/wxkb_plugin 结尾
 static const char kKbdExtPathSuffix[] = "/wxkb_plugin.appex/wxkb_plugin";

@@ -21,16 +21,21 @@ static void BKPostPrefsChanged(void) {
 // 硬编码 /var/mobile/Library/Preferences/<domain>.plist + 直读文件，不走 NSUserDefaults。
 // 三条通道依次兜底：直读文件 -> CFPreferences -> NSUserDefaults suite。
 
-static NSString *const kRecDomain   = @"com.wcvoicekeep.bgkeep.records";
 static NSString *const kRecName     = @"com.wcvoicekeep.bgkeep.records.plist";
 static NSString *const kPrefsDomain = @"com.wcvoicekeep.bgkeep";
 
+// v2.0.32（老板 2026-11-07）：daemon 记录固定写在原生 /var/mobile，绝不写 jbroot
+// （.jbroot-XXXX 随机串会变）。设置页这里也以同一个固定路径为第一优先。
+// 后面两条 /rootfs 是同一文件的「原生根视角」：万一设置进程被 roothide 做了路径重定向，
+// /var/mobile 指向 jbroot 内部，/rootfs 仍能读到 daemon 写的原生文件。
 static NSArray<NSString *> *BKRecCandidates(void) {
     return @[
+        @"/var/mobile/wcvoicekeep.records.plist",
+        @"/rootfs/var/mobile/wcvoicekeep.records.plist",
+        @"/rootfs/private/var/mobile/wcvoicekeep.records.plist",
         [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@", kRecName],
         [NSString stringWithFormat:@"/private/var/mobile/Library/Preferences/%@", kRecName],
         [NSString stringWithFormat:@"/rootfs/private/var/mobile/Library/Preferences/%@", kRecName],
-        @"/var/mobile/wcvoicekeep.records.plist",
     ];
 }
 
@@ -43,37 +48,32 @@ static NSArray *BKParseRows(id obj) {
     return nil;
 }
 
+// 遍历全部候选、按修改时间取**最新**的那份有效记录。
+// 旧实现是「命中第一个存在的文件就 return」+ 后面还有 cfprefsd 兜底：roothide 下
+// daemon 写在 .jbroot-* 里、设置页的候选路径全落空，于是退回 CFPreferences 读取
+// cfprefsd 内存里的僵尸快照 —— 页面就永远停在最后一次缓存的时间（老板看到的 4:16:48）。
 static NSArray *BKReadRows(NSString **fromOut, NSString **diagOut) {
     NSMutableString *diag = [NSMutableString string];
+    NSArray *best = nil;
+    NSString *bestPath = nil;
+    double bestM = -1;
     for (NSString *p in BKRecCandidates()) {
         NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
         if (!attr) { [diag appendFormat:@"✘ %@\n", p]; continue; }
         NSArray *r = BKParseRows([NSDictionary dictionaryWithContentsOfFile:p]);
         if (!r) r = BKParseRows([NSArray arrayWithContentsOfFile:p]);
-        [diag appendFormat:@"✔ %@ (%lluB) rows=%lu\n", p,
+        [diag appendFormat:@"%@ %@ (%lluB) rows=%lu\n", r ? @"✔" : @"!", p,
          (unsigned long long)[attr[NSFileSize] unsignedLongLongValue], (unsigned long)r.count];
-        if (r) { if (fromOut) *fromOut = p; if (diagOut) *diagOut = diag; return r; }
+        if (!r) continue;
+        double m = [attr[NSFileModificationDate] timeIntervalSince1970];
+        if (m > bestM) { bestM = m; best = r; bestPath = p; }
+    }
+    if (best) {
+        if (fromOut) *fromOut = bestPath;
+        if (diagOut) *diagOut = diag;
+        return best;
     }
     if (diagOut) *diagOut = diag.length ? diag : @"（所有候选路径都不存在）";
-    return nil;
-}
-
-static NSArray *BKReadRowsFromCFPrefs(void) {
-    CFPropertyListRef v = CFPreferencesCopyValue(CFSTR("rows"),
-                                                (__bridge CFStringRef)kRecDomain,
-                                                kCFPreferencesAnyUser, kCFPreferencesAnyHost);
-    if (!v) v = CFPreferencesCopyValue(CFSTR("rows"),
-                                       (__bridge CFStringRef)kRecDomain,
-                                       kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
-    if (!v) return nil;
-    return BKParseRows((__bridge_transfer id)v);
-}
-
-static NSArray *BKReadRowsFromUserDefaults(void) {
-    @try {
-        NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kRecDomain];
-        return BKParseRows([d objectForKey:@"rows"]);
-    } @catch (NSException *e) {}
     return nil;
 }
 
@@ -92,9 +92,19 @@ static NSString *BKRecordsFooterText(void) {
     df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
     df.dateFormat = @"MM-dd HH:mm:ss";
 
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:
-        [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", kPrefsDomain]];
-    BOOL recordOn = prefs[@"record"] ? [prefs[@"record"] boolValue] : YES;
+    // 开关由 cfprefsd 管（可能只存在内存里、还没 flush 到盘），优先问 cfprefsd；
+    // 直读文件只作兜底 —— roothide 下 plist 可能落在 jbroot 内而不是原生路径。
+    BOOL recordOn = YES;
+    CFPropertyListRef v = CFPreferencesCopyValue(CFSTR("record"),
+        (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    if (v) {
+        id val = (__bridge_transfer id)v;
+        recordOn = [val respondsToSelector:@selector(boolValue)] ? [val boolValue] : YES;
+    } else {
+        NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:
+            [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", kPrefsDomain]];
+        if (prefs[@"record"]) recordOn = [prefs[@"record"] boolValue];
+    }
     if (!recordOn) {
         return @"「记录拉起动作」开关是关闭状态：插件不写任何记录（零写入、零 CPU）。"
                 "要记录请把上面那个开关打开。";
@@ -102,9 +112,10 @@ static NSString *BKRecordsFooterText(void) {
 
     NSString *from = nil;
     NSString *diag = nil;
+    // ★ 只读真实文件，绝不回退到 CFPreferences / NSUserDefaults：
+    //   daemon 是直接写 plist 文件的，cfprefsd 内存里那份是历史快照，永远不刷新，
+    //   读它会让页面显示「记录停在某个旧时间点」的假象（v2.0.32 修掉）。
     NSArray *rows = BKReadRows(&from, &diag);
-    if (!rows) { rows = BKReadRowsFromCFPrefs(); if (rows) from = @"CFPreferences"; }
-    if (!rows) { rows = BKReadRowsFromUserDefaults(); if (rows) from = @"NSUserDefaults"; }
     if (!rows) rows = @[];
 
     if (!rows.count)

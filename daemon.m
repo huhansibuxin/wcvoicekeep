@@ -1,4 +1,4 @@
-// wcvoicekeep daemon — v2.0.31「只负责拉起」
+// wcvoicekeep daemon — v2.0.32「只负责拉起」
 //
 // 职责（老板 2026-11-07 定案）：本工程**不再注入任何 App 进程**，daemon 只做两件事：
 //   1) 键盘扩展 wxkb_plugin —— 必须保活（不可关闭、永不熔断）。它一退出，发 Darwin 通知
@@ -11,6 +11,13 @@
 //   任何 EXIT 事件 -> 固定 1s 立刻拉起，不引入任何指数退避；
 //   键盘 3s 防抖、App 失败 15s 冷却、连续 3 次失败熔断（**键盘豁免**）、
 //   拉起后 1.5s 按真实 pid 校验、失败按 5s/15s 重试两次、挂监视重试 2/5/10/20/40s。
+//
+// ===== v2.0.32：拉起记录改写到固定 /var/mobile（老板 2026-11-07）=====
+//   旧实现用 WCVKExistingPrefsDir() 推导记录路径，实机选中的是
+//   <jbroot>/var/mobile/Library/Preferences/... —— roothide 随机串会变，且设置页
+//   读的是原生 /var/mobile，永远看不到它；设置页再退回 cfprefsd 僵尸缓存，
+//   于是「记录停在 4:16:48 再不更新」。现在 daemon 固定写 /var/mobile/wcvoicekeep.records.plist，
+//   设置页同路径读 + 按 mtime 取最新 + 不再回退 cfprefsd。拉起语义一个数没动。
 //
 // ===== v2.0.31 优化：不卡事件队列 / 无多余开销 / 鲁棒性 / 精准命中 =====
 //  ① 线程拆分（gQueue 只做轻量状态判断，不再被同步 IO/IPC 卡住）：
@@ -72,9 +79,16 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #define WCVK_NO_LOG 0
 #endif
 
-static NSString *const kLogPath     = @"/var/mobile/wcvoicekeep.daemon.log";
-static NSString *const kPrefsDomain = @"com.wcvoicekeep.bgkeep";
-static NSString *const kRecordsName = @"com.wcvoicekeep.bgkeep.records.plist";
+static NSString *const kLogPath       = @"/var/mobile/wcvoicekeep.daemon.log";
+static NSString *const kPrefsDomain   = @"com.wcvoicekeep.bgkeep";
+// v2.0.32（老板 2026-11-07）：记录文件**只写固定的 /var/mobile**，绝不写进 jbroot。
+// roothide 的 .jbroot-XXXX 随机串每次 bootstrap 都可能变，写进去换环境就丢；
+// 而且设置页读的是原生 /var/mobile —— 写在 jbroot 里它根本看不见，
+// 这正是「记录一直停在 4:16:48、后面再不更新」的根因。
+// 放在 /var/mobile 根目录而非 Library/Preferences：不进 cfprefsd 监视目录，
+// 写盘不会触发 com.apple.preferences-changed 广播 -> daemon 不会自己唤醒自己（零多余开销）。
+static NSString *const kRecordsPath = @"/var/mobile/wcvoicekeep.records.plist";
+static NSString *const kRecordsAlt  = @"/var/mobile/Library/Preferences/com.wcvoicekeep.bgkeep.records.plist";
 
 #if WCVK_NO_LOG
 #define LOG(...) do {} while (0)
@@ -179,8 +193,10 @@ static NSString *WCVKExistingPrefsDir(void) {
 static NSString *WCVKPrefsPath(void) {
     return [WCVKExistingPrefsDir() stringByAppendingFormat:@"/%@.plist", kPrefsDomain];
 }
+// ★ 固定路径，与 roothide 的 jbroot 完全解耦（不再经过 WCVKExistingPrefsDir 推导）。
+//   prefs 开关仍从 WCVKExistingPrefsDir 读（那是 cfprefsd 写的地方，只读不受影响）。
 static NSString *WCVKRecordsPath(void) {
-    return [WCVKExistingPrefsDir() stringByAppendingFormat:@"/%@", kRecordsName];
+    return kRecordsPath;
 }
 
 // ===== 设置读取 =====
@@ -258,26 +274,29 @@ static void WCVKRecordWrite(NSString *path, NSDictionary *row) {
     NSString *writtenPath = path;
     BOOL wrote = [out writeToFile:path atomically:YES];
     if (!wrote) {
-        NSString *alt = @"/var/mobile/wcvoicekeep.records.plist";
-        wrote = [out writeToFile:alt atomically:YES];
-        if (wrote) writtenPath = alt;
-        LOG(@"record write fallback -> %@ (%d)", alt, wrote);
+        // 备用同样落在固定 /var/mobile，绝不回退到 jbroot 内部路径
+        wrote = [out writeToFile:kRecordsAlt atomically:YES];
+        if (wrote) writtenPath = kRecordsAlt;
+        LOG(@"record write fallback -> %@ (%d)", kRecordsAlt, wrote);
     }
     if (wrote) {
-        // 属主必须是 mobile（设置页要能清空）；已正确就不再 syscall
+        LOG(@"record write -> %@ rows=%lu", writtenPath, (unsigned long)arr.count);
+        // 属主必须是 mobile（设置页要能读/清空）；已正确就不再 syscall
         struct stat sb;
         if (stat(writtenPath.fileSystemRepresentation, &sb) != 0 ||
             sb.st_uid != 501 || (sb.st_mode & 07777) != 0644) {
             chown(writtenPath.fileSystemRepresentation, 501, 501);
             chmod(writtenPath.fileSystemRepresentation, 0644);
         }
+    } else {
+        LOG(@"record write FAILED -> %@", path);
     }
 }
 
 static void WCVKRecord(NSString *display, NSString *ident, NSString *kind, BOOL ok, NSString *detail) {
     // 记录开关关掉时**直接返回**：不读文件、不写文件、不进队列，零 syscall、零 CPU
     if (!gRecord) return;
-    NSString *path = WCVKRecordsPath();     // 目录缓存在调用线程解析好，后台线程不读共享状态
+    NSString *path = WCVKRecordsPath();     // 固定 /var/mobile 路径，后台线程零共享状态
     NSMutableDictionary *row = [NSMutableDictionary dictionary];
     row[@"t"] = [NSDate date];
     row[@"name"] = display ?: ident ?: @"?";
