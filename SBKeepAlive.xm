@@ -293,6 +293,13 @@ static BOOL gKbdOkPosted = NO;      // 本次预热是否已回报"成功"给 da
 static void KbdSetKeyboardWindowsAlpha(CGFloat alpha, const char *tag);
 static void KbdReportOkIfRunning(const char *tag);
 // v1.9.43：同上（定义在文件后半部）
+// 注意 .xm 按 ObjC++ 编译：变量必须只定义一次，所以状态变量统一放这里，
+// 后面的函数只使用不重复定义（CI 上就踩过 "use of undeclared identifier"）。
+static BOOL gKbdHideActive = NO;
+static int  gKbdHideTicks  = 0;
+static int  gKbdHideResets = 0;
+static NSMutableSet *gKbdHideSeen = nil;            // 已压制过的窗口地址（判断"被改回去"）
+static NSMutableDictionary *gKbdHideFrames = nil;   // 窗口地址 -> 原始 frame（收尾还原）
 static void KbdForceHideBegin(const char *tag);
 static void KbdForceHideEnd(const char *tag);
 static void KbdDumpWindows(const char *tag);
@@ -628,12 +635,6 @@ static void KbdDumpWindows(const char *tag) {
 // 假设 A 的解法：键盘显示动画约 250ms，期间 SB/arbiter 会反复布局并可能把 alpha 写回 1。
 // 这里在预热全程（~1.6s）每 20ms 重新压一次 alpha=0，并统计"被系统改回去"的次数 ——
 // 这个次数就是假设 A 成立与否的直接证据（>0 = 系统在覆盖我们；=0 = 那就不是 alpha 的问题）。
-static BOOL gKbdHideActive = NO;
-static int  gKbdHideTicks  = 0;
-static int  gKbdHideResets = 0;
-static NSMutableSet *gKbdHideSeen = nil;      // 已压制过的窗口地址（判断"被改回去"）
-static NSMutableDictionary *gKbdHideFrames = nil;  // 窗口地址 -> 原始 frame（收尾还原）
-
 static void KbdForceHideTick(void);
 
 static void KbdForceHideBegin(const char *tag) {
