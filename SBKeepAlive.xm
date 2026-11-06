@@ -280,6 +280,10 @@ static BOOL gKbdDidShow = NO;
 static id   gKbdShowObs = nil;
 static id   gKbdHideObs = nil;
 
+// v1.9.42：Darwin 通知（SB 侧要主动回报 daemon），notify.h 在这个 SDK 里不全，手动声明
+extern uint32_t notify_post(const char *name);
+static BOOL gKbdOkPosted = NO;      // 本次预热是否已回报"成功"给 daemon
+
 // v1.9.42：这两个函数定义在后面（键盘隐藏 / 成功回报），前面多处引用，先声明
 static void KbdSetKeyboardWindowsAlpha(CGFloat alpha, const char *tag);
 static void KbdReportOkIfRunning(const char *tag);
@@ -585,9 +589,6 @@ static void KbdSetKeyboardWindowsAlpha(CGFloat alpha, const char *tag) {
 // 做判定窗口 —— SpringBoard 明明在 T+0.6s 就已经把扩展拉起来了（日志
 // running=1），但下一次采样时进程刚被再次杀掉，于是被判 FAILED 并锁 45s，
 // 老板看到的就是"第二次之后不重启"。改成 SB 侧成功即回报，判定不靠采样：
-extern uint32_t notify_post(const char *name);
-static BOOL gKbdOkPosted = NO;
-
 static void KbdReportOkIfRunning(const char *tag) {
     if (gKbdOkPosted) return;
     if (!KbdProcRunning()) return;

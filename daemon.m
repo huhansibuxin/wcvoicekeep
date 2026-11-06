@@ -63,9 +63,12 @@ extern uint32_t notify_register_dispatch(const char *name, int *out_token,
                                          dispatch_queue_t queue, void (^handler)(int));
 extern uint32_t notify_get_state(int token, uint64_t *state);
 
+#include <dispatch/dispatch.h>   // v1.9.42：DISPATCH_SOURCE_TYPE_PROC 事件监听
+
 // v1.9.42：事件驱动键盘扩展看护（定义在后，注册处先声明）
 static void armKbdProcWatch(void);
 static void onKbdWarmupOk(void);
+static dispatch_queue_t kbdEventQueue(void);
 
 #define SBS_PATH "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices"
 
