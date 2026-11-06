@@ -165,8 +165,8 @@ static void KbdWarmupFinish(NSString *tag) {
     }
     // 恢复原本的 key window，避免 SpringBoard 触摸/手势因 key 转移而异常
     if (gKbdPrevKeyWindow) {
-        BOOL ok = [gKbdPrevKeyWindow makeKeyWindow];
-        SBLog(@"[KBDWARM] %@ restore prev keyWindow=%d", tag, ok);
+        [gKbdPrevKeyWindow makeKeyWindow];   // 返回 void，不能取返回值
+        SBLog(@"[KBDWARM] %@ restored prev keyWindow", tag);
         gKbdPrevKeyWindow = nil;
     }
 }
