@@ -38,7 +38,7 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.23-roothide"
+#define WCVK_BUILD_TAG "v2.0.24-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC_EXIT 里 kRelaunchDelaySec
                                              // 秒后就会主动再拉，形成「杀-拉-黑」死循环。
@@ -833,6 +833,17 @@ static void WPFSanitizeKnownSceneSessions(void) {
         //   做法：挑一条「配置名不是 SubScene」的留下，其余全部删除；若留下的那条本身
         //     就是 SubScene（磁盘上全是子场景），就一条都不留，让 UIKit 自己重建默认 session。
         NSData *needle = [@"SubScene" dataUsingEncoding:NSUTF8StringEncoding];
+        // ★★ v2.0.24（04:15~04:16 实机证据）：判据改成**全删**，一条都不留。
+        //   证据链：
+        //     04:15:56.088 首次分配 session=FD5F03B1 name=MainScene → 正常（这是 FBS 的启动请求）
+        //     04:16:05.855 9.7s 后系统又来一次分配 session=7E94B89B name=SubScene
+        //                  ← 这条正是磁盘上被持久化、被系统"恢复"的那个 session
+        //                  （本进程 ctor 里打印的就是「已存在 session 7E94B89B → 保留（唯一）」）
+        //   结论：只要磁盘上留着任何一条被恢复的 session，用户点开时系统就连它，
+        //         而微信对"恢复来的 session"一律下发 SubScene 配置 → 空场景占前台 → 黑屏。
+        //   v2.0.22「留一条最像 main 的」不够：那条留下的照样会在运行时被当成 sub。
+        //   ⇒ 幂等做法：每次启动前把 KnownSceneSessions 清空（原文件已备份 .wcvk.bak），
+        //     系统没有可恢复的 session，只能按当前请求新建，微信才会老老实实分配 MainScene。
         NSString *keep = nil;
         NSMutableArray *kill = [NSMutableArray array];
         for (NSString *k in keys) {
@@ -842,21 +853,19 @@ static void WPFSanitizeKnownSceneSessions(void) {
                 NSData *vd = (NSData *)v;
                 isSub = [vd rangeOfData:needle options:0 range:NSMakeRange(0, vd.length)].location != NSNotFound;
             }
-            BOOL take = (!isSub && keep == nil);
             WPFLog(@"scene-session: 已存在 session %@ → %@", k,
-                   isSub ? @"SubScene（删）" : (take ? @"保留（唯一）" : @"多余会话（删）"));
-            if (take) keep = k; else [kill addObject:k];
+                   isSub ? @"SubScene（删）" : @"也删（v2.0.24 全清，防止运行时被当成 sub）");
+            [kill addObject:k];
         }
-        if (!kill.count) { WPFLog(@"scene-session: 只有 1 条且非 SubScene，不动"); return; }
+        if (!kill.count) { WPFLog(@"scene-session: 本来就没有条目，无需处理"); return; }
         [d removeObjectsForKeys:kill];
         NSData *out = [NSPropertyListSerialization dataWithPropertyList:d
                                                                  format:NSPropertyListBinaryFormat_v1_0
                                                                 options:0 error:&err];
         if (!out) { WPFLog(@"scene-session: 序列化失败(%@)", err.localizedDescription); return; }
         if ([out writeToFile:path atomically:YES]) {
-            WPFLog(@"scene-session: 已删除 %lu 条多余会话，留下 %@（原 %lu 字节 → 新 %lu 字节）",
-                   (unsigned long)kill.count, keep ?: @"0 条（全是子场景，交给 UIKit 重建）",
-                   (unsigned long)raw.length, (unsigned long)out.length);
+            WPFLog(@"scene-session: 已清空 %lu 条会话（原 %lu 字节 → 新 %lu 字节），本次系统只能新建 session",
+                   (unsigned long)kill.count, (unsigned long)raw.length, (unsigned long)out.length);
         } else {
             WPFLog(@"scene-session: 写回失败（路径 %@）", path);
         }

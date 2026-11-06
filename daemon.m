@@ -489,17 +489,13 @@ static int WCVKHeadlessLaunch(NSString *bid) {
 // ===== 目标（事件驱动看护）=====
 static const char *kKbdExtSuffix    = "/wxkb_plugin.appex/wxkb_plugin";
 static const int  kRelaunchDelaySec = 1;     // 事件 -> 拉起前等 1s（尊重系统回收动作）
-// ★ v2.0.22 短命退出退避（老板 2026-11-07 实测：「用 CocoaTop 杀掉微信后就一直黑屏」）
-//   实机证据：03:43:43~03:49:16 共 5.5 分钟里微信被拉起 25 次，平均 13 秒一轮 ——
-//   headless 拉起 → willEnterForeground(首次) → 1s 后检查 → didEnterBackground → 进程死 → 1s 再拉。
-//   每轮都会在 KnownSceneSessions 里留下一条 session，越滚越乱，系统恢复命中子场景就黑屏；
-//   而且用户此刻点开微信，撞上的是刚被拉起、还没稳定的半死进程 → 「直接进微信动不了」。
-//   ⇒ 存活 < kShortLifeSec 的退出算「短命」，连击按指数退避，彻底断掉这个风暴。
+// ★ v2.0.24（老板 2026-11-07 定案）：退避机制已撤销。
+//   历史：v2.0.22 为压「5.5 分钟拉起 25 次」的风暴，给 App 加了 1/5/15/60/120s 指数退避；
+//   但实机感受是「daemon 半天不拉起、很多时候根本不拉」，反而不如老版本好用，测试也等不到。
+//   现在恢复成纯事件驱动：任何退出事件 -> 固定 1s 立刻拉起，不做任何加长延迟。
+//   短命次数只保留统计日志（kShortLifeSec 仅用于判定日志措辞）。
 static const int  kShortLifeSec     = 60;
-static const int  kShortLifeDelay[] = {1, 5, 15, 60, 120};  // 索引 = shortLives-1，超出取末位
-// v2.0.23：上限从 300s 收到 120s —— 300s 太长，老板实测感受是「daemon 根本不拉了」。
-// 崩溃根因修掉之后短命本来就该很少，120s 足够压住风暴，又不至于长时间不出手。
-static const int  kFailCooldownSec  = 45;    // App 拉起失败后冷却，避免死循环
+static const int  kFailCooldownSec  = 15;    // v2.0.24: 45s→15s，拉起失败(rc≠0)后也尽快重试
 static const int  kKbdDebounceSec   = 3;     // 键盘扩展只防抖 3s：拉起成功后必须能立刻再拉
 static const int  kArmRetrySecs[]   = {2, 5, 10, 20, 40};  // 拉起后找 pid 挂监视的重试点
 // v2.0.6：连续失败熔断上限（改设置即恢复）
@@ -638,21 +634,18 @@ static void WCVKArmPid(WCVKTarget *t, int pid) {
     dispatch_source_set_event_handler(src, ^{
         WCVKTarget *st = wt;
         if (!st) return;
-        // v2.0.22：短命退出识别 + 指数退避（只对 App；键盘扩展必须保持 1s 立刻重拉）
+        // ★ v2.0.24（老板 2026-11-07 明确要求）：撤掉短命退避，恢复纯事件驱动。
+        //   上一版 1/5/15/60/120s 的退避把 daemon 变成「半天不拉起」，测试时根本等不到；
+        //   而且退避本来是为了压「重启风暴」，可风暴的真实影响（会话越滚越多）已经在
+        //   scene-session 那一层按条数处理掉了，这里没必要再拖时间。
+        //   现在：任何退出事件 -> 固定 kRelaunchDelaySec（1s）立刻拉起。
+        //   短命次数仅用于日志统计，不再影响延迟。
         time_t life = (st.armedAt > 0) ? (time(NULL) - st.armedAt) : -1;
         int delay = kRelaunchDelaySec;
         if ([st.kind isEqualToString:@"app"] && life >= 0 && life < kShortLifeSec) {
             st.shortLives++;
-            int n = (int)(sizeof(kShortLifeDelay) / sizeof(kShortLifeDelay[0]));
-            int idx = st.shortLives - 1; if (idx >= n) idx = n - 1;
-            delay = kShortLifeDelay[idx];
-            LOG(@"### %@ (pid=%d) 短命退出：只活了 %lds，连击 %d 次 -> 退避 %ds 再拉起",
+            LOG(@"### %@ (pid=%d) 退出（只活了 %lds，累计短命 %d 次）-> %ds 后立刻拉起",
                 st.display, st.pid, (long)life, st.shortLives, delay);
-            if (st.shortLives == 2)
-                WCVKRecord(st.display, st.ident, st.kind, NO,
-                           [NSString stringWithFormat:
-                            @"%@ 连续短命退出（每次只活十几秒），已退避 %ds，避免重启风暴",
-                            st.display, delay]);
         } else {
             if (st.shortLives > 0)
                 LOG(@"### %@ 这次活了 %lds -> 短命计数清零（原连击 %d 次）",
