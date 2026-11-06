@@ -43,7 +43,7 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #import <stdio.h>
 #import <stdlib.h>   // calloc / free
 
-#define WCVK_BUILD_TAG "v2.0.2-roothide"
+#define WCVK_BUILD_TAG "v2.0.3-roothide"
 
 // 键盘扩展进程的精确特征：可执行文件路径以 /wxkb_plugin.appex/wxkb_plugin 结尾
 static NSString *const kKbdExtPathSuffix = @"/wxkb_plugin.appex/wxkb_plugin";
@@ -183,27 +183,6 @@ static id           gHideObs = nil;
 
 static void KbdWarmupFinish(NSString *tag);
 
-static void KbdRetryTick(int attempt) {
-    if (gDidShow || !gWarmField) return;
-    if (attempt > 3) {
-        SBLog(@"[KBDWARM] retry 用尽 3 次，键盘仍未弹出（本次拉起失败）");
-        return;
-    }
-    @try { [gWarmField resignFirstResponder]; } @catch (NSException *e) {}
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (!gWarmField || gDidShow) return;
-        BOOL b = [gWarmField becomeFirstResponder];
-        SBLog(@"[KBDWARM] retry#%d becomeFirstResponder=%d", attempt, b);
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.1 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        SBLog(@"[KBDWARM] retry#%d keyboardShown=%d wxkb_plugin_running=%d",
-              attempt, gDidShow, KbdProcRunning());
-        if (!gDidShow) KbdRetryTick(attempt + 1);
-    });
-}
-
 static void KbdInstallObservers(void) {
     if (gShowObs) return;
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -234,21 +213,34 @@ static void KbdInstallObservers(void) {
 }
 
 static void KbdWarmupFinish(NSString *tag) {
-    if (gWarmField) {
-        BOOL ok = [gWarmField resignFirstResponder];
+    // v2.0.2：收尾顺序重排。以前是 resign 之后**立刻**把窗口 hidden + 销毁 + 恢复 keyWindow，
+    // 键盘收起动画被打断，键盘就留在屏幕上了（老板实测"注销后键盘一直在桌面"）。
+    // 现在：resign 生效 -> 让动画先走完 -> 再销毁窗口、恢复 key window。幂等，可重复调用。
+    UITextField *f = gWarmField;
+    UIWindow *w = gWarmWindow;
+    UIWindow *prev = gPrevKeyWindow;
+    gWarmField = nil;
+    gWarmWindow = nil;
+    gPrevKeyWindow = nil;
+
+    if (f) {
+        BOOL ok = NO;
+        @try { ok = [f resignFirstResponder]; } @catch (NSException *e) {}
+        @try { [f endEditing:YES]; } @catch (NSException *e) {}
         SBLog(@"[KBDWARM] %@ resignFirstResponder=%d", tag, ok);
-        [gWarmField removeFromSuperview];
-        gWarmField = nil;
     }
-    if (gWarmWindow) {
-        gWarmWindow.hidden = YES;
-        gWarmWindow.rootViewController = nil;
-        gWarmWindow = nil;
-    }
-    if (gPrevKeyWindow) {
-        [gPrevKeyWindow makeKeyWindow];   // 返回 void
-        gPrevKeyWindow = nil;
-    }
+    if (!f && !w) return;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (f) @try { [f removeFromSuperview]; } @catch (NSException *e) {}
+        if (w) {
+            w.hidden = YES;
+            w.rootViewController = nil;
+        }
+        if (prev) [prev makeKeyWindow];   // 返回 void
+        SBLog(@"[KBDWARM] %@ 窗口清理完成（键盘收起动画已走完）", tag);
+    });
 }
 
 static void KbdWarmupRun(NSString *reason) {
@@ -298,30 +290,48 @@ static void KbdWarmupRun(NSString *reason) {
         SBLog(@"[KBDWARM] becomeFirstResponder=%d isFirstResponder=%d isKeyWindow=%d",
               became, (int)tf.isFirstResponder, (int)w.isKeyWindow);
 
-        // T+0.6s：确认键盘是否真弹
+        // T+0.6s：确认键盘是否真弹（只记日志，不再用它决定要不要收）
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             SBLog(@"[KBDWARM] T+0.6s keyboardShown=%d wxkb_plugin_running=%d",
                   gDidShow, KbdProcRunning());
-            if (!gDidShow) KbdRetryTick(1);
+            // 只补一次：真没弹出来再 become 一次。绝不再做 3 连重试 ——
+            // 那会让键盘在桌面上反复闪、且迟迟不收（老板实测"注销后键盘一直留在桌面"）。
+            if (!gDidShow && gWarmField && !gWarmField.isFirstResponder) {
+                @try { [gWarmField becomeFirstResponder]; } @catch (NSException *e) {}
+            }
         });
 
-        // T+1.0s：弹出来了就收键盘（扩展已被系统拉起，收键盘不影响它继续活着）
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+        // T+0.7s：**无条件**收键盘。
+        // 关键：以前这里写的是 `if (!gDidShow) return;` —— 而 SpringBoard 里
+        // UIKeyboardDidShow 经常收不到，结果"键盘弹出来了却永远不收"，一直挂在桌面上。
+        // 0.7s 足够系统把 wxkb_plugin spawn 出来（实测 <0.6s），收键盘不影响扩展继续存活。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (!gDidShow) return;
-            KbdWarmupFinish(@"T+1.0s");
-            SBLog(@"[KBDWARM] T+1.0s 收键盘完成 wxkb_plugin_running=%d", KbdProcRunning());
-            gWarmBusy = NO;
+            KbdWarmupFinish(@"T+0.7s");
+            SBLog(@"[KBDWARM] T+0.7s 收键盘完成 wxkb_plugin_running=%d", KbdProcRunning());
         });
 
-        // T+5s：最终判定
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+        // T+1.1s：再补一次收（第一次 resign 可能撞在键盘还在弹出的动画里，收不干净）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.1 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (gWarmField) {
+                @try { [gWarmField resignFirstResponder]; } @catch (NSException *e) {}
+            }
+            if (gWarmWindow) {
+                gWarmWindow.hidden = YES;
+                gWarmWindow = nil;
+            }
+            if (gPrevKeyWindow) { [gPrevKeyWindow makeKeyWindow]; gPrevKeyWindow = nil; }
+        });
+
+        // T+3s：最终判定 + 释放 busy（无论成败都要释放，否则下次预热会被 busy 挡住）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             BOOL running = KbdProcRunning();
-            SBLog(@"[KBDWARM] T+5s FINAL keyboardShown=%d wxkb_plugin_running=%d (%@)",
+            SBLog(@"[KBDWARM] T+3s FINAL keyboardShown=%d wxkb_plugin_running=%d (%@)",
                   gDidShow, running, running ? @"成功" : @"失败");
-            if (!running) KbdWarmupFinish(@"T+5s-fallback");
+            KbdWarmupFinish(@"T+3s-final");
             gWarmBusy = NO;
         });
     });

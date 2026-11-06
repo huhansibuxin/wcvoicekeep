@@ -67,8 +67,29 @@ static NSArray *BKReadRowsFromCFPrefs(void) {
     CFPropertyListRef v = CFPreferencesCopyValue(CFSTR("rows"),
                                                 (__bridge CFStringRef)kRecordsDomain,
                                                 kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    if (!v) v = CFPreferencesCopyValue(CFSTR("rows"),
+                                       (__bridge CFStringRef)kRecordsDomain,
+                                       kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
     if (!v) return nil;
     return BKParseRows((__bridge_transfer id)v);
+}
+
+// 通道③：NSUserDefaults suite 读（与 Touch-Viz 设置页同一套做法）
+static NSArray *BKReadRowsFromUserDefaults(void) {
+    @try {
+        NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:kRecordsDomain];
+        id v = [d objectForKey:@"rows"];
+        return BKParseRows(v);
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+// 保证拿到的永远是 NSString（NSNull / 异常类型一律回落默认值）—— 页面上出现过 "null"，
+// 就是有地方把 nil 塞进了 %@ 或 setProperty。
+static NSString *BKSafeStr(id v, NSString *fallback) {
+    if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) return v;
+    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v stringValue];
+    return fallback;
 }
 
 @implementation BKRecordsController
@@ -93,6 +114,9 @@ static NSArray *BKReadRowsFromCFPrefs(void) {
     NSString *footer = nil;
 
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    // 固定 locale：不设的话在设置进程里可能按用户区域格式失败，stringFromDate 返回 nil，
+    // 页面就显示成 "null"（老板实测"直接显示 null"）。
+    df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
     df.dateFormat = @"MM-dd HH:mm:ss";
 
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:BKPrefsPath()];
@@ -103,10 +127,15 @@ static NSArray *BKReadRowsFromCFPrefs(void) {
         footer = @"「记录拉起动作」开关是关闭状态：插件不写任何记录（零写入、零 CPU）。"
                  @"要记录请回上一页打开开关。";
     } else {
+        // 三条读取通道依次试：直读文件 -> CFPreferences -> NSUserDefaults suite
         rows = BKReadRowsFromFile(&from, &diag);
         if (!rows) {
             rows = BKReadRowsFromCFPrefs();
             if (rows) from = @"CFPreferences 域读";
+        }
+        if (!rows) {
+            rows = BKReadRowsFromUserDefaults();
+            if (rows) from = @"NSUserDefaults suite";
         }
         if (!rows) rows = @[];
 
@@ -118,10 +147,13 @@ static NSArray *BKReadRowsFromCFPrefs(void) {
             for (NSUInteger i = 0; i < rows.count && i < 6; i++) {
                 id r = rows[i];
                 if (![r isKindOfClass:[NSDictionary class]]) continue;
-                NSString *nm = r[@"name"] ?: r[@"bid"] ?: @"?";
-                NSDate *t = [r[@"t"] isKindOfClass:[NSDate class]] ? r[@"t"] : nil;
-                [tail appendFormat:@"%@ %@ %@\n",
-                 t ? [df stringFromDate:t] : @"--",
+                NSString *nm = BKSafeStr(r[@"name"], BKSafeStr(r[@"bid"], @"?"));
+                NSString *when = @"--";
+                if ([r[@"t"] isKindOfClass:[NSDate class]]) {
+                    NSString *s2 = [df stringFromDate:r[@"t"]];
+                    if (s2.length) when = s2;
+                }
+                [tail appendFormat:@"%@ %@ %@\n", when,
                  [r[@"ok"] boolValue] ? @"✔" : @"✘", nm];
             }
             footer = [NSString stringWithFormat:
@@ -152,15 +184,17 @@ static NSArray *BKReadRowsFromCFPrefs(void) {
         if (idx >= 0 && idx < (int)rows.count) {
             id r = rows[idx];
             if ([r isKindOfClass:[NSDictionary class]]) {
-                id nm = r[@"name"] ?: r[@"bid"];
-                name = [nm isKindOfClass:[NSString class]] && [nm length] ? nm : @"?";
+                name = BKSafeStr(r[@"name"], BKSafeStr(r[@"bid"], @"?"));
                 NSString *kind = [r[@"kind"] isEqualToString:@"kbd"] ? @"键盘" : @"App";
                 BOOL ok = [r[@"ok"] boolValue];
-                NSDate *t = [r[@"t"] isKindOfClass:[NSDate class]] ? r[@"t"] : nil;
-                NSString *detail = [r[@"detail"] isKindOfClass:[NSString class]] ? r[@"detail"] : @"";
+                NSString *when = @"--";
+                if ([r[@"t"] isKindOfClass:[NSDate class]]) {
+                    NSString *s2 = [df stringFromDate:r[@"t"]];
+                    if (s2.length) when = s2;
+                }
+                NSString *detail = BKSafeStr(r[@"detail"], @"");
                 value = [NSString stringWithFormat:@"%@ · %@ %@%@",
-                         t ? [df stringFromDate:t] : @"--",
-                         kind, ok ? @"成功" : @"失败",
+                         when, kind, ok ? @"成功" : @"失败",
                          detail.length ? [NSString stringWithFormat:@" · %@", detail] : @""];
             }
         }
