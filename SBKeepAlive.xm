@@ -286,7 +286,7 @@ static void KbdWarmupRun(NSString *reason) {
 
         UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 2, 2)];
         tf.autocorrectionType = UITextAutocorrectionTypeNo;
-        tf.autospellCheckingType = UITextSpellCheckingTypeNo;
+        tf.spellCheckingType = UITextSpellCheckingTypeNo;
         tf.inputAssistantItem.leadingBarButtonGroups = @[];
         tf.inputAssistantItem.trailingBarButtonGroups = @[];
         [w.rootViewController.view addSubview:tf];
