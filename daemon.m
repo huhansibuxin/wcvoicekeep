@@ -733,6 +733,10 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--kbd-warm") == 0) {
             return kbdWarmTrigger();
         }
+        // v1.9.36：--kbd-warm-test 一次给出完整结论（发通知 + 12s 采样时间线）
+        if (strcmp(argv[i], "--kbd-warm-test") == 0) {
+            return kbdWarmTest();
+        }
         // v1.9.34：--dlopen-test <path> 验证 tweak dylib 能否被加载
         if (strcmp(argv[i], "--dlopen-test") == 0 && i + 1 < argc) {
             return dlopenTest(argv[i + 1]);
