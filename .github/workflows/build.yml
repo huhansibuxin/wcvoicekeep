@@ -6,7 +6,9 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14 于 2026-11 被 GitHub 下线（报错 "configuration
+    # 'macos-14-arm64-us-default' is not supported"），改用现役 macos-15 镜像。
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
