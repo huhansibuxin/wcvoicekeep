@@ -37,8 +37,11 @@
 #import <errno.h>
 #import <notify.h>
 
+// 黑屏修复核心（独立可移植模块）：willConnect 抢先搬家 + 0.4s 兜底
+#import "WCSceneBlackFix.h"
+
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.27-roothide"
+#define WCVK_BUILD_TAG "v2.0.28-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC_EXIT 里 kRelaunchDelaySec
                                              // 秒后就会主动再拉，形成「杀-拉-黑」死循环。
@@ -433,57 +436,34 @@ static void WPFDumpState(NSString *tag) {
            WPFWindowAlive(main) ? 1 : 0, WPFSceneOnStage(main) ? 1 : 0);
     WPFLog(@"---- END %@ ----", tag);
 }
+// ============================================================
+// v2.0.28 大精简（依据 2026-11-07 04:57~04:59 六个进程的实机日志）
+// ------------------------------------------------------------
+// 日志硬结论：6 个进程 / 10 次 scene 分配 / 10 次「抢先搬家」全部命中，
+// 「判定黑屏」0 次、「L2 修复链」0 次、「L2a/L2b/L2c/L2d」0 次 ——
+// 真正治病的只有一条链路：
+//     -[场景delegate scene:willConnectToSession:options:] 里把主窗口指到新场景
+//     （赶在系统把这个场景激活成前台之前）
+//
+// 因此下面这些全部删除，一行不留：
+//   × WPFSanitizeKnownSceneSessions  删 KnownSceneSessions 里的会话
+//       证据：每进程都写「已清空 N 条」，下个进程同样几条又回来（FBS 内存里也握一份），零收益
+//   × WPFUnlockMultiScene            改写 supportsMultipleScenes 返回 YES
+//       证据：改写成功 2 个，但 scene API 在 v2.0.25 就从链上摘了，改了没人用
+//   × L1  makeKeyAndVisible / hidden 抖动 / 强制布局
+//   × L2a 压制覆盖窗（实测「共压制 0 个窗口」）
+//   × L2b 主窗口提层（实测提层后 sceneOnStage 仍为 0）
+//   × L2② requestSceneSessionRefresh
+//   × L3  requestSceneSessionActivation/Destruction
+//       证据：单场景 App 上两个 API 都同步返回「当前设备不支持多个场景」，一次都没生效
+//   × L2d 回滚（并入模块）
+//
+// 迁移：核心修复逻辑已抽成独立可移植模块 _extract/WCSceneBlackFix.{h,m}，
+//   本文件只剩「诊断日志 + 生命周期埋点」，修复动作全部交给那个模块。
+// ============================================================
 
-// ===== L1/L2 原生修复（v2.0.18 起只保留这两级，非原生的 L3/L4 已删除）=====
-// 返回 YES = 这一级做过了（是否真修好由调用方复查）
-static BOOL WPFRepairLevel1(UIWindow *w) {
-    if (!w) return NO;
-    if (gL1Attempts >= 2) { WPFLog(@"L1: 已执行 %d 次，本次跳过（防抖动）", gL1Attempts); return NO; }
-    // v2.0.17：窗口没挂在台上的话，makeKeyAndVisible 不但没用，还会把 keyWindow 抢掉
-    // （v2.0.16 日志里 key 从 1 变 0 就是这个），直接交给 L2 处理。
-    if (!WPFSceneOnStage(w)) {
-        WPFLog(@"L1: 跳过（窗口 scene 不在台上，makeKeyAndVisible 无意义）→ 交给 L2");
-        return NO;
-    }
-    gL1Attempts++;
-    WPFLog(@"L1(%d): makeKeyAndVisible + 强制 layout + hidden 抖动", gL1Attempts);
-    @try {
-        [w makeKeyAndVisible];
-        w.hidden = YES;
-        w.hidden = NO;
-        [w setNeedsLayout];
-        [w layoutIfNeeded];
-        UIViewController *vc = w.rootViewController;
-        [vc.view setNeedsLayout];
-        [vc.view layoutIfNeeded];
-        [vc.view setNeedsDisplay];
-    } @catch (NSException *e) { WPFLog(@"L1 异常: %@", e.reason); return NO; }
-    return YES;
-}
-
-// ⭐ v2.0.19 L2：**只保留真正无害的那一步**。
-// v2.0.18 的两级实测判死（老板 02:58 实测：直接进微信动不了、切后台都切不了、卡死很久才闪退重启）：
-//   ① requestSceneSessionActivation: → 系统回「当前设备不支持多个场景」
-//      （微信没有 UIApplicationSceneManifest，是单场景 App），errorHandler 同步就返回，从未生效；
-//   ③ notify → SpringBoard → SBSLaunchApplicationWithIdentifier(bid, false)
-//      → SB 日志铁证：收到请求 18:56:46，rc=11 在 18:56:56 —— **主线程同步阻塞整 11 秒**，
-//        期间 SpringBoard 完全无响应（这就是「切后台都切不了」），而且 rc=11 表示启动没被受理。
-//        微信侧同一时刻的「L2 之后复查」也被从 1.5s 拖到 10s（02:57:43.364 → 02:57:53.675），
-//        说明两边互锁：SB 等微信响应，微信主线程在等 SB。
-// 所以 ①③ 整段删除，只留 ②（requestSceneSessionRefresh：纯异步、无返回值、不改任何状态）。
-// ===== v2.0.20 L3：请系统拆掉「冒充前台的子场景」 =====
-// v2.0.19 实机日志（31 个 dump 块精确统计）第一次把黑屏的形态定死了：
-//   正常 18 次：scenes=1，delegate=MMMainSceneDelegate，state=0，窗口 iConsoleWindow，可用=1
-//   黑屏  8 次：scenes=2
-//      前台 state=0/1 → delegate=MMSubSceneDelegate，可用窗口=0，只有 MMSubSceneWindow(hidden)
-//      后台 state=2   → delegate=MMMainSceneDelegate，可用窗口=1，iConsoleWindow 就挂在它上面
-// ⇒ **主窗口从来没有挂错 scene**！错的是「系统把 sub scene 激活成了前台」。
-//   （v2.0.17 用 setWindowScene 把主窗口从 main scene 搬到 sub scene，等于把主界面塞进
-//     微信的子场景里，所以界面亮了但微信内部状态全乱、通讯录读不出来。那条路彻底作废。）
-// 处理：请系统销毁那个「没有任何可用窗口、却占着前台态」的子 session。
-//       剩下的 main session 只有它一个，系统必须重新激活它 → 界面回来。
-//       全程不碰任何 window / windowScene 属性，只发一个标准的 UIApplication 请求。
 static NSUInteger WPFUsableWindowCount(UIWindowScene *ws) {
+    if (!ws) return 0;
     NSUInteger n = 0;
     for (UIWindow *w in ws.windows) {
         if (w.isHidden || !w.rootViewController) continue;
@@ -494,428 +474,35 @@ static NSUInteger WPFUsableWindowCount(UIWindowScene *ws) {
     return n;
 }
 
-// 返回「占着前台态却没有任何可用窗口」的 scene；outMainScene = 另一个有可用窗口的 scene
-static UIWindowScene *WPFEmptyForegroundScene(UIWindowScene **outMainScene) {
-    UIWindowScene *mainScene = nil, *emptyFg = nil;
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-        if (![s isKindOfClass:[UIWindowScene class]]) continue;
-        UIWindowScene *ws = (UIWindowScene *)s;
-        NSUInteger usable = WPFUsableWindowCount(ws);
-        if (usable > 0) {
-            // 有可用窗口的就是"真正有界面的那个"
-            if (!mainScene || ws.activationState == UISceneActivationStateForegroundActive) mainScene = ws;
-        } else {
-            UISceneActivationState st = ws.activationState;
-            if ((st == UISceneActivationStateForegroundActive ||
-                 st == UISceneActivationStateForegroundInactive) && !emptyFg) {
-                emptyFg = ws;
-            }
-        }
-    }
-    if (outMainScene) *outMainScene = mainScene;
-    return emptyFg;
-}
-
-// v2.0.25：L3 已从修复链摘除（scene API 在单场景 App 上被同步拒绝），保留实现仅供日志排查。
-__attribute__((unused)) static BOOL WPFRepairLevel3(UIWindow *w) {
-    if (gL3Attempts >= 1) { WPFLog(@"L3: 本进程已试过，跳过"); return NO; }
-    UIWindowScene *mainScene = nil;
-    UIWindowScene *bad = WPFEmptyForegroundScene(&mainScene);
-    if (!bad || !bad.session) {
-        WPFLog(@"L3: 跳过（没有「占前台但无可用窗口」的 scene）");
-        return NO;
-    }
-    if (!mainScene) {
-        WPFLog(@"L3: 跳过（找不到有可用窗口的主 scene，不能乱拆）");
-        return NO;
-    }
-    if (mainScene == bad) { WPFLog(@"L3: 跳过（同一 scene）"); return NO; }
-    gL3Attempts++;
-
-    NSUInteger badN = WPFUsableWindowCount(bad), mainN = WPFUsableWindowCount(mainScene);
-    WPFLog(@"L3(%d): 拆子场景 —— 待销毁 scene=%p state=%ld session=%@ 可用=%lu 窗口=[%@]",
-           gL3Attempts, (__bridge void *)bad, (long)bad.activationState,
-           bad.session.persistentIdentifier ?: @"(nil)", (unsigned long)badN,
-           bad.windows.count ? NSStringFromClass([bad.windows.firstObject class]) : @"(空)");
-    WPFLog(@"L3(%d): 保留主场景 scene=%p state=%ld session=%@ 可用=%lu 窗口=[%@]",
-           gL3Attempts, (__bridge void *)mainScene, (long)mainScene.activationState,
-           mainScene.session.persistentIdentifier ?: @"(nil)", (unsigned long)mainN,
-           mainScene.windows.count ? NSStringFromClass([mainScene.windows.firstObject class]) : @"(空)");
-
-    // ⭐ v2.0.21：顺序反过来 —— 先「请系统把 main session 请上台」，
-    //   这才是「让系统别再激活 sub、改激活 main」的原生做法（v2.0.20 先销毁，而销毁在
-    //   单场景 App 上被同一道门槛挡掉，所以什么都没发生）。
-    //   销毁退到最后：只有当 main 请不上台时才拆 sub。
-    UIApplication *app = [UIApplication sharedApplication];
-    UISceneSession *ms = mainScene.session;
-    WPFLog(@"L3(%d)①: 请系统激活 main session %@（= 让系统不再把 sub 当前台）",
-           gL3Attempts, ms.persistentIdentifier ?: @"(nil)");
-    @try {
-        #pragma clang diagnostic push
-        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        [app requestSceneSessionActivation:ms userActivity:nil options:nil errorHandler:^(NSError *e) {
-            WPFLog(@"L3① 被系统拒绝: %@ (%@)", e.localizedDescription, e.domain);
-        }];
-        #pragma clang diagnostic pop
-    } @catch (NSException *e) { WPFLog(@"L3① 异常: %@", e.reason); }
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UIApplication *a = [UIApplication sharedApplication];
-        UIWindow *mw = WPFMainWindow(a);
-        if (WPFHealthy(mw, YES)) { WPFLog(@"L3① 成功：main session 上台，界面已恢复（sceneOnStage=1）"); return; }
-
-        // ② main 请不上台 → 退一步请系统销毁那个空子场景，逼系统重新激活唯一剩下的 main
-        UISceneSession *bs = bad.session;
-        if (!bs) { WPFLog(@"L3: 子场景 session 已不存在，结束"); return; }
-        WPFLog(@"L3(%d)②: main 仍未上台，改为请系统销毁 sub session %@",
-               gL3Attempts, bs.persistentIdentifier ?: @"(nil)");
-        @try {
-            [a requestSceneSessionDestruction:bs options:nil errorHandler:^(NSError *e) {
-                WPFLog(@"L3② requestSceneSessionDestruction 被拒绝: %@ (%@)", e.localizedDescription, e.domain);
-            }];
-        } @catch (NSException *e) { WPFLog(@"L3② 异常: %@", e.reason); }
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            UIApplication *a2 = [UIApplication sharedApplication];
-            if (WPFHealthy(WPFMainWindow(a2), YES)) { WPFLog(@"L3② 成功：拆掉 sub 后界面恢复"); return; }
-            WPFLog(@"L3: ①② 都没让 main 上台（scene API 仍未生效或系统不理），放弃本进程");
-            WPFDumpState(@"L3 放弃");
-        });
-    });
-
-    return YES;
-}
-
-// ============================================================
-// ★★ v2.0.25 L2 全重写：走「窗口」那一套（老板 2026-11-07 定调）
-// ------------------------------------------------------------
-// 老板的判断：「肯定是一个黑屏的窗口盖在微信主窗口上面了，从窗口这个思路解决」。
-// 前面 v2.0.19~v2.0.24 全在 scene API / 会话文件上打，始终没碰窗口层级本身，
-// 这就是为什么"改了这么多版还是黑"。
-//
-// 实机证据（04:15:56~04:16:07）：
-//   scenes(2)
-//     前台 state=0：windows=0，可用=0  → 一个空 scene 霸着前台，系统给它铺的就是纯黑底
-//     后台 state=2：windows=1，可用=1  → iConsoleWindow + MainTabBarViewController 全在这里
-//   windows(1)：只有 iConsoleWindow 一个，hidden=0 alpha=1 rootVC 正常
-// ⇒ 主窗口本身没问题，问题是它**挂在一个后台 scene 上**，系统不渲染后台 scene 的窗口，
-//   于是前台空 scene 的黑底就成了用户看到的画面。所以必须做两件事：
-//     a) 把所有"可能盖在上面"的窗口（子场景窗口/无 rootVC 的全屏空窗）压到底/隐藏
-//     b) 把主窗口搬到前台 scene 上并重新布局 —— 纯窗口层操作，不碰 scene API
-//   b 唯一风险是搬完 VC 不再收到出现回调（v2.0.17 通讯录空就是这个），
-//   所以搬家后补一次**官方** beginAppearanceTransition/endAppearanceTransition（容器转场专用公开 API，
-//   不是伪造通知，不是手调 viewWillAppear）。
-// ============================================================
-static UIWindowScene *gWPFSavedMainScene = nil;    // 搬家前主窗口的 scene，用于回滚
-static int gWPFSuppressedCount = 0;
-
-// L2-a：压制所有"不是主窗口、却可能盖在上面"的窗口
-static int WPFOppressOtherWindows(UIWindow *main) {
-    int n = 0;
-    NSArray<UIWindow *> *all = [UIApplication sharedApplication].windows;
-    for (UIWindow *x in all) {
-        if (x == main || !x) continue;
-        NSString *cls = NSStringFromClass([x class]);
-        BOOL nameSub = ([cls rangeOfString:@"SubScene" options:NSCaseInsensitiveSearch].location != NSNotFound);
-        BOOL noRoot  = (x.rootViewController == nil);
-        BOOL fullscreen = (main.bounds.size.height > 1) &&
-                          (x.bounds.size.height >= main.bounds.size.height * 0.9) &&
-                          (x.bounds.size.width  >= main.bounds.size.width  * 0.9);
-        // 只压这三类：子场景窗、没有 rootVC 的空窗、和主窗同尺寸却层级更高的窗
-        BOOL overlay = nameSub || noRoot || (fullscreen && x.windowLevel >= main.windowLevel && !x.isHidden);
-        if (!overlay) continue;
-        WPFLog(@"L2a: 压制可疑覆盖窗 %@ hidden=%d alpha=%.2f level=%.1f %.0fx%.0f rootVC=%@",
-               cls, (int)x.isHidden, x.alpha, x.windowLevel,
-               x.bounds.size.width, x.bounds.size.height,
-               x.rootViewController ? NSStringFromClass([x.rootViewController class]) : @"(nil)");
-        @try {
-            x.hidden = YES;
-            x.alpha = 0.0;
-            x.windowLevel = -1000.0;     // 压到所有窗口之下
-        } @catch (NSException *e) { WPFLog(@"L2a 异常: %@", e.reason); }
-        n++;
-    }
-    gWPFSuppressedCount = n;
-    WPFLog(@"L2a: 共压制 %d 个窗口（主窗口=%@ level=%.1f）",
-           n, NSStringFromClass([main class]), main.windowLevel);
-    return n;
-}
-
-// L2-b：主窗口提到最前 + 强制布局（不搬 scene）
-static void WPFRaiseMainWindow(UIWindow *main) {
-    @try {
-        main.hidden = NO;
-        main.alpha = 1.0;
-        if (main.windowLevel < UIWindowLevelNormal) main.windowLevel = UIWindowLevelNormal;
-        [main makeKeyAndVisible];
-        [main setNeedsLayout];
-        [main layoutIfNeeded];
-        UIViewController *vc = main.rootViewController;
-        if (vc.view) {
-            if (vc.view.frame.size.width < 1 || vc.view.frame.size.height < 1)
-                vc.view.frame = main.bounds;
-            [vc.view setNeedsLayout];
-            [vc.view layoutIfNeeded];
-            [vc.view setNeedsDisplay];
-        }
-        WPFLog(@"L2b: 主窗口已提到最前（level=%.1f key=%d hidden=%d alpha=%.2f）",
-               main.windowLevel, main.isKeyWindow ? 1 : 0, (int)main.isHidden, main.alpha);
-    } @catch (NSException *e) { WPFLog(@"L2b 异常: %@", e.reason); }
-}
-
-// ===== v2.0.27 通用搬家：把主窗口搬到指定 scene（不做任何 scene 状态判断，由调用方决定）=====
-// 抽出来是为了让「scene:willConnectToSession:」提前搬家复用同一套布局补偿，
-// 避免两条路径行为不一致。
-static BOOL WPFMoveMainWindowToScene(UIWindow *main, UIWindowScene *target) {
-    if (!main || !target) return NO;
-    WPFLog(@"搬家: 主窗口 %p 从 scene %p(state=%ld) 搬到目标 scene %p(state=%ld)",
-           (__bridge void *)main,
-           (__bridge void *)main.windowScene,
-           main.windowScene ? (long)main.windowScene.activationState : (long)-1,
-           (__bridge void *)target, (long)target.activationState);
-    gWPFSavedMainScene = main.windowScene;
-    @try {
-        main.windowScene = target;
-    } @catch (NSException *e) {
-        WPFLog(@"搬家异常: %@", e.reason);
-        gWPFSavedMainScene = nil;
-        return NO;
-    }
-    @try {
-        UIViewController *vc = main.rootViewController;
-        BOOL appeared = NO;
-        if (vc) {
-            // 官方容器转场 API：只让 VC 重走一遍出现流程，不伪造通知、不手调 viewWillAppear
-            [vc beginAppearanceTransition:YES animated:NO];
-            appeared = YES;
-        }
-        main.hidden = NO;
-        main.alpha = 1.0;
-        [main makeKeyAndVisible];
-        [main setNeedsLayout];
-        [main layoutIfNeeded];
-        if (vc.view) {
-            vc.view.frame = main.bounds;
-            [vc.view setNeedsLayout];
-            [vc.view layoutIfNeeded];
-            [vc.view setNeedsDisplay];
-        }
-        if (appeared) [vc endAppearanceTransition];
-        WPFLog(@"搬家完成: 主窗口 scene=%p(state=%ld) 可用窗口=%lu",
-               (__bridge void *)main.windowScene,
-               main.windowScene ? (long)main.windowScene.activationState : (long)-1,
-               (unsigned long)WPFUsableWindowCount(main.windowScene));
-    } @catch (NSException *e) { WPFLog(@"搬家布局异常: %@", e.reason); }
-    return YES;
-}
-
-// L2-c：把主窗口搬到前台 scene（窗口层唯一能让它重新被渲染的办法）
-static BOOL WPFMoveMainWindowToFrontScene(UIWindow *main) {
-    if (!main) return NO;
-    UIWindowScene *front = WPFActiveScene();
-    UIWindowScene *owned = main.windowScene;
-    if (!front) { WPFLog(@"L2c: 跳过（没有前台 scene）"); return NO; }
-    if (front == owned) { WPFLog(@"L2c: 跳过（主窗口已经在前台 scene 上）"); return NO; }
-    WPFLog(@"L2c: 搬家中 —— 主窗口 %p 从 scene %p(state=%ld) 搬到前台 scene %p(state=%ld)",
-           (__bridge void *)main,
-           (__bridge void *)owned, owned ? (long)owned.activationState : (long)-1,
-           (__bridge void *)front, (long)front.activationState);
-    return WPFMoveMainWindowToScene(main, front);
-}
-
-// L2-d：搬家后仍黑 -> 回滚到原 scene，避免把微信内部状态搞乱
-static void WPFRollbackMainScene(UIWindow *main) {
-    if (!main || !gWPFSavedMainScene) return;
-    WPFLog(@"L2d: 搬家后仍黑，回滚主窗口到原 scene %p", (__bridge void *)gWPFSavedMainScene);
-    @try {
-        main.windowScene = gWPFSavedMainScene;
-        [main setNeedsLayout];
-        [main layoutIfNeeded];
-    } @catch (NSException *e) { WPFLog(@"L2d 回滚异常: %@", e.reason); }
-    gWPFSavedMainScene = nil;
-}
-
-static BOOL WPFRepairLevel2(UIWindow *w) {
-    if (!w) { WPFLog(@"L2: 跳过（没有主窗口）"); return NO; }
-    if (gL2Attempts >= 6) { WPFLog(@"L2: 本进程已试过 %d 次，不再重复（防抖动）", gL2Attempts); return NO; }
-    gL2Attempts++;
-
-    UIWindowScene *owned = w.windowScene;
-    UIWindowScene *front = WPFActiveScene();
-    NSUInteger frontUsable = front ? WPFUsableWindowCount(front) : 0;
-    WPFLog(@"L2(%d): 主窗口 scene=%p(state=%ld) 前台 scene=%p(state=%ld) 前台可用窗口=%lu 全部窗口=%lu",
-           gL2Attempts,
-           (__bridge void *)owned, owned ? (long)owned.activationState : (long)-1,
-           (__bridge void *)front, front ? (long)front.activationState : (long)-1,
-           (unsigned long)frontUsable,
-           (unsigned long)[UIApplication sharedApplication].windows.count);
-
-    // ⭐⭐ v2.0.26 快速路径（依据 04:38:19 实机日志定论）：
-    //   生效的动作只有 L2c 搬家；L2a 压制 0 个窗口、L2b 提层后 sceneOnStage 仍然是 0 —— 都没用。
-    //   而「主窗口在别的 scene + 前台 scene 一个可用窗口都没有」这个组合一旦成立，
-    //   a/b 必然无效（提层改变不了"窗口挂在后台 scene 就不渲染"这件事）。
-    //   ⇒ 命中就直接搬家，不再白等 0.7s，把黑屏时间从 ~2.5s 压到 ~0.3s。
-    BOOL mustMove = (front != nil) && (front != owned) && (frontUsable == 0);
-    if (mustMove) {
-        WPFLog(@"L2: 快速路径 —— 主窗口挂在 scene %p(state=%ld)，前台 scene %p(state=%ld) 可用窗口=0，直接搬家",
-               (__bridge void *)owned, owned ? (long)owned.activationState : (long)-1,
-               (__bridge void *)front, (long)front.activationState);
-        WPFOppressOtherWindows(w);           // 顺手压掉可能存在的覆盖窗（成本极低）
-        if (WPFMoveMainWindowToFrontScene(w)) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                UIApplication *a = [UIApplication sharedApplication];
-                UIWindow *mw = WPFMainWindow(a);
-                if (WPFHealthy(mw, YES)) {
-                    WPFLog(@"L2c(快速) 成功：搬完 %.2fs 内界面恢复", 0.35);
-                    return;
-                }
-                WPFRollbackMainScene(mw);
-                WPFLog(@"L2c(快速) 搬家后仍未恢复，已回滚");
-                WPFDumpState(@"L2 快速路径失败");
-            });
-            return YES;
-        }
-        WPFLog(@"L2: 快速路径搬家失败，回落到通用流程");
-    }
-
-    // a) 先把可疑覆盖窗压掉
-    WPFOppressOtherWindows(w);
-    // b) 再把主窗口提层并重排
-    WPFRaiseMainWindow(w);
-
-    // 0.7s 后复查：还黑就搬家（窗口层真正的杀招）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UIApplication *app = [UIApplication sharedApplication];
-        UIWindow *mw = WPFMainWindow(app);
-        if (WPFHealthy(mw, YES)) { WPFLog(@"L2(ab) 成功：压制/提层后界面恢复"); return; }
-
-        BOOL moved = WPFMoveMainWindowToFrontScene(mw);
-        if (!moved) {
-            WPFLog(@"L2c: 没能搬家（可能主窗口已在前台 scene，或没有前台 scene）");
-            WPFDumpState(@"L2c 未搬家");
-            return;
-        }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            UIApplication *a2 = [UIApplication sharedApplication];
-            UIWindow *mw2 = WPFMainWindow(a2);
-            if (WPFHealthy(mw2, YES)) {
-                WPFLog(@"L2c 成功：主窗口搬到前台 scene 后界面恢复（黑屏解决）");
-                return;
-            }
-            WPFRollbackMainScene(mw2);
-            WPFLog(@"L2: abc 全部未让界面恢复");
-            WPFDumpState(@"L2 放弃");
-        });
-    });
-    return YES;
-}
-
-
-
-// v2.0.18：L3（重挂 rootVC + 手补 viewWillAppear/viewDidAppear）和
-// L4（伪造 UIApplicationWillEnterForeground/DidBecomeActive 通知 + 手调 delegate）
-// 整套删除。它们和 setWindowScene 一样属于「自己动手造一个看起来正常的界面」，
-// 老板定调只走原生。真要重建界面，就靠 L2 让系统/微信自己走一遍原生激活流程。
-// ⛔ 不要再加回来。
-
-// 逐级修复：每级做完等一会儿复查，修好立即停
-static void WPFRepairChain_(int level);
-
-// 当前应该修/检查的目标窗口（v2.0.18：不再自造窗口，永远就是微信自己的主窗口）
-static UIWindow *WPFTargetWindow(UIApplication *app) {
-    return WPFMainWindow(app);
-}
-
-static void WPFCheckAfterRepair(UIApplication *app, int nextLevel, int doneLevel) {
-    // L3 是「销毁子 session + 兜底激活」，要等销毁真正落地；L2 是系统刷新；L1 是进程内的
-    double wait = (doneLevel >= 3) ? 2.5 : ((doneLevel >= 2) ? 1.5 : 0.6);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UIWindow *w = WPFTargetWindow(app);
-        BOOL alive = WPFWindowAlive(w);
-        BOOL staged = WPFSceneOnStage(w);
-        BOOL ok = WPFHealthy(w, YES);       // ★ 判据必须和「判定黑屏」时一致，否则永远假成功
-        WPFLog(@"复查(L%d 之后): alive=%d sceneOnStage=%d healthy=%d",
-               doneLevel, alive ? 1 : 0, staged ? 1 : 0, ok ? 1 : 0);
-        if (ok) {
-            gRepairLevel = doneLevel;
-            WPFLog(@"*** 修复成功，生效级别 L%d ***", doneLevel);
-            WPFDumpState(@"修复后");
-            return;
-        }
-        if (nextLevel > 3) {
-            WPFLog(@"*** 原生修复（L1/L2/L3）无效 ***");
-            WPFDumpState(@"修复失败");
-            WPFLog(@"保持现状，等用户下次前台激活再试（不 exit、不硬改 UI）");
-            return;
-        }
-        WPFRepairChain_(nextLevel);
-    });
-}
-
-static void WPFRepairChain_(int level) {
-    UIApplication *app = [UIApplication sharedApplication];
-    UIWindow *w = WPFTargetWindow(app);
-    BOOL did = NO;
-    switch (level) {
-        case 1: did = WPFRepairLevel1(w); break;
-        case 2: did = WPFRepairLevel2(w); break;
-        // ★ v2.0.25：L3（requestSceneSessionActivation / Destruction）已实机证死 ——
-        //   单场景 App 上两个 API 都同步返回「当前设备不支持多个场景」，一次都没生效。
-        //   所以第 3 轮改成「窗口层再来一遍」（搬家 + 提层，允许复发时重试），不再碰 scene API。
-        case 3: did = WPFRepairLevel2(w); break;
-        default: did = NO; break;
-    }
-    if (!did) WPFLog(@"L%d 未执行（条件不满足）", level);
-    WPFCheckAfterRepair(app, level + 1, level);
-}
-
+// 纯诊断：比模块的兜底（0.4s）晚 0.2s 跑，用来记录「模块修完之后」的真实状态。
+// 这里绝不修任何东西 —— 修是模块的事，两边都动手会互相打。
 static void WPFDoCheck(NSString *reason) {
     UIApplication *app = [UIApplication sharedApplication];
-    UIWindow *w = WPFTargetWindow(app);
+    UIWindow *w = WPFMainWindow(app);
     BOOL alive  = WPFWindowAlive(w);
     BOOL staged = WPFSceneOnStage(w);
-
-    // ★★ v2.0.25 关键修正：结构判定**不再等 appState == Active**。
-    //   04:31 日志显示 headless 拉起后 1.0s 就从 Active 掉到 Inactive（appState=1），
-    //   旧代码一路「非 Active，1.0s 后复查」，复查 6 次时微信早就 didEnterBackground 了，
-    //   于是整个修复链从来没跑过。而黑屏形态（前台 scene 没有任何可用窗口）在 Inactive 下
-    //   判断得一清二楚 —— 根本不需要真前台。
     UIWindowScene *front = WPFActiveScene();
-    NSUInteger frontUsable = front ? WPFUsableWindowCount(front) : 0;
-    NSArray<UIWindow *> *allWins = app.windows;
-    WPFLog(@"检查(%@): mainWindow=%@ alive=%d sceneOnStage=%d appState=%ld "
-           @"前台scene=%p(state=%ld) 前台可用窗口=%lu 全部窗口=%lu 已检查%d次/生效L%d",
+    NSUInteger frontUsable = WPFUsableWindowCount(front);
+
+    WPFLog(@"诊断(%@): mainWindow=%@ alive=%d sceneOnStage=%d appState=%ld "
+           @"前台scene=%p(state=%ld) 前台可用窗口=%lu 全部窗口=%lu 已检查%d次",
            reason, w ? NSStringFromClass([w class]) : @"(nil)", alive ? 1 : 0, staged ? 1 : 0,
            (long)app.applicationState,
            (__bridge void *)front, front ? (long)front.activationState : (long)-1,
-           (unsigned long)frontUsable, (unsigned long)allWins.count,
-           gCheckCount, gRepairLevel);
+           (unsigned long)frontUsable, (unsigned long)app.windows.count, gCheckCount);
 
-    BOOL structBlank = (!alive) || (!staged) || (frontUsable == 0);
-    if (structBlank) {
-        WPFLog(@"判定黑屏（结构: alive=%d staged=%d 前台可用窗口=%lu）-> 窗口层修复",
-               alive ? 1 : 0, staged ? 1 : 0, (unsigned long)frontUsable);
+    if ((!alive) || (!staged) || (frontUsable == 0)) {
+        WPFLog(@"诊断: 仍不健康 -> dump 现场（修复由 WCSceneBlackFix 负责）");
         WPFDumpState(reason);
-        WPFRepairChain_(2);          // v2.0.25：黑屏只走窗口层（L2），scene API 那条路已证死
         return;
     }
-
-    // 结构正常，最后用像素定死（只在真前台做离屏渲染，其它时候渲染本来就是空的）
     if (app.applicationState == UIApplicationStateActive && WPFSnapshotBlank(w)) {
-        WPFLog(@"判定黑屏（结构正常但快照无画面）-> 窗口层修复");
+        WPFLog(@"诊断: 结构正常但快照无画面 -> dump 现场");
         WPFDumpState(reason);
-        WPFRepairChain_(2);
         return;
     }
-    WPFLog(@"界面确认为正常，本次不修");
+    WPFLog(@"诊断: 界面确认正常");
 }
-
 
 // ===== 生命周期埋点 =====
 static void WPFOnDidFinishLaunching(void) {
@@ -928,7 +515,7 @@ static void WPFOnDidFinishLaunching(void) {
     WPFLog(@"didFinishLaunching: appState=%ld headless=%d ActivePrewarm=%s XPC=%s",
            (long)app.applicationState, gWasHeadless, ap ? ap : "(null)", xpc ? xpc : "(null)");
     if (!kWPFEnable) return;
-    if (!gWasHeadless) WPFLog(@"非后台启动，本次完全不干预（只观察）");
+    if (!gWasHeadless) WPFLog(@"非后台启动，本次只观察不干预");
 }
 
 static void WPFOnWillEnterForeground(void) {
@@ -939,13 +526,9 @@ static void WPFOnWillEnterForeground(void) {
 
 static void WPFOnDidBecomeActive(void) {
     UIApplication *app = [UIApplication sharedApplication];
-    WPFLog(@"didBecomeActive: appState=%ld headless=%d 已检查%d次/生效L%d",
-           (long)app.applicationState, gWasHeadless, gCheckCount, gRepairLevel);
+    WPFLog(@"didBecomeActive: appState=%ld headless=%d 已检查%d次",
+           (long)app.applicationState, gWasHeadless, gCheckCount);
     if (!kWPFEnable || !gWasHeadless) return;
-    // ⭐ v2.0.17：以前这里是 `gHandled` 一次性闸门 —— 只有进程的「第一次」前台激活会检查，
-    // 之后所有 didBecomeActive 直接 return。可黑屏恰恰发生在用户后续点开的时候：
-    // v2.0.16 日志里 pid 10806 后面 6 次 `handled=1` 的激活全部零检查，等于毫无保护。
-    // 现在每次真前台激活都给一次机会，只做节流（间隔 1s、每进程最多 kWPFCheckMax 次）。
     if (app.applicationState != UIApplicationStateActive) return;
     if (gCheckCount >= kWPFCheckMax) {
         WPFLog(@"本进程检查次数已满（%d），不再检查", gCheckCount);
@@ -959,9 +542,9 @@ static void WPFOnDidBecomeActive(void) {
     }
     gLastCheckAt = now;
     gCheckCount++;
-    gCheckRetries = 0;
-    double delay = (gCheckCount == 1) ? kWPFCheckDelay : 0.15;   // 首次等界面建好，后续快速复核
-    WPFLog(@"前台激活 #%d，%.2fs 后检查界面健康度", gCheckCount, delay);
+    // 0.6s：模块的兜底在 0.4s 动手、0.35s 复查，所以这里看到的是最终结果
+    double delay = (gCheckCount == 1) ? 0.6 : 0.15;
+    WPFLog(@"前台激活 #%d，%.2fs 后诊断界面状态", gCheckCount, delay);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ WPFDoCheck(@"前台激活"); });
 }
@@ -970,371 +553,19 @@ static void WPFOnEnterBackground(void) {
     WPFLog(@"didEnterBackground: appState=%ld", (long)[UIApplication sharedApplication].applicationState);
 }
 
-// ============================================================
-// v2.0.21 ①：从源头掐掉「SubScene」这个持久化场景会话
-// ------------------------------------------------------------
-// 2026-11-07 03:37 设备取证（决定性证据）：
-//   <容器>/Library/Saved Application State/com.tencent.xin.savedState/
-//        KnownSceneSessions/data.data   （741 字节 bplist）
-//   → 里面只有一个 key：5FCC1B2B-BAF9-4EFC-8A78-14A86E333179
-//   → 值是 UISceneSession 的 NSKeyedArchiver，明确写着：
-//        _UISceneConfigurationName = "SubScene"
-//        _UISceneSessionRole       = UIWindowSceneSessionRoleApplication
-//   也就是说这个 session 的**配置名是 SubScene** → 微信
-//   application:configurationForConnectingSceneSession:options: 按配置名返回
-//   MMSubSceneDelegate（它天然不建主界面，只有一个 hidden 的 MMSubSceneWindow）。
-//   系统每次启动都把这个 session 恢复出来、并且**激活成前台** → 前台是个空场景 → 黑屏。
-//   而 scenes=1 的那 13 次正常，就是这次没恢复它。
-//   ⚠️ 这也解释了为什么它永远固定是同一个 UUID（其他 main session 每次都是新的）。
-//
-// 修法：本 dylib 的 constructor 在 UIApplicationMain **之前**执行（dyld 阶段），
-//   此时 UIKit 还没读这个文件。把带 "SubScene" 的条目删掉再写回，系统就没有可恢复的
-//   子场景，只能新建默认 session → MMMainSceneDelegate → 界面正常。
-//   原文备份 data.data.wcvk.bak（只备份一次，便于回滚）。
-static void WPFSanitizeKnownSceneSessions(void) {
-    @try {
-        NSString *home = NSHomeDirectory();
-        NSString *bid  = [NSBundle mainBundle].bundleIdentifier;
-        if (!home.length || !bid.length) { WPFLog(@"scene-session: HOME/bid 取不到，跳过"); return; }
-        NSString *dir  = [home stringByAppendingPathComponent:
-                          [NSString stringWithFormat:
-                           @"Library/Saved Application State/%@.savedState/KnownSceneSessions", bid]];
-        NSString *path = [dir stringByAppendingPathComponent:@"data.data"];
-        NSData *raw = [NSData dataWithContentsOfFile:path];
-        if (!raw.length) { WPFLog(@"scene-session: 没有 KnownSceneSessions/data.data，跳过"); return; }
-
-        NSString *bak = [path stringByAppendingString:@".wcvk.bak"];
-        if (![[NSFileManager defaultManager] fileExistsAtPath:bak]) [raw writeToFile:bak atomically:NO];
-
-        NSError *err = nil;
-        NSPropertyListFormat fmt = 0;
-        id pl = [NSPropertyListSerialization propertyListWithData:raw
-                                                          options:NSPropertyListMutableContainersAndLeaves
-                                                           format:&fmt error:&err];
-        if (![pl isKindOfClass:[NSMutableDictionary class]]) {
-            WPFLog(@"scene-session: plist 解析失败(%@)，直接删文件让系统重建", err.localizedDescription);
-            [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
-            return;
-        }
-        NSMutableDictionary *d = (NSMutableDictionary *)pl;
-        NSArray *keys = [d.allKeys copy];
-
-        // ★★ v2.0.22 判据重写（v2.0.21 的「按配置名找 SubScene」是错的，实测从没删过一条）：
-        //   实机证据（03:47~03:49 日志）：磁盘上唯一那条 D6C3661C 的配置名是 **MainScene**，
-        //   可运行时它却被挂成 delegate=MMSubSceneDelegate / MMSubSceneWindow(hidden) ——
-        //   而另一个**临时新 UUID** 的 session 才是 MMMainSceneDelegate / iConsoleWindow。
-        //   也就是说「谁是 main」不是写死在配置名里，而是微信在
-        //   application:configurationForConnectingSceneSession:options: 里动态分的，
-        //   同一个 UUID 这次是 main、下次可能是 sub。
-        //   ⇒ 唯一站得住的判据是**条数**：KnownSceneSessions 里只允许存在 1 条。
-        //     多条 = 每次强杀（CocoaTop/SIGKILL，不走正常退出清理）+ 每次后台重拉
-        //     各留一条，系统启动时按其中一条恢复，命中 sub 就黑屏 —— 条数越多越容易黑。
-        //   做法：挑一条「配置名不是 SubScene」的留下，其余全部删除；若留下的那条本身
-        //     就是 SubScene（磁盘上全是子场景），就一条都不留，让 UIKit 自己重建默认 session。
-        NSData *needle = [@"SubScene" dataUsingEncoding:NSUTF8StringEncoding];
-        // ★★ v2.0.24（04:15~04:16 实机证据）：判据改成**全删**，一条都不留。
-        //   证据链：
-        //     04:15:56.088 首次分配 session=FD5F03B1 name=MainScene → 正常（这是 FBS 的启动请求）
-        //     04:16:05.855 9.7s 后系统又来一次分配 session=7E94B89B name=SubScene
-        //                  ← 这条正是磁盘上被持久化、被系统"恢复"的那个 session
-        //                  （本进程 ctor 里打印的就是「已存在 session 7E94B89B → 保留（唯一）」）
-        //   结论：只要磁盘上留着任何一条被恢复的 session，用户点开时系统就连它，
-        //         而微信对"恢复来的 session"一律下发 SubScene 配置 → 空场景占前台 → 黑屏。
-        //   v2.0.22「留一条最像 main 的」不够：那条留下的照样会在运行时被当成 sub。
-        //   ⇒ 幂等做法：每次启动前把 KnownSceneSessions 清空（原文件已备份 .wcvk.bak），
-        //     系统没有可恢复的 session，只能按当前请求新建，微信才会老老实实分配 MainScene。
-        NSString *keep = nil;
-        NSMutableArray *kill = [NSMutableArray array];
-        for (NSString *k in keys) {
-            id v = d[k];
-            BOOL isSub = NO;
-            if ([v isKindOfClass:[NSData class]] && [(NSData *)v length]) {
-                NSData *vd = (NSData *)v;
-                isSub = [vd rangeOfData:needle options:0 range:NSMakeRange(0, vd.length)].location != NSNotFound;
-            }
-            WPFLog(@"scene-session: 已存在 session %@ → %@", k,
-                   isSub ? @"SubScene（删）" : @"也删（v2.0.24 全清，防止运行时被当成 sub）");
-            [kill addObject:k];
-        }
-        if (!kill.count) { WPFLog(@"scene-session: 本来就没有条目，无需处理"); return; }
-        [d removeObjectsForKeys:kill];
-        NSData *out = [NSPropertyListSerialization dataWithPropertyList:d
-                                                                 format:NSPropertyListBinaryFormat_v1_0
-                                                                options:0 error:&err];
-        if (!out) { WPFLog(@"scene-session: 序列化失败(%@)", err.localizedDescription); return; }
-        if ([out writeToFile:path atomically:YES]) {
-            WPFLog(@"scene-session: 已清空 %lu 条会话（原 %lu 字节 → 新 %lu 字节），本次系统只能新建 session",
-                   (unsigned long)kill.count, (unsigned long)raw.length, (unsigned long)out.length);
-        } else {
-            WPFLog(@"scene-session: 写回失败（路径 %@）", path);
-        }
-    } @catch (NSException *e) { WPFLog(@"scene-session 异常: %@", e.reason); }
-}
-
-// ============================================================
-// v2.0.21 ②：绕开「当前设备不支持多个场景」这道门槛
-// ------------------------------------------------------------
-// 微信 Info.plist 里**没有** UIApplicationSceneManifest（已用 plutil 核过，grep 零命中），
-// 所以 UIKit 认为 UIApplicationSupportsMultipleScenes = NO，
-// 于是 requestSceneSessionActivation: / requestSceneSessionDestruction: 一律**同步**回调
-//   "当前设备不支持多个场景。" (UISceneErrorDomain)  ← v2.0.19 / v2.0.20 实测都是它。
-// 这就是 L3 三级全灭的原因：API 根本没执行，只在门口被拒。
-// 做法：把 UIApplication / UISceneSession / UISceneConfiguration /
-//       UIApplicationSceneManifest 上所有名字含 "MultipleScenes" 的 BOOL getter 改成返回 YES。
-//       这几个 API 才有机会真正下到系统层。
-static BOOL WPFYesIMP(id self, SEL _cmd) { return YES; }
-
-static void WPFUnlockMultiScene(void) {
-    const char *names[] = { "UIApplication", "UISceneSession",
-                            "UISceneConfiguration", "UIApplicationSceneManifest" };
-    int hacked = 0, seen = 0;
-    for (int i = 0; i < 4; i++) {
-        Class c = objc_getClass(names[i]);
-        if (!c) { WPFLog(@"multi-scene: 设备上没有类 %s", names[i]); continue; }
-        unsigned int n = 0;
-        Method *ms = class_copyMethodList(c, &n);
-        for (unsigned int j = 0; j < n; j++) {
-            NSString *sel = NSStringFromSelector(method_getName(ms[j]));
-            if ([sel rangeOfString:@"MultipleScenes" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
-            seen++;
-            const char *rt = method_getTypeEncoding(ms[j]);
-            BOOL isBool = (rt && (rt[0] == 'c' || rt[0] == 'B'));
-            WPFLog(@"multi-scene: 命中 -[%s %@] 返回类型=%s%s", names[i], sel, rt ? rt : "?",
-                   isBool ? " → 改写成 YES" : "（非 BOOL，跳过）");
-            if (isBool) { method_setImplementation(ms[j], (IMP)WPFYesIMP); hacked++; }
-        }
-        free(ms);
-    }
-    WPFLog(@"multi-scene: 共命中 %d 个、改写 %d 个（改写 0 个 = 找不到门槛，scene API 仍会被拒）", seen, hacked);
-}
-
-// ============================================================
-// v2.0.22 ③：把「子场景」分支掰回微信主场景（真正对症的一级）
-// ------------------------------------------------------------
-// 实机证据（v2.0.21 日志 03:47:43 / 03:47:55 / 03:48:17 三次黑屏）：
-//   前台 scene → delegate=MMSubSceneDelegate、window=MMSubSceneWindow(hidden)、rootVC=nil、可用=0
-//   主窗口 iConsoleWindow（rootVC=MainTabBarViewController）挂在**另一条** session 上 state=2（后台）
-//   ⇒ 黑屏不是「窗口没了」，是**前台被空子场景占着**，主窗口在后台场景里没资格上屏。
-//   系统级 scene 切换 API 在单场景 App 上一律同步被拒（v2.0.19/20/21 三版实证），
-//   所以只能在**微信决定这条 session 用哪套 delegate 的那一刻**下手：
-//   微信的 -application:configurationForConnectingSceneSession:options: 返回 UISceneConfiguration，
-//   其中的 delegateClass 决定了这条 session 是主场景还是子场景。
-//   hook 它：只要 delegateClass / name 里带 "SubScene"，就换成 MMMainSceneDelegate + "MainScene"，
-//   让微信自己走**原生主界面分支**。
-//   ⚠️ 边界：不自造窗口、不搬 windowScene、不伪造生命周期；用的仍是微信原生
-//      MMMainSceneDelegate + iConsoleWindow + MainTabBarViewController，
-//      只是把「被错分到子场景的那条 session」还原成它本来该有的主场景身份。
-//   找不到 hook 点（微信升级改名）就只打日志、不做任何动作。
-static Class gWPFFallbackMainSceneClass = Nil;
-static IMP   gWPFOrigConfigForConnecting = NULL;
-
-static id WPFConfigForConnecting(id self, SEL _cmd, id app, id session, id options) {
-    // ⚠️ 先写一条「进入」日志再调原始实现：万一后面崩，至少能证明方法确实被调用了
-    @autoreleasepool {
-        NSString *pid = @"?";
-        @try { pid = [NSString stringWithFormat:@"%@", [session valueForKey:@"persistentIdentifier"]]; }
-        @catch (NSException *e) {}
-        WPFLog(@"scene-config: → 进入分配（session=%@）", pid);
-    }
-    id cfg = nil;
-    if (gWPFOrigConfigForConnecting) {
-        cfg = ((id (*)(id, SEL, id, id, id))gWPFOrigConfigForConnecting)(self, _cmd, app, session, options);
-    }
-    @try {
-        if (!cfg) { WPFLog(@"scene-config: 原始实现返回 nil"); return cfg; }
-        NSString *cname = nil;
-        Class dc = Nil;
-        @try { cname = (NSString *)[cfg valueForKey:@"name"]; } @catch (NSException *e) {}
-        @try { dc = (Class)[cfg valueForKey:@"delegateClass"]; } @catch (NSException *e) {}
-        NSString *dcn = dc ? NSStringFromClass(dc) : @"(nil)";
-        BOOL isSub = ([dcn rangeOfString:@"SubScene" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
-                     (cname && [cname rangeOfString:@"SubScene" options:NSCaseInsensitiveSearch].location != NSNotFound);
-        WPFLog(@"scene-config: 分配结果 name=%@ delegate=%@ → %@",
-               cname ?: @"(nil)", dcn, isSub ? @"子场景(要掰回)" : @"主场景(不动)");
-        if (isSub && gWPFFallbackMainSceneClass) {
-            SEL setDC = NSSelectorFromString(@"setDelegateClass:");
-            if ([cfg respondsToSelector:setDC]) {
-                ((void (*)(id, SEL, Class))objc_msgSend)(cfg, setDC, gWPFFallbackMainSceneClass);
-            } else {
-                @try { [cfg setValue:gWPFFallbackMainSceneClass forKey:@"delegateClass"]; } @catch (NSException *e) {}
-            }
-            @try { [cfg setValue:@"MainScene" forKey:@"name"]; } @catch (NSException *e) {}
-            WPFLog(@"scene-config: ★ 已掰回主场景（delegate=%@, name=MainScene）",
-                   NSStringFromClass(gWPFFallbackMainSceneClass));
-        }
-    } @catch (NSException *e) { WPFLog(@"scene-config 异常: %@", e.reason); }
-    return cfg;
-}
-
-// ⚠️⚠️ v2.0.22 首版事故复盘（2026-11-07 04:01~04:04 实机）：
-//   首版是「全类扫描 + 批量接管」——扫到 11 个类实现了该方法，把其中 9 个的 IMP 全换成
-//   同一个 WPFConfigForConnecting，但 gWPFOrigConfigForConnecting **只存了第一个类的原始实现**。
-//   于是 UIKit 真去调 MicroMessengerAppDelegate 的那个方法时，跳进去执行的是**别的类**的实现，
-//   参数语义完全对不上 → EXC_BAD_ACCESS。后果：微信启动后 1~3 秒必死，
-//   日志里从 04:01:48 起连一次 willEnterForeground 都没有（v2.0.21 时期每进程都能进前台）。
-//   ⇒ 现在只认准 MicroMessengerAppDelegate 一个类，其余（WCColorProxy / FakeTarget /
-//     MMHookUIAlertView / SwiftUI.* 等别家插件或系统类）**一律不碰**，也算顺手避免破坏别人。
-// 只取「这个类**自己**实现的方法」，绝不沿继承链拿父类的 Method。
-// ⚠️ 这是 v2.0.22 崩溃的直接教训：class_getInstanceMethod 会沿继承链返回父类的 Method，
-//   对它做 method_setImplementation 等于**改父类**，所有子类跟着遭殃。
-static Method WPFMethodOwnedByClass(Class c, SEL sel) {
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(c, &n);
-    Method found = NULL;
-    for (unsigned int i = 0; i < n; i++) {
-        if (method_getName(ms[i]) == sel) { found = ms[i]; break; }
-    }
-    if (ms) free(ms);
-    return found;
-}
-
-static void WPFForceMainScene(void) {
-    Class mainCls = NSClassFromString(@"MMMainSceneDelegate");
-    if (!mainCls) { WPFLog(@"scene-config: 找不到 MMMainSceneDelegate 类，跳过"); return; }
-    gWPFFallbackMainSceneClass = mainCls;
-
-    Class appDel = NSClassFromString(@"MicroMessengerAppDelegate");
-    if (!appDel) { WPFLog(@"scene-config: 找不到 MicroMessengerAppDelegate，跳过"); return; }
-
-    SEL sel = sel_registerName("application:configurationForConnectingSceneSession:options:");
-    // 沿继承链找**真正自己拥有**这个方法的那一层（AppDelegate 通常自己实现，
-    // 若它只是继承，就动父类那一个 Method —— 而那个父类就是 UIKit 实际调用的目标）
-    Class owner = Nil;
-    Method m = NULL;
-    for (Class c = appDel; c && c != [NSObject class]; c = class_getSuperclass(c)) {
-        Method om = WPFMethodOwnedByClass(c, sel);
-        if (om) { owner = c; m = om; break; }
-    }
-    if (!m) {
-        WPFLog(@"scene-config: AppDelegate 继承链上没人实现 %@，跳过", NSStringFromSelector(sel));
-        return;
-    }
-    const char *te = method_getTypeEncoding(m);
-    if (!te || te[0] != '@') {
-        WPFLog(@"scene-config: %@ 的返回类型不是对象(%s)，放弃 hook 以免崩",
-               NSStringFromClass(owner), te ?: "(null)");
-        return;
-    }
-    IMP cur = method_getImplementation(m);
-    if (cur == (IMP)WPFConfigForConnecting) { WPFLog(@"scene-config: 已接管过，跳过"); return; }
-    gWPFOrigConfigForConnecting = method_setImplementation(m, (IMP)WPFConfigForConnecting);
-    WPFLog(@"scene-config: 已接管 %@ 的 scene 配置方法（orig 就是它自己的实现）",
-           NSStringFromClass(owner));
-}
-
-// ============================================================
-// ★★★ v2.0.27：在系统激活空场景**之前**就把主窗口搬过去 —— 目标 0 秒黑屏
-// ------------------------------------------------------------
-// v2.0.26 实测：快速路径生效后黑屏仍有一小段时间，因为整条链是
-//   didBecomeActive → 0.4s 检查 → 搬家
-// 也就是说「系统已经把空 scene 激活成前台、铺了黑底」之后我们才动手。
-//
-// 要彻底 0 秒，唯一更早的时机是 scene 连接阶段：
-//   系统分配 config（我们已 hook，日志「scene-config: → 进入分配」）
-//     → UIKit 创建 UIScene
-//     → 调 delegate 的  scene:willConnectToSession:options:   ← ★ 就是这里，scene 还没激活
-//     → scene 被激活成前台
-//   在 willConnect 里把主窗口 `windowScene` 指到新 scene，等它被激活时窗口已经在上面，
-//   系统没有「空场景」这一帧，用户就看不到黑。
-//
-// 判断条件（保守，只处理"多余场景"这一种情况）：
-//   主窗口**已存在**（说明不是首次启动建窗口那一轮）且它当前不在这个新 scene 上
-//   ⇒ 这个新 scene 就是系统恢复出来的那个空的，把主窗口搬过去。
-//   首次启动时主窗口还不存在（由微信在第一轮 willConnect 里创建），这里自然什么都不做。
-static IMP gWPFOrigWillConnect = NULL;
-static NSMutableSet *gWPFHookedWillConnect = nil;
-
-static void WPFSceneWillConnectHook(id self, SEL _cmd, UIScene *scene, UISceneSession *session, id options) {
-    @try {
-        if (scene && [scene isKindOfClass:[UIWindowScene class]]) {
-            UIWindowScene *ws = (UIWindowScene *)scene;
-            UIApplication *app = [UIApplication sharedApplication];
-            UIWindow *main = WPFMainWindow(app);
-            if (main && main.windowScene != ws) {
-                WPFLog(@"scene-willConnect: 新场景 %p(session=%@ state=%ld) 即将连接，"
-                        "主窗口在 %p → 抢先搬家（赶在系统激活它之前）",
-                       (__bridge void *)ws,
-                       session.persistentIdentifier ?: @"(nil)",
-                       (long)ws.activationState,
-                       (__bridge void *)main.windowScene);
-                WPFMoveMainWindowToScene(main, ws);
-            } else if (!main) {
-                WPFLog(@"scene-willConnect: 新场景 %p 连接，主窗口还没建（首次启动），交给微信自己建",
-                       (__bridge void *)ws);
-            }
-        }
-    } @catch (NSException *e) { WPFLog(@"scene-willConnect 抢先搬家异常: %@", e.reason); }
-
-    if (gWPFOrigWillConnect)
-        ((void (*)(id, SEL, id, id, id))gWPFOrigWillConnect)(self, _cmd, scene, session, options);
-
-    // 微信自己的实现可能又改窗口归属（它内部也有窗口管理），所以 orig 之后再校准一次
-    @try {
-        if (scene && [scene isKindOfClass:[UIWindowScene class]]) {
-            UIWindowScene *ws = (UIWindowScene *)scene;
-            UIWindow *main2 = WPFMainWindow([UIApplication sharedApplication]);
-            if (main2 && main2.windowScene != ws && ws.activationState != UISceneActivationStateBackground) {
-                WPFLog(@"scene-willConnect: 微信 orig 之后主窗口又不在这个场景上了 → 再搬一次");
-                WPFMoveMainWindowToScene(main2, ws);
-            }
-        }
-    } @catch (NSException *e) { WPFLog(@"scene-willConnect 复查异常: %@", e.reason); }
-}
-
-static void WPFHookSceneWillConnect(void) {
-    SEL sel = sel_registerName("scene:willConnectToSession:options:");
-    NSArray *candidates = @[@"MMMainSceneDelegate", @"MMSceneDelegate", @"MMSubSceneDelegate",
-                            @"MMProxySceneDelegate"];
-    if (!gWPFHookedWillConnect) gWPFHookedWillConnect = [NSMutableSet set];
-    NSMutableString *log = [NSMutableString string];
-    for (NSString *n in candidates) {
-        Class c = NSClassFromString(n);
-        if (!c) { [log appendFormat:@"%@(无),", n]; continue; }
-        // 沿继承链找真正拥有该方法的类，避免 method_setImplementation 改到父类/系统类
-        Class owner = Nil; Method m = NULL;
-        for (Class k = c; k && k != [NSObject class]; k = class_getSuperclass(k)) {
-            Method om = WPFMethodOwnedByClass(k, sel);
-            if (om) { owner = k; m = om; break; }
-        }
-        if (!m) { [log appendFormat:@"%@(无人实现),", n]; continue; }
-        if ([gWPFHookedWillConnect containsObject:NSStringFromClass(owner)]) continue;
-        const char *te = method_getTypeEncoding(m);
-        if (!te || te[0] != 'v') {
-            [log appendFormat:@"%@(返回类型%s),", NSStringFromClass(owner), te ?: "?"];
-            continue;
-        }
-        IMP cur = method_getImplementation(m);
-        if (cur == (IMP)WPFSceneWillConnectHook) continue;
-        IMP orig = method_setImplementation(m, (IMP)WPFSceneWillConnectHook);
-        if (!gWPFOrigWillConnect) gWPFOrigWillConnect = orig;
-        else if (orig != gWPFOrigWillConnect) {
-            // 多个类各自实现时，orig 不能共用同一个 —— 否则又是 v2.0.22 那个崩法。
-            // 这里直接还原，只保留第一个（微信实际只会用到主 scene delegate 那一个）。
-            method_setImplementation(m, orig);
-            [log appendFormat:@"%@(多实现已还原),", NSStringFromClass(owner)];
-            continue;
-        }
-        [gWPFHookedWillConnect addObject:NSStringFromClass(owner)];
-        [log appendFormat:@"%@(已接管),", NSStringFromClass(owner)];
-    }
-    WPFLog(@"scene-willConnect: hook 结果 [%@]", log);
-}
-
 // ⚠️ 这里必须用 `__attribute__((constructor))`，**不能用 Logos 的 %ctor**（v2.0.15 根因）：
 //   本文件历史上是 .xm + %ctor，编出来的 dylib 是**空壳** —— 实测该产物
-//   __TEXT 段只剩 Mach-O 头（16384B）、__LINKEDIT 仅 1104B、全文件只有 18 个字符串
-//   （连 "UIApplication" 都没有），链接阶段还报 `warning: no debug symbols in executable`。
+//   __TEXT 段只剩 Mach-O 头（16384B）、__LINKEDIT 仅 1104B、全文件只有 18 个字符串，
+//   链接阶段还报 `warning: no debug symbols in executable`。
 //   也就是说 %ctor 的代码从来没被链进去 → 注入后什么都不可能执行 → 日志当然一条都没有。
-//   同工程 wetypekeepalive（SBKeepAlive.xm）一直正常，差别只有一个：它用的是
-//   __attribute__((constructor))，不经过 Logos。本文件没有任何 %hook/%orig，
-//   本来就不需要 Logos，所以直接改成 .m + constructor，彻底绕开这条路。
+//   同工程 wetypekeepalive（SBKeepAlive.xm）一直正常，差别只有一个：它用
+//   __attribute__((constructor))，不经过 Logos。本文件没有 %hook/%orig，直接 .m + constructor。
 __attribute__((constructor))
 static void WCVKPFInit(void) {
     @autoreleasepool {
         // ★ 通道 D：第一件事就告诉 SpringBoard「我被加载并执行了」。
         //   darwin notify 不经过文件系统，沙盒写不写得出东西都跟它无关，
-        //   所以它是「dylib 到底有没有被 dlopen 进来」的唯一硬证据：
-        //   wetypekeepalive（SB 侧）收到会写 /var/mobile/wetypekeepalive.log 的 [PREWARM] ctor reached。
+        //   所以它是「dylib 到底有没有被 dlopen 进来」的唯一硬证据。
         notify_post("com.wcvoicekeep.prewarm.ctor");
 
         WPFLog(@"==== WCPrewarmFix inject (pid=%d build=%s) ====", getpid(), WCVK_BUILD_TAG);
@@ -1344,17 +575,10 @@ static void WCVKPFInit(void) {
                getenv("XPC_SERVICE_NAME") ?: "(null)");
         // log channel / probe 两行由 WPFWriteFile 在首次成功写入时自动补上（含每个候选的 errno）
 
-        // ★★ v2.0.21 两件必须在这里做的事（ctor 早于 UIApplicationMain）：
-        //   ① 把持久化的 SubScene 场景会话从磁盘删掉 —— UIKit 还没读，删了就不会被恢复/激活
-        //   ② 绕开「不支持多个场景」门槛 —— 否则后面的 scene API 全在门口被拒
-        // ★★ v2.0.22 ③ 必须在 ctor 里（早于第一个 scene 连接）：接管
-        //   application:configurationForConnectingSceneSession:options:，把子场景掰回主场景
-        WPFSanitizeKnownSceneSessions();
-        WPFUnlockMultiScene();
-        WPFForceMainScene();
-        // ★★ v2.0.27：再接管 scene delegate 的 scene:willConnectToSession:options:，
-        //   在系统把新 scene 激活成前台**之前**把主窗口搬过去 —— 目标 0 秒黑屏。
-        WPFHookSceneWillConnect();
+        // ★ 黑屏修复：整套交给独立模块（可直接移植到其它 tweak 工程）。
+        //   必须在 UIApplicationMain 之前装好，否则 willConnect hook 赶不上第一个场景。
+        WCSceneBlackFixSetLog(^(NSString *line) { WPFLog(@"[scene-fix] %@", line); });
+        WCSceneBlackFixInstall();
 
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         [nc addObserverForName:UIApplicationDidFinishLaunchingNotification

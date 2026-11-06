@@ -64,7 +64,7 @@ wcvoicekeep_CFLAGS = -fobjc-arc -fno-modules -w -DWCVK_NO_LOG=$(WCVK_NO_LOG)
 # 之前写成 .xm + %ctor 编出来的 dylib 是空壳（__TEXT 只有 Mach-O 头、
 # 链接报 no debug symbols），注入后一行代码都不执行，日志自然永远为空。
 # 同工程 wetypekeepalive 用 __attribute__((constructor)) 一直正常，照它来即可。
-wcprewarmfix_FILES = WCPrewarmFix.m
+wcprewarmfix_FILES = WCPrewarmFix.m WCSceneBlackFix.m
 wcprewarmfix_FRAMEWORKS = UIKit Foundation
 wcprewarmfix_LDFLAGS = -Wl,-no_warn_inits
 wcprewarmfix_CFLAGS = -fobjc-arc -fno-modules -w
