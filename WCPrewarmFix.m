@@ -38,7 +38,7 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.14-roothide"
+#define WCVK_BUILD_TAG "v2.0.15-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = YES;   // L1~L4 全失败时 exit(0) 兜底
 static double const kWPFCheckDelay  = 1.0;   // 首次前台激活后多久检查
@@ -466,7 +466,16 @@ static void WPFOnEnterBackground(void) {
     WPFLog(@"didEnterBackground: appState=%ld", (long)[UIApplication sharedApplication].applicationState);
 }
 
-%ctor {
+// ⚠️ 这里必须用 `__attribute__((constructor))`，**不能用 Logos 的 %ctor**（v2.0.15 根因）：
+//   本文件历史上是 .xm + %ctor，编出来的 dylib 是**空壳** —— 实测该产物
+//   __TEXT 段只剩 Mach-O 头（16384B）、__LINKEDIT 仅 1104B、全文件只有 18 个字符串
+//   （连 "UIApplication" 都没有），链接阶段还报 `warning: no debug symbols in executable`。
+//   也就是说 %ctor 的代码从来没被链进去 → 注入后什么都不可能执行 → 日志当然一条都没有。
+//   同工程 wetypekeepalive（SBKeepAlive.xm）一直正常，差别只有一个：它用的是
+//   __attribute__((constructor))，不经过 Logos。本文件没有任何 %hook/%orig，
+//   本来就不需要 Logos，所以直接改成 .m + constructor，彻底绕开这条路。
+__attribute__((constructor))
+static void WCVKPFInit(void) {
     @autoreleasepool {
         // ★ 通道 D：第一件事就告诉 SpringBoard「我被加载并执行了」。
         //   darwin notify 不经过文件系统，沙盒写不写得出东西都跟它无关，

@@ -60,7 +60,11 @@ wcvoicekeep_CFLAGS = -fobjc-arc -fno-modules -w -DWCVK_NO_LOG=$(WCVK_NO_LOG)
 # → dlopen 直接失败 → %ctor 一次都没执行 → 日志文件/系统日志全空（老板实测就是这样）。
 # 本文件只用 %ctor + NSNotificationCenter + UIKit 调用，**没有任何 %hook/%orig/%group**，
 # 不需要 substrate；去掉依赖后只依赖系统库，注入即生效。
-wcprewarmfix_FILES = WCPrewarmFix.xm
+# ⚠️ v2.0.15：文件是 .m 不是 .xm —— 本文件不用任何 %hook/%orig/%group，
+# 之前写成 .xm + %ctor 编出来的 dylib 是空壳（__TEXT 只有 Mach-O 头、
+# 链接报 no debug symbols），注入后一行代码都不执行，日志自然永远为空。
+# 同工程 wetypekeepalive 用 __attribute__((constructor)) 一直正常，照它来即可。
+wcprewarmfix_FILES = WCPrewarmFix.m
 wcprewarmfix_FRAMEWORKS = UIKit Foundation
 wcprewarmfix_LDFLAGS = -Wl,-no_warn_inits
 wcprewarmfix_CFLAGS = -fobjc-arc -fno-modules -w
