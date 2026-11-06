@@ -6,3 +6,5 @@ packages/
 
 # OS junk
 .DS_Store
+wcvk_kbdapi.log
+.dl/
