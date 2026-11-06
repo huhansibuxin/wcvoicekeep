@@ -73,6 +73,28 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
+			<string>预热方式（黑屏相关）</string>
+			<key>footerText</key>
+			<string>关（默认）= 后台完整启动：进程会跑完整个启动流程再被系统挂起，点开是"激活已有界面"，所以微信经常黑屏。
+开 = 真预热（冻结式）：进程一创建就立刻冻结在启动早期，不写数据、不连界面，点开后从极早期继续启动，理论上不再黑屏。
+注意：这是实验项。若开启后点开 App 卡住不动，关掉本开关即可恢复；也可用命令行 /usr/bin/wcvoicekeep --prewarm-cont com.tencent.xin 手动恢复。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>真预热（冻结式，实验）</string>
+			<key>key</key>
+			<string>freezePrewarm</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.wcvoicekeep.bgkeep</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
 			<string>拉起记录</string>
 			<key>footerText</key>
 			<string>关闭后插件不再写任何记录文件（零写入、零开销），已存在的记录也会忽略。</string>
@@ -109,7 +131,8 @@
 2. 保活 App：你在上面勾选的 App，被系统或手动杀掉后在后台重新拉起（不切前台、不亮屏、不打扰）。
 3. 记录：每次拉起都会在「最近拉起记录」里留一条时间 + 目标 + 结果，文件内只保留最近 20 条；关掉开关则完全不写（零写入、零 CPU）。
 4. 熔断：某个勾选的 App 连续 3 次拉不起来（比如已卸载），插件自动把它从看护里摘掉，不会无限重试；改一下设置就恢复。
-5. 原理：每个目标单独挂一个内核进程退出事件，只有目标真的退出时才会回调，平时没有任何轮询与定时器，CPU 占用为 0。</string>
+5. 预热方式：「真预热（冻结式）」开启时，进程只启动到极早期就被冻结，等点开时才继续，等于 Apple 官方 prewarm；关闭时是后台完整启动，点开容易黑屏。
+6. 原理：每个目标单独挂一个内核进程退出事件，只有目标真的退出时才会回调，平时没有任何轮询与定时器，CPU 占用为 0。</string>
 		</dict>
 		<dict>
 			<key>cell</key>

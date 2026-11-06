@@ -36,6 +36,8 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 
 #include <dlfcn.h>
 #include <dispatch/dispatch.h>
+#include <signal.h>       // v2.0.8：SIGSTOP/SIGCONT —— 真预热（冻结在启动早期）
+#include <errno.h>
 #include <notify.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -135,6 +137,9 @@ static NSString *WCVKRecordsPath(void) {
 static BOOL     gEnabled = YES;   // 总开关
 static BOOL     gLogging = NO;    // 日志开关（日志版才有实际作用）
 static BOOL     gRecord  = YES;   // 拉起记录开关：关掉后**完全不写**记录（零写入零开销）
+// v2.0.8：真预热（冻结式）。开启后 App 被拉起时立刻 SIGSTOP 冻在启动早期，
+// 不写容器、不连 scene —— 相当于 Apple 那种 prewarm 状态；用户点开时再恢复。
+static BOOL     gFreeze  = NO;
 static NSArray *gAppBIDs = nil;   // 用户勾选的 App bundle id 数组
 
 // v2.0.5：返回「值是否有变化」。
@@ -143,6 +148,7 @@ static NSArray *gAppBIDs = nil;   // 用户勾选的 App bundle id 数组
 // 白干活。现在值没变就直接跳过，系统里别人改设置跟我们无关。
 static BOOL WCVKReadPrefs(void) {
     BOOL    oldEnabled = gEnabled, oldLogging = gLogging, oldRecord = gRecord;
+    BOOL    oldFreeze  = gFreeze;
     NSArray *oldBIDs   = gAppBIDs;
     NSString *p = WCVKPrefsPath();
 
@@ -155,6 +161,8 @@ static BOOL WCVKReadPrefs(void) {
     id lg = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("logging"),
               (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
     id rec = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("record"),
+              (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    id frz = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("freezePrewarm"),
               (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
     id apps = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("enabledApps"),
               (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
@@ -171,11 +179,13 @@ static BOOL WCVKReadPrefs(void) {
             }
         }
         en = d[@"enabled"]; lg = d[@"logging"]; rec = d[@"record"]; apps = d[@"enabledApps"];
+        frz = d[@"freezePrewarm"];
     }
 
     gEnabled = en ? [en boolValue] : YES;
     gLogging = lg ? [lg boolValue] : NO;
     gRecord = rec ? [rec boolValue] : YES;
+    gFreeze = frz ? [frz boolValue] : NO;
 
     NSMutableArray *bids = [NSMutableArray array];
     if ([apps isKindOfClass:[NSArray class]]) {
@@ -186,9 +196,10 @@ static BOOL WCVKReadPrefs(void) {
     }
     gAppBIDs = bids;
     BOOL changed = (oldEnabled != gEnabled) || (oldLogging != gLogging) || (oldRecord != gRecord)
+                   || (oldFreeze != gFreeze)
                    || ![oldBIDs isEqualToArray:gAppBIDs];
-    LOG(@"prefs loaded (%s): enabled=%d logging=%d apps=%@ changed=%d",
-        viaCF ? "cfprefs" : "file", gEnabled, gLogging, gAppBIDs, changed);
+    LOG(@"prefs loaded (%s): enabled=%d logging=%d freeze=%d apps=%@ changed=%d",
+        viaCF ? "cfprefs" : "file", gEnabled, gLogging, gFreeze, gAppBIDs, changed);
     return changed;
 }
 
@@ -486,6 +497,61 @@ static int WCVKHeadlessLaunch(NSString *bid) {
     return r;
 }
 
+// ===== v2.0.8：真预热（冻结式） =====
+// 背景（v2.0.7 实测证据）：SBSLaunchApplicationWithIdentifier(bid, 1) 是「后台完整启动」，
+// 微信会在后台把数据层跑完（容器 61 个文件被改写、5 个 sqlite 被开），scene 以非前台
+// 状态连上后被系统挂起；用户点图标只是「激活已有 scene」，不会再跑启动流程 → 黑屏。
+// Apple 官方 prewarm 是「跑到 UIApplicationMain 之前就暂停」，那种状态不碰磁盘。
+//
+// 这里用 SIGSTOP 人工制造同样的状态：进程一创建就冻住，不写容器、不连 scene。
+// 用户点开时再 SIGCONT 恢复，App 相当于从极早期继续启动 → 不应黑屏。
+// 注意：SIGSTOP 冻住后 FrontBoard 并不知道我们在"预热"，它的启动看门狗可能超时；
+// 所以实验里必须能手动/定时 SIGCONT，否则可能变成点开卡死。
+static int WCVKPidNewer(NSString *bid, int oldPid) {
+    int pid = WCVKPidForBID(bid);
+    if (pid > 0 && pid != oldPid) return pid;
+    return 0;
+}
+
+// 返回 >0 = 冻住的 pid；0 = 没等到进程；<0 = 拉起失败
+// delayMs：创建到冻结之间等多久。0 = 一出现就冻（最干净，但可能让系统的启动事务完不成）；
+//          几百毫秒 = 等启动事务走完再冻（系统更稳定，但可能已经开始写盘）。
+static int WCVKPrewarmFreeze(NSString *bid, int maxWaitMs, int delayMs) {
+    if (delayMs < 0) delayMs = 0;
+    int oldPid = WCVKPidForBID(bid);
+    if (oldPid > 0) {
+        // 已在运行就别再拉，直接冻住现有进程（相当于"把当前进程当成预热态"）
+        if (kill(oldPid, SIGSTOP) == 0) { LOG(@"prewarm: 冻结已在运行的 %@ pid=%d", bid, oldPid); return oldPid; }
+        return -1;
+    }
+    int r = WCVKHeadlessLaunch(bid);
+    if (r != 0) { LOG(@"prewarm: 拉起 %@ 失败 rc=%d", bid, r); return -100 + r; }
+    // 1ms 轮询抢在写盘/scene 连接之前冻住；最多等 maxWaitMs
+    for (int ms = 0; ms < maxWaitMs; ms++) {
+        int pid = WCVKPidNewer(bid, oldPid);
+        if (pid > 0) {
+            if (delayMs > ms) { usleep((useconds_t)(delayMs - ms) * 1000); }
+            if (kill(pid, SIGSTOP) == 0) {
+                LOG(@"prewarm: %@ 创建后 %dms(+delay %dms) 冻结 pid=%d", bid, ms, delayMs, pid);
+                return pid;
+            }
+            LOG(@"prewarm: SIGSTOP(%d) 失败 errno=%d", pid, errno);
+            return -2;
+        }
+        usleep(1000);
+    }
+    LOG(@"prewarm: %@ 等了 %dms 没等到进程", bid, maxWaitMs);
+    return 0;
+}
+
+static int WCVKPrewarmCont(NSString *bid) {
+    int pid = WCVKPidForBID(bid);
+    if (pid <= 0) { LOG(@"prewarm cont: %@ 不在运行", bid); return -1; }
+    int r = kill(pid, SIGCONT);
+    LOG(@"prewarm cont: %@ pid=%d SIGCONT -> %d", bid, pid, r);
+    return r == 0 ? pid : -2;
+}
+
 // ===== 目标（事件驱动看护）=====
 static const char *kKbdExtSuffix    = "/wxkb_plugin.appex/wxkb_plugin";
 static const int  kRelaunchDelaySec = 1;     // 事件 -> 拉起前等 1s（尊重系统回收动作）
@@ -538,8 +604,21 @@ static void WCVKRelaunchAttempt(WCVKTarget *t, int attempt) {
     NSString *disp = t.display ?: t.ident;
     NSString *ident = t.ident;
     NSString *kind = t.kind;
-    int r = WCVKHeadlessLaunch(ident);
-    LOG(@"headless launch %@ rc=%d (attempt %d)", ident, r, attempt);
+    // v2.0.8：预热方式二选一。
+    //   普通：SBSLaunch(flag=1) 后台**完整启动**（会跑完数据层、scene 以后台态连上 → 点开黑屏）
+    //   真预热：拉起后立刻 SIGSTOP 冻在启动早期（不写容器、不连 scene，等同 Apple prewarm）
+    // 键盘扩展永远走普通路径（它没有 UI，不需要 scene）。
+    int r = 0;
+    int frozePid = 0;
+    if (gFreeze && ![kind isEqualToString:@"kbd"]) {
+        int fz = WCVKPrewarmFreeze(ident, 4000, 0);
+        if (fz > 0) { frozePid = fz; r = 0; }
+        else        { r = (fz < 0) ? fz : -1; }
+        LOG(@"prewarm-freeze %@ -> %d (rc=%d, attempt %d)", ident, fz, r, attempt);
+    } else {
+        r = WCVKHeadlessLaunch(ident);
+        LOG(@"headless launch %@ rc=%d (attempt %d)", ident, r, attempt);
+    }
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kVerifyDelayMs * NSEC_PER_MSEC)),
                    WCVKQueue(), ^{
@@ -548,8 +627,13 @@ static void WCVKRelaunchAttempt(WCVKTarget *t, int attempt) {
             t.fails = 0;
             t.lastRelaunch = 0;                    // 成功立刻清冷却
             WCVKRecord(disp, ident, kind, YES,
-                       [NSString stringWithFormat:@"后台拉起成功 (pid=%d)", pid]);
+                       frozePid > 0
+                         ? [NSString stringWithFormat:@"真预热(已冻结) pid=%d", pid]
+                         : [NSString stringWithFormat:@"后台拉起成功 (pid=%d)", pid]);
             WCVKArmTarget(t, 0);                   // 立刻在新 pid 上重挂监视
+            if (frozePid > 0) {
+                LOG(@"%@ 处于冻结预热态：用户点开时若卡住，执行 wcvoicekeep --prewarm-cont %@", disp, ident);
+            }
             return;
         }
         int retries = (int)(sizeof(kAppRetryDelay) / sizeof(kAppRetryDelay[0]));
@@ -837,7 +921,7 @@ static void WCVKPrintStatus(void) {
     WCVKReadPrefs();
     printf("prefs   : %s\n", WCVKPrefsPath().UTF8String);
     printf("records : %s\n", WCVKRecordsPath().UTF8String);
-    printf("enabled=%d logging=%d record=%d\n", gEnabled, gLogging, gRecord);
+    printf("enabled=%d logging=%d record=%d freeze=%d\n", gEnabled, gLogging, gRecord, gFreeze);
     int kpid = WCVKPidForPathSuffix([NSString stringWithUTF8String:kKbdExtSuffix], nil);
     printf("  [kbd] wxkb_plugin pid=%d\n", kpid);
     for (NSString *bid in gAppBIDs) {
@@ -877,6 +961,37 @@ int main(int argc, char *argv[]) {
                 int r = WCVKHeadlessLaunch(bid);
                 WCVKRecord(bid, bid, @"app", r == 0, @"手动测试后台拉起");
                 printf("headless launch %s -> %d (0=ok)\n", argv[i + 1], r);
+                return 0;
+            }
+            if (strcmp(argv[i], "--prewarm") == 0 && i + 1 < argc) {
+                // 真预热实验：拉起后立刻冻结（不写容器、不连 scene）。
+                // 用法: wcvoicekeep --prewarm <bid> [冻结延迟ms] [自动恢复秒数]
+                //   delay 不填=0（一创建就冻，最接近 Apple prewarm，磁盘零写入）
+                //   delay 200 = 等启动事务走完再冻（系统更稳，可能已开始写盘）
+                //   cont 不填=0（保持冻结，等你点开 App 或用 --prewarm-cont 恢复）
+                NSString *bid = [NSString stringWithUTF8String:argv[i + 1]];
+                int delayMs = (i + 2 < argc) ? atoi(argv[i + 2]) : 0;
+                int contSec = (i + 3 < argc) ? atoi(argv[i + 3]) : 0;
+                int pid = WCVKPrewarmFreeze(bid, 4000, delayMs);
+                printf("prewarm freeze %s (delay=%dms) -> pid=%d\n", argv[i + 1], delayMs, pid);
+                if (pid > 0) {
+                    WCVKRecord(bid, bid, @"app", YES,
+                               [NSString stringWithFormat:@"真预热(冻结) pid=%d delay=%dms", pid, delayMs]);
+                    if (contSec > 0) {
+                        printf("  %ds 后自动 SIGCONT ...\n", contSec);
+                        fflush(stdout);
+                        sleep(contSec);
+                        int n = WCVKPrewarmCont(bid);
+                        printf("  SIGCONT -> %d\n", n);
+                    } else {
+                        printf("  保持冻结。点开 App 若卡住请执行: wcvoicekeep --prewarm-cont %s\n", argv[i + 1]);
+                    }
+                }
+                return 0;
+            }
+            if (strcmp(argv[i], "--prewarm-cont") == 0 && i + 1 < argc) {
+                int n = WCVKPrewarmCont([NSString stringWithUTF8String:argv[i + 1]]);
+                printf("prewarm cont %s -> %d\n", argv[i + 1], n);
                 return 0;
             }
             if (strcmp(argv[i], "--ls-probe") == 0) {
