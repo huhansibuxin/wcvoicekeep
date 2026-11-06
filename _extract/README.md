@@ -53,6 +53,13 @@ Theos 工程里把 .m 加进 FILES：
 wctweak_FILES += WCSceneBlackFix.m
 ```
 
+纯净版（编译期剥离日志）：传 `-DWCF_NO_LOG=1`，或直接沿用宿主工程已有的
+`-DWCVK_NO_LOG=1`（模块会自动跟随）。剥离后连字符串格式化都不做，实测 dylib 小 20%。
+
+```make
+wctweak_CFLAGS += -DWCVK_NO_LOG=$(WCVK_NO_LOG)
+```
+
 ## 验证日志（装好后看这几行）
 
 正常（零黑屏）：
@@ -86,3 +93,7 @@ wctweak_FILES += WCSceneBlackFix.m
 - `KnownSceneSessions` 文件删了没用（FBS 内存里也握一份），别走那条路。
 - `requestSceneSessionActivation/Destruction` 在无 `UIApplicationSceneManifest` 的单场景 App 上
   全部同步返回「当前设备不支持多个场景」，一次都不会生效，别走那条路。
+- **运行开销**：模块只在「后台无头拉起」的进程里持续工作；用户自己点图标冷启动的进程
+  只做第一次确认，之后完全不介入。兜底检查带 1s 节流，单次开销是遍历一遍窗口数组（微秒级）。
+- **想再砍一个 hook**：`WCSceneBlackFixSetRewriteConfig(NO)` 可以关掉 ②（配置掰回）。
+  核心的 willConnect 抢先搬家不依赖它。要关的话记得实测几轮确认仍零黑屏。
