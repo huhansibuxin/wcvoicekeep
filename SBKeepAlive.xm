@@ -73,7 +73,7 @@ static void SBLog(NSString *fmt, ...) {
 //   通道 1  open/write  —— 原始文件（保留，若沙盒放行最直观）
 //   通道 2  CFPreferences —— SB 必然有权写自己的 prefs domain
 //   通道 3  Darwin 通知 —— 由 root 的 wcvoicekeep daemon 收到后落盘（必定成功）
-#define WCVK_BUILD_TAG "v1.9.41-roothide"
+#define WCVK_BUILD_TAG "v1.9.42-roothide"
 
 // 通道 3：Darwin 通知（名字区分阶段，daemon 侧监听后写自己的日志）
 static void WCVKPostNotify(const char *name) {
@@ -280,6 +280,10 @@ static BOOL gKbdDidShow = NO;
 static id   gKbdShowObs = nil;
 static id   gKbdHideObs = nil;
 
+// v1.9.42：这两个函数定义在后面（键盘隐藏 / 成功回报），前面多处引用，先声明
+static void KbdSetKeyboardWindowsAlpha(CGFloat alpha, const char *tag);
+static void KbdReportOkIfRunning(const char *tag);
+
 static void KbdStartKbWatch(void) {
     if (gKbdShowObs) return;
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -288,11 +292,29 @@ static void KbdStartKbWatch(void) {
                               usingBlock:^(NSNotification *n) {
         gKbdDidShow = YES;
         SBLog(@"[KBDWARM] *** UIKeyboardDidShow 收到 = 键盘真的弹出来了");
+        // v1.9.42：键盘出现 = 键盘扩展必然已被系统 spawn。通知 daemon 立刻在
+        // 当前 wxkb_plugin pid 上挂"进程退出事件"监视（事件驱动，不轮询）。
+        notify_post("com.wcvoicekeep.kbd.up");
+        // v1.9.42：藏键盘（只在"我们自己预热"期间藏，用户真打字时不动）
+        if (gKbdWarmBusy) {
+            KbdSetKeyboardWindowsAlpha(0.0, "DidShow");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (gKbdWarmBusy) KbdSetKeyboardWindowsAlpha(0.0, "DidShow+20ms");
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (gKbdWarmBusy) KbdSetKeyboardWindowsAlpha(0.0, "DidShow+60ms");
+            });
+        }
     }];
     gKbdHideObs = [nc addObserverForName:UIKeyboardDidHideNotification
                                   object:nil queue:[NSOperationQueue mainQueue]
                               usingBlock:^(NSNotification *n) {
+        gKbdDidShow = NO;
         SBLog(@"[KBDWARM] *** UIKeyboardDidHide 收到");
+        // v1.9.42：只要键盘收起就把 alpha 还原，绝不让"隐形键盘"留到用户真打字时
+        KbdSetKeyboardWindowsAlpha(1.0, "DidHide-restore");
     }];
     SBLog(@"[KBDWARM] keyboard show/hide observers installed");
 }
@@ -364,6 +386,11 @@ static void KbdWarmupFinish(NSString *tag) {
         SBLog(@"[KBDWARM] %@ restored prev keyWindow", tag);
         gKbdPrevKeyWindow = nil;
     }
+    // v1.9.42：键盘窗口 alpha 还原（等收起动画走完再还原，避免动画期间露出来）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        KbdSetKeyboardWindowsAlpha(1.0, "finish-restore");
+    });
 }
 
 // ===== v1.9.37 备选通道：UIAlertController + UITextField =====
@@ -442,6 +469,7 @@ static void KbdWarmupRun(NSString *reason) {
         // 改成屏幕内正常尺寸窗口 + 文本框放在可见位置，并用 UIKeyboardDidShow
         // 通知做实测判据（不再用写死的"(键盘已弹)"字符串冒充结论）。
         gKbdDidShow = NO;
+        gKbdOkPosted = NO;                 // v1.9.42：每次预热重置"已回报成功"标志
         UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
         w.frame = CGRectMake(20, 100, 180, 44);      // 屏幕可见区域内的小窗口
         w.windowLevel = UIWindowLevelNormal + 1;
@@ -478,6 +506,7 @@ static void KbdWarmupRun(NSString *reason) {
                        dispatch_get_main_queue(), ^{
             SBLog(@"[KBDWARM] T+0.6s keyboardShown=%d wxkb_plugin_running=%d",
                   gKbdDidShow, KbdProcRunning());
+            KbdReportOkIfRunning("T+0.6s");          // v1.9.42：成功立刻回报 daemon
             if (!gKbdDidShow) KbdWarmRetryTick(1);   // v1.9.39：不弹就重试
         });
 
@@ -513,6 +542,58 @@ static void KbdWarmupRun(NSString *reason) {
             SBLog(@"[KBDWARM] ===== end =====");
         });
     });
+}
+
+// ===== v1.9.42：把系统键盘窗口藏掉（让桌面预热变"无头"）=====
+// 老板实测：微信前台时看不到闪（SB 的键盘在 App 层下面），但**桌面能看到键盘弹出**。
+// 目标：键盘照常被系统创建（扩展才会 spawn），但窗口 alpha 置 0 -> 屏幕上看不到。
+// 注意三点：
+//  1) 只用 alpha，不设 hidden —— hidden 会让系统认为键盘没显示，扩展可能立刻退出；
+//  2) 只在 DidShow 后极短窗口内藏（20/60ms 各补一次），尽量赶在弹起动画可见前；
+//  3) **必须还原**（resign 之后 / DidHide 时），否则以后真用键盘也会是隐形的。
+static BOOL KbdIsKeyboardWindow(UIWindow *w) {
+    NSString *cn = NSStringFromClass([w class]);
+    return [cn containsString:@"KeyboardWindow"];      // UIRemoteKeyboardWindow(_Hosted)
+}
+
+static NSArray *KbdKeyboardWindows(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    UIApplication *app = [UIApplication sharedApplication];
+    NSMutableArray *all = [NSMutableArray array];
+    for (UIScene *s in app.connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) {
+            [all addObjectsFromArray:((UIWindowScene *)s).windows];
+        }
+    }
+    [all addObjectsFromArray:app.windows];
+    for (UIWindow *w in all) {
+        if (KbdIsKeyboardWindow(w)) [out addObject:w];
+    }
+    return out;
+}
+
+static void KbdSetKeyboardWindowsAlpha(CGFloat alpha, const char *tag) {
+    for (UIWindow *w in KbdKeyboardWindows()) {
+        if (w.alpha == alpha) continue;   // 已经是目标值，不重复写日志
+        w.alpha = alpha;
+        SBLog(@"[KBDHIDE] %s -> %s alpha=%.0f", tag, object_getClassName(w), alpha);
+    }
+}
+
+// ===== v1.9.42：拉起成功立即回报 daemon =====
+// 设备实测（2026-11-06 12:24:12）：daemon 只在 15s tick 上采一次样，却用 12s
+// 做判定窗口 —— SpringBoard 明明在 T+0.6s 就已经把扩展拉起来了（日志
+// running=1），但下一次采样时进程刚被再次杀掉，于是被判 FAILED 并锁 45s，
+// 老板看到的就是"第二次之后不重启"。改成 SB 侧成功即回报，判定不靠采样：
+extern uint32_t notify_post(const char *name);
+static BOOL gKbdOkPosted = NO;
+
+static void KbdReportOkIfRunning(const char *tag) {
+    if (gKbdOkPosted) return;
+    if (!KbdProcRunning()) return;
+    gKbdOkPosted = YES;
+    uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup.ok");
+    SBLog(@"[KBDWARM] report OK -> daemon (%s) st=%u", tag, st);
 }
 
 // ===== v1.9.40：UIKit 键盘私有 API 探测（只读，不改任何状态）=====
@@ -607,8 +688,10 @@ static NSString *KbdAppexPath(void) {
             NSArray *exes = [fm contentsOfDirectoryAtPath:plugins error:nil];
             for (NSString *e in exes) {
                 if (![e hasSuffix:@".appex"]) continue;
-                if ([e.lowercaseString containsString:@"wxkb"] ||
-                    [e.lowercaseString containsString:@"keyboard"]) {
+                // v1.9.42：必须锁定 wetype 的键盘扩展。v1.9.41 用
+                // containsString:@"keyboard" 直接撞到"百度输入法.app/PlugIns/
+                // com.baidu.inputMethod.keyboard.appex"，浪费一轮实测。
+                if ([e.lowercaseString containsString:@"wxkb"]) {
                     return [plugins stringByAppendingPathComponent:e];
                 }
             }

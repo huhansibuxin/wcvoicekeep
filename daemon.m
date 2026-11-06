@@ -63,6 +63,10 @@ extern uint32_t notify_register_dispatch(const char *name, int *out_token,
                                          dispatch_queue_t queue, void (^handler)(int));
 extern uint32_t notify_get_state(int token, uint64_t *state);
 
+// v1.9.42：事件驱动键盘扩展看护（定义在后，注册处先声明）
+static void armKbdProcWatch(void);
+static void onKbdWarmupOk(void);
+
 #define SBS_PATH "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices"
 
 // ===== 配置 =====
@@ -72,6 +76,9 @@ static const char    *const kTriggerName = "com.wcvoicekeep.pip.trigger"; // 与
 static const char    *const kPipBuiltName = "com.wcvoicekeep.pip.built";  // dylib->daemon：PiP 已建
 static const int    kBootDelaySec     = 1;        // v1.9.20：1s（原 3s），注销后尽早开始预热
 static const int    kCheckIntervalSec = 60;       // 守护轮询
+// v1.9.42：键盘扩展专用轮询间隔。15s 太慢（老板实测第三次杀后等很久），
+// 5s 让"被杀 -> 发现 -> 拉起"控制在 ~6s 内；检查只是 sysctl 快照，不写盘。
+static const int    kKbdPollSec       = 5;
 static const int    kFastRetrySec     = 5;        // 预热快循环间隔（锁屏期重试）
 static const int    kPipWaitTimeoutSec = 15;      // 等 dylib 报 pip.built 超时
 static const int    kKillStaleSec     = 25;       // 进程在跑但迟迟无 pip.built -> kill 重试（锁屏僵尸）
@@ -447,6 +454,20 @@ static void registerNotifs(void) {
             });
         }
     });
+    // v1.9.42：键盘扩展事件通道（SpringBoard 观察到键盘出现 / 拉起成功时发）
+    static int kbdUpToken = 0;
+    notify_register_dispatch("com.wcvoicekeep.kbd.up",
+                             &kbdUpToken,
+                             kbdEventQueue(), ^(int t) {
+        LOG(@"kbd.up received -> arm proc watch");
+        armKbdProcWatch();
+    });
+    // v1.9.42：SpringBoard 拉起成功回报
+    notify_register_dispatch("com.wcvoicekeep.kbd.warmup.ok", &gKbdOkToken,
+                             kbdEventQueue(), ^(int t) {
+        onKbdWarmupOk();
+        armKbdProcWatch();
+    });
     LOG(@"notifs registered (pip.built + hasBlankedScreen + lockstate)");
 }
 
@@ -586,7 +607,79 @@ static BOOL   gKbdStartupLogged = NO;
 // 但旧代码无论成败都锁死 300s，导致老板"第一次能重启、后面杀掉再也不重启"。
 static time_t gKbdPendAt = 0;         // 已发预热请求、等待结果的时刻（0=无待定）
 static time_t gKbdLastSkipLog = 0;
-static const time_t kKbdFailCooldownSec = 45;   // 失败后仅冷却 45s，15s tick 内很快会再试
+static const time_t kKbdFailCooldownSec = 45;   // 失败后仅冷却 45s，20s 待定窗口后很快会再试
+
+// v1.9.42：拉起成功由 SpringBoard 主动回报，不再靠"下一次采样是否看到进程"。
+// 设备实测（12:24:12）正是因为采样窗口与真实拉起时刻错位，把成功判成 FAILED
+// 并锁 45s —— 老板看到的现象就是"第三次杀掉很久才拉起"。
+static int gKbdOkToken = 0;
+static void onKbdWarmupOk(void) {
+    LOG(@"kbd warmup OK reported by SpringBoard -> 成功, 冷却清零");
+    gKbdPendAt = 0;
+    gKbdCooldownUntil = 0;
+    gKbdEverSeen = YES;
+    gKbdLastRunning = YES;
+}
+
+// ===== v1.9.42：键盘扩展退出**事件监听**（老板要求：事件驱动，不要轮询）=====
+// 原理：dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, pid, DISPATCH_PROC_EXIT)
+// 由内核在进程退出那一刻回调，不需要任何定时器/sysctl 轮询。
+// 流程：SpringBoard 观察到键盘 DidShow（扩展必然已 spawn）或拉起成功 -> 发
+// com.wcvoicekeep.kbd.up -> daemon 取当前 pid 挂监视 -> 进程一退出立刻回调
+// -> 等 1.2s（留出系统回收时间）-> 发预热请求 -> SB 拉起 -> 又发 kbd.up
+// -> 重新挂监视，闭环。全程零轮询。
+static dispatch_source_t gKbdProcSrc = NULL;
+static int gKbdWatchedPid = 0;
+
+static dispatch_queue_t kbdEventQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("com.wcvoicekeep.kbdevent", NULL); });
+    return q;
+}
+
+static void armKbdProcWatch(void) {
+    int pid = procPid("wxkb_plugin");
+    if (pid <= 0) { LOG(@"kbd watch: ext absent -> 先不挂监视，等 kbd.up / 兜底自检"); return; }
+    if (gKbdProcSrc && pid == gKbdWatchedPid) return;      // 已挂在同一个 pid 上
+    if (gKbdProcSrc) { dispatch_source_cancel(gKbdProcSrc); gKbdProcSrc = NULL; }
+
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC,
+                                                   (uintptr_t)pid,
+                                                   DISPATCH_PROC_EXIT,
+                                                   kbdEventQueue());
+    if (!src) { LOG(@"kbd watch: dispatch_source_create failed pid=%d", pid); return; }
+
+    dispatch_source_set_event_handler(src, ^{
+        unsigned long data = dispatch_source_get_data(src);
+        LOG(@"kbd ext (pid=%d) EXIT EVENT (data=0x%lx) -> 1.2s 后拉起", pid, data);
+        gKbdWatchedPid = 0;
+        gKbdLastRunning = NO;
+        if (gKbdProcSrc) { dispatch_source_cancel(gKbdProcSrc); gKbdProcSrc = NULL; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       kbdEventQueue(), ^{
+            if (procExists("wxkb_plugin")) {
+                LOG(@"kbd 已在跑(用户自己弹了键盘?) -> 重新挂监视");
+                armKbdProcWatch();
+                return;
+            }
+            if (gLocked) { LOG(@"kbd 退出但锁屏 -> 等解锁(解锁事件会再触发)"); return; }
+            if (time(NULL) < gKbdCooldownUntil) {
+                LOG(@"kbd 退出但冷却中 -> 跳过（%lds 后兜底自检会重试）",
+                    (long)(gKbdCooldownUntil - time(NULL)));
+                return;
+            }
+            LOG(@"kbd ext MISSING (exit event) -> ask SpringBoard to issue a keyboard request");
+            uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup");
+            LOG(@"kbd warmup notify posted -> %u (0=ok)", st);
+            gKbdPendAt = time(NULL);
+        });
+    });
+    dispatch_resume(src);
+    gKbdProcSrc = src;
+    gKbdWatchedPid = pid;
+    LOG(@"kbd watch ARMED on pid=%d (event-driven, 无轮询)", pid);
+}
 
 static void watchKeyboardExtension(void) {
     BOOL running = procExists("wxkb_plugin");
@@ -599,6 +692,8 @@ static void watchKeyboardExtension(void) {
         gKbdLastRunning = YES;
         gKbdEverSeen = YES;
         gKbdCooldownUntil = 0;   // v1.9.39：成功即清零，下次被杀可立刻再拉
+        // v1.9.42：确保退出事件监视挂在当前 pid 上（幂等，同 pid 直接返回）
+        armKbdProcWatch();
         return;
     }
     if (gKbdLastRunning) {
@@ -629,8 +724,10 @@ static void watchKeyboardExtension(void) {
     // 只锁 45s；15s tick 下最多 1 分钟内会再试，不会像旧版那样锁死 5 分钟。
     time_t now = time(NULL);
     if (gKbdPendAt) {
-        if (now - gKbdPendAt < 12) return;             // 还在等结果
-        LOG(@"kbd warmup FAILED (12s 内未拉起) -> cooldown %lds", (long)kKbdFailCooldownSec);
+        // v1.9.42：待定窗口 12s -> 20s。旧值比采样间隔还短，采样点一错位就误判失败。
+        // 正常路径已由 SpringBoard 的 OK 回报瞬间收尾，这里只是兜底超时。
+        if (now - gKbdPendAt < 20) return;             // 还在等结果
+        LOG(@"kbd warmup FAILED (20s 内未收到成功回报) -> cooldown %lds", (long)kKbdFailCooldownSec);
         gKbdPendAt = 0;
         gKbdCooldownUntil = now + kKbdFailCooldownSec;
         return;
@@ -1201,18 +1298,23 @@ int main(int argc, char *argv[]) {
         // 兜底：循环结束还没拉过微信就补拉（防 2min 全在锁屏且 30s 点恰好没到）
         maybeWarmWechat();
 
+        // v1.9.42：进入事件驱动看护 —— 立刻在现有 wxkb_plugin pid 上挂退出事件监视。
+        // 若此刻扩展不在（常见：开机后还没用过键盘），watchKeyboardExtension 会在
+        // 首次自检时补一次预热，拉起后 SB 会发 kbd.up 让我们挂上监视。
+        @autoreleasepool { armKbdProcWatch(); }
+
         // 守护循环（v1.9.10 老板拍板 + v1.9.13 PiP 失效检测）：
         //  - wetype：解锁态死了/僵尸 -> kill+重拉；活着但被系统挂起（suspend_count>0，
         //    微信视频 PiP 顶掉保活凭证）-> PiP 失效 -> 择机重拉（锁屏等解锁/有音频不拉/5min 冷却）
         //  - 微信：被杀就无头拉（不管锁屏/息屏，无 UI 无打扰），120s 节流
         while (1) {
-            // v1.9.36：原有 60s 主 tick 拆成 4 段 15s，每段只跑一次键盘扩展检查。
-            // 这样 wxkb_plugin 被内存压力杀掉后，最迟 15s 内就会被发现并拉回，
-            // 而不是等满 60s。检查本身只是 sysctl 进程快照，无磁盘写、无定时器。
-            for (int _kb = 0; _kb < 4; _kb++) {
-                sleep(kCheckIntervalSec / 4);
-                @autoreleasepool { watchKeyboardExtension(); }
-            }
+            // v1.9.42：键盘扩展改为**事件驱动**（老板要求，不用轮询）：
+            // 见 armKbdProcWatch() —— 用 DISPATCH_SOURCE_TYPE_PROC +
+            // DISPATCH_PROC_EXIT 直接监听 wxkb_plugin 进程退出事件，内核回调，
+            // 零 sysctl 轮询、零定时器。这里只保留 60s 一次的兜底自检
+            //（正常路径根本走不到，仅防止"漏挂监视"导致永久失联）。
+            sleep(kCheckIntervalSec);
+            @autoreleasepool { watchKeyboardExtension(); }
             @autoreleasepool {
                 watchWechat(); // 微信看护优先（老板要求：微信也要能拉起来）
 
