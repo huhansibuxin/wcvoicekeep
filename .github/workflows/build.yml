@@ -15,9 +15,12 @@ concurrency:
 jobs:
   build:
     name: build (${{ matrix.variant }}-${{ matrix.flavor }})
-    # 老板要求：改用 macOS 英特尔（x86_64）机器 —— macos-15/14 都是 Apple Silicon，
-    # 夜间排队严重、机器池小不够用；macos-13 是 Intel 池，可用机器更多。
-    runs-on: macos-13
+    # 老板要求：改用 macOS 英特尔（x86_64）机器 —— macos-14/15 都是 Apple Silicon（M1 3 核），
+    # 夜间机器池小、排队严重；Intel 池是 4 核 14GB，机器更多。
+    # ⚠️ 必须写 macos-15-intel：GitHub 现役 Intel 标签只有 macos-15-intel / macos-26-intel。
+    #    macos-13 早已从官方 runner 表格下线（macos-14 也挂了 deprecated 标记），
+    #    用 macos-13 会一直 queued 等到 24h 超时——v2.0.10 就踩了这个坑。
+    runs-on: macos-15-intel
     strategy:
       fail-fast: false
       matrix:
