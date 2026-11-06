@@ -73,7 +73,7 @@ static void SBLog(NSString *fmt, ...) {
 //   通道 1  open/write  —— 原始文件（保留，若沙盒放行最直观）
 //   通道 2  CFPreferences —— SB 必然有权写自己的 prefs domain
 //   通道 3  Darwin 通知 —— 由 root 的 wcvoicekeep daemon 收到后落盘（必定成功）
-#define WCVK_BUILD_TAG "v1.9.39-roothide"
+#define WCVK_BUILD_TAG "v1.9.40-roothide"
 
 // 通道 3：Darwin 通知（名字区分阶段，daemon 侧监听后写自己的日志）
 static void WCVKPostNotify(const char *name) {
@@ -210,13 +210,59 @@ static BOOL KbdProcRunning(void) {
     return found;
 }
 
-// 取 SpringBoard 当前前台激活的 windowScene（iOS 16 建 window 需要 scene）
+// 取 SpringBoard 真正"有显示"的 windowScene（iOS 16 建 window 需要 scene）
+//
+// v1.9.40 关键修正（前 8 次全失败的疑似根因）：
+//   SpringBoard 有 3 个 UIWindowScene：SBWindowScene（真正承载桌面/App 的）、
+//   SBSystemApertureWindowScene、SBSystemApertureCurtainWindowScene。
+//   后两个是"灵动岛/刘海"辅助 scene，也是 UIWindowScene 子类。旧代码只看
+//   activationState==ForegroundActive 就返回第一个命中的 —— connectedScenes 是
+//   无序集合，很可能一开始就选中 Aperture/Curtain scene。
+//   把窗口建在那种 scene 上：窗口 isKeyWindow 可以为 1、textfield 也能成为
+//   firstResponder（日志正是这样：isKeyWindow=1 / isFirstResponder=1），
+//   但那个 scene 根本没有正常显示层，系统永远不会为它发起键盘请求
+//   -> keyboardShown 恒 0。与实测日志完全吻合。
+// 新顺序：① key window 所属 scene（一定是有显示的那个）
+//        ② 窗口里含 HomeScreen/Switcher/CoverSheet/Main 字样的 scene
+//        ③ 兜底：任意 active UIWindowScene，但排除 Aperture/Curtain
+static NSString *KbdSceneTag(UIWindowScene *s) {
+    if (!s) return @"nil";
+    NSMutableString *m = [NSMutableString stringWithFormat:@"%s(%lu windows:",
+                          NSStringFromClass([s class]).UTF8String,
+                          (unsigned long)s.windows.count];
+    for (UIWindow *w in s.windows) {
+        [m appendFormat:@" %s", NSStringFromClass([w class]).UTF8String];
+    }
+    [m appendString:@")"];
+    return m;
+}
+
 static UIWindowScene *KbdWarmScene(void) {
-    for (UIScene *s in [[UIApplication sharedApplication] connectedScenes]) {
-        if ([s isKindOfClass:[UIWindowScene class]] &&
-            s.activationState == UISceneActivationStateForegroundActive) {
-            return (UIWindowScene *)s;
+    UIApplication *app = [UIApplication sharedApplication];
+
+    // ① SpringBoard 当前 key window 所属 scene
+    UIWindow *kw = app.keyWindow;
+    if (kw && kw.windowScene) return kw.windowScene;
+
+    // ② 含真实 UI 窗口的 scene
+    for (UIScene *s in app.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)s).windows) {
+            NSString *cn = NSStringFromClass([w class]);
+            if ([cn containsString:@"HomeScreen"] || [cn containsString:@"Switcher"] ||
+                [cn containsString:@"CoverSheet"] || [cn containsString:@"Main"]) {
+                return (UIWindowScene *)s;
+            }
         }
+    }
+
+    // ③ 兜底：排除 Aperture / Curtain
+    for (UIScene *s in app.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        if (s.activationState != UISceneActivationStateForegroundActive) continue;
+        NSString *cn = NSStringFromClass([s class]);
+        if ([cn containsString:@"Aperture"] || [cn containsString:@"Curtain"]) continue;
+        return (UIWindowScene *)s;
     }
     return nil;
 }
@@ -386,6 +432,7 @@ static void KbdWarmupRun(NSString *reason) {
             gKbdWarmBusy = NO;
             return;
         }
+        SBLog(@"[KBDWARM] host scene = %@", KbdSceneTag(scene));
 
         // v1.9.36 关键修正（v1.9.33/34 失败的根因）：
         // 上一版为了"不干扰"设了 windowLevel = Normal-1 且不 makeKeyAndVisible，
@@ -415,8 +462,12 @@ static void KbdWarmupRun(NSString *reason) {
         [w.rootViewController.view addSubview:tf];
         BOOL became = [tf becomeFirstResponder];
         BOOL attached = tf.isFirstResponder;
-        SBLog(@"[KBDWARM] becomeFirstResponder=%d isFirstResponder=%d isKeyWindow=%d",
-              became, attached, (int)w.isKeyWindow);
+        // v1.9.40：把"窗口是否真在显示层"也记下来。isKeyWindow=1 只说明在
+        // 自己的 scene 里是 key；若 w.hidden=1 或 tf.window=nil，说明窗口根本
+        // 没进显示的窗口层级，键盘当然不会被请求。
+        SBLog(@"[KBDWARM] becomeFirstResponder=%d isFirstResponder=%d isKeyWindow=%d hidden=%d alpha=%.1f tf.window=%d tf.superview=%d",
+              became, attached, (int)w.isKeyWindow, (int)w.hidden, w.alpha,
+              tf.window != nil, tf.superview != nil);
 
         gKbdWarmWindow = w;
         gKbdWarmField = tf;
@@ -462,6 +513,77 @@ static void KbdWarmupRun(NSString *reason) {
             SBLog(@"[KBDWARM] ===== end =====");
         });
     });
+}
+
+// ===== v1.9.40：UIKit 键盘私有 API 探测（只读，不改任何状态）=====
+// 为什么探：程序化弹键盘 8/8 失败后，剩下唯一"真无头"的可能就是
+// 直接命令 keyboard arbiter 预热/分配键盘（不需要任何 UI）。但 arbiter 的
+// 入口签名是私有的、iOS 16 与老资料不一定一致，盲写必错。
+// 所以先把 SpringBoard 进程里所有 Keyboard* 相关类的方法签名 dump 出来看。
+// 触发：wcvoicekeep --kbd-api-probe （daemon 发 com.wcvoicekeep.kbd.probe）
+static void KbdApiProbe(void) {
+    const char *path = "/var/mobile/wcvk_kbdapi.log";
+    FILE *fp = fopen(path, "w");
+    if (!fp) return;
+    setvbuf(fp, NULL, _IONBF, 0);          // 无缓冲：即使进程崩，已写内容也不丢
+
+    fprintf(fp, "=== kbd api probe build=v1.9.40 pid=%d ===\n", getpid());
+
+    static const char *keys[] = {
+        "KeyboardArbiter", "KeyboardArbitration", "KeyboardScene", "KeyboardState",
+        "KeyboardAutomatic", "KeyboardImpl", "KeyboardWindow", "KeyboardLayout",
+        "KeyboardHost", "InputMode", "TextInput", "PKHost", "PKManager"
+    };
+    const int keyCount = (int)(sizeof(keys) / sizeof(keys[0]));
+
+    unsigned int nClasses = 0;
+    Class *classes = objc_copyClassList(&nClasses);
+    fprintf(fp, "total classes = %u\n", nClasses);
+    if (!classes) { fclose(fp); return; }
+
+    int hit = 0;
+    for (unsigned int i = 0; i < nClasses; i++) {
+        Class c = classes[i];
+        const char *cn = class_getName(c);
+        if (!cn) continue;
+        BOOL match = NO;
+        for (int k = 0; k < keyCount; k++) {
+            if (strstr(cn, keys[k])) { match = YES; break; }
+        }
+        if (!match) continue;
+        hit++;
+
+        Class sup = class_getSuperclass(c);
+        fprintf(fp, "\n### %s : %s\n", cn, sup ? class_getName(sup) : "-");
+
+        // 只 dump 本类自己实现的方法（不含继承），避免刷屏
+        unsigned int mc = 0;
+        Method *ims = class_copyMethodList(c, &mc);
+        for (unsigned int j = 0; j < mc && j < 160; j++) {
+            fprintf(fp, "  - %s  %s\n", sel_getName(method_getName(ims[j])),
+                    method_getTypeEncoding(ims[j]) ?: "");
+        }
+        if (ims) free(ims);
+
+        Class meta = object_getClass((id)c);
+        unsigned int cmc = 0;
+        Method *cms = meta ? class_copyMethodList(meta, &cmc) : NULL;
+        for (unsigned int j = 0; j < cmc && j < 160; j++) {
+            fprintf(fp, "  + %s  %s\n", sel_getName(method_getName(cms[j])),
+                    method_getTypeEncoding(cms[j]) ?: "");
+        }
+        if (cms) free(cms);
+    }
+    free(classes);
+    fprintf(fp, "\n=== done, matched classes = %d ===\n", hit);
+    fclose(fp);
+    SBLog(@"[KBDAPI] probe done, matched=%d -> /var/mobile/wcvk_kbdapi.log", hit);
+}
+
+static void KbdApiProbeCallback(CFNotificationCenterRef center, void *observer,
+                                CFStringRef name, const void *object,
+                                CFDictionaryRef userInfo) {
+    dispatch_async(dispatch_get_main_queue(), ^{ KbdApiProbe(); });
 }
 
 static void KbdWarmNotifyCallback(CFNotificationCenterRef center, void *observer,
@@ -514,6 +636,13 @@ __attribute__((constructor)) static void SBKeepAliveInit(void) {
                                             CFSTR("com.wcvoicekeep.kbd.warmup.alert"),
                                             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
             SBLog(@"[KBDWARM] darwin notify ....alert registered");
+
+            // v1.9.40：键盘私有 API 探测通道（只读 dump，不改任何状态）
+            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                            NULL, KbdApiProbeCallback,
+                                            CFSTR("com.wcvoicekeep.kbd.probe"),
+                                            NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+            SBLog(@"[KBDAPI] darwin notify com.wcvoicekeep.kbd.probe registered");
         }
     }
 }

@@ -719,6 +719,17 @@ static int kbdAlertTrigger(void) {
     return st == 0 ? 0 : 1;
 }
 
+// v1.9.40：--kbd-api-probe —— 让 SpringBoard 侧 dump 键盘私有 API 签名
+// 目的：程序化弹键盘全失败后，唯一"真无头"希望是直接命令 keyboard arbiter
+// 预热/分配键盘。先 dump 出真实方法签名再决定调哪个，不猜着写。
+static int kbdApiProbeTrigger(void) {
+    uint32_t st = notify_post("com.wcvoicekeep.kbd.probe");
+    fprintf(stderr, "[WCVK-KBDAPI] notify_post(com.wcvoicekeep.kbd.probe) -> %u (0=ok)\n", st);
+    fprintf(stderr, "[WCVK-KBDAPI] 2s 后看 /var/mobile/wcvk_kbdapi.log\n");
+    fflush(stderr);
+    return st == 0 ? 0 : 1;
+}
+
 // v1.9.35：--kbd-warm-test —— 一次跑完给出完整结论的实验
 // 目的：老板要的是「键盘扩展被杀后能否被无头拉起并留存」，而无需反复 SSH 采样。
 // 流程：记录基线 -> post 预热通知（SB 侧建 UIKit 文本框触发键盘请求）
@@ -1139,6 +1150,10 @@ int main(int argc, char *argv[]) {
         // v1.9.38：--pk-hold 用 PKManager 的 hold API 正式尝试持有键盘扩展
         if (strcmp(argv[i], "--pk-hold") == 0) {
             return pkHold();
+        }
+        // v1.9.40：--kbd-api-probe 让 SpringBoard dump 键盘私有 API 签名
+        if (strcmp(argv[i], "--kbd-api-probe") == 0) {
+            return kbdApiProbeTrigger();
         }
     }
 
