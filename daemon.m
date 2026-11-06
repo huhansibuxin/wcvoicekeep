@@ -24,8 +24,15 @@
 #ifndef PROC_PIDPATHINFO_MAXSIZE
 #define PROC_PIDPATHINFO_MAXSIZE 4096
 #endif
+// .xm 按 ObjC++ 编译，C 函数必须 extern "C"，否则链接期符号带 C++ 修饰找不到
+#ifdef __cplusplus
+extern "C" {
+#endif
 extern int proc_listallpids(void *buffer, int buffersize);
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+#ifdef __cplusplus
+}
+#endif
 
 #include <dlfcn.h>
 #include <dispatch/dispatch.h>
