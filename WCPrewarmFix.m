@@ -38,7 +38,7 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.21-roothide"
+#define WCVK_BUILD_TAG "v2.0.22-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC_EXIT 里 kRelaunchDelaySec
                                              // 秒后就会主动再拉，形成「杀-拉-黑」死循环。
@@ -818,27 +818,45 @@ static void WPFSanitizeKnownSceneSessions(void) {
             return;
         }
         NSMutableDictionary *d = (NSMutableDictionary *)pl;
-        NSMutableArray *kill = [NSMutableArray array];
+        NSArray *keys = [d.allKeys copy];
+
+        // ★★ v2.0.22 判据重写（v2.0.21 的「按配置名找 SubScene」是错的，实测从没删过一条）：
+        //   实机证据（03:47~03:49 日志）：磁盘上唯一那条 D6C3661C 的配置名是 **MainScene**，
+        //   可运行时它却被挂成 delegate=MMSubSceneDelegate / MMSubSceneWindow(hidden) ——
+        //   而另一个**临时新 UUID** 的 session 才是 MMMainSceneDelegate / iConsoleWindow。
+        //   也就是说「谁是 main」不是写死在配置名里，而是微信在
+        //   application:configurationForConnectingSceneSession:options: 里动态分的，
+        //   同一个 UUID 这次是 main、下次可能是 sub。
+        //   ⇒ 唯一站得住的判据是**条数**：KnownSceneSessions 里只允许存在 1 条。
+        //     多条 = 每次强杀（CocoaTop/SIGKILL，不走正常退出清理）+ 每次后台重拉
+        //     各留一条，系统启动时按其中一条恢复，命中 sub 就黑屏 —— 条数越多越容易黑。
+        //   做法：挑一条「配置名不是 SubScene」的留下，其余全部删除；若留下的那条本身
+        //     就是 SubScene（磁盘上全是子场景），就一条都不留，让 UIKit 自己重建默认 session。
         NSData *needle = [@"SubScene" dataUsingEncoding:NSUTF8StringEncoding];
-        for (NSString *k in d.allKeys) {
+        NSString *keep = nil;
+        NSMutableArray *kill = [NSMutableArray array];
+        for (NSString *k in keys) {
             id v = d[k];
             BOOL isSub = NO;
             if ([v isKindOfClass:[NSData class]] && [(NSData *)v length]) {
                 NSData *vd = (NSData *)v;
                 isSub = [vd rangeOfData:needle options:0 range:NSMakeRange(0, vd.length)].location != NSNotFound;
             }
-            WPFLog(@"scene-session: 已存在 session %@ → %@", k, isSub ? @"SubScene（删除）" : @"非 SubScene（保留）");
-            if (isSub) [kill addObject:k];
+            BOOL take = (!isSub && keep == nil);
+            WPFLog(@"scene-session: 已存在 session %@ → %@", k,
+                   isSub ? @"SubScene（删）" : (take ? @"保留（唯一）" : @"多余会话（删）"));
+            if (take) keep = k; else [kill addObject:k];
         }
-        if (!kill.count) { WPFLog(@"scene-session: 没有 SubScene 条目，无需处理"); return; }
+        if (!kill.count) { WPFLog(@"scene-session: 只有 1 条且非 SubScene，不动"); return; }
         [d removeObjectsForKeys:kill];
         NSData *out = [NSPropertyListSerialization dataWithPropertyList:d
                                                                  format:NSPropertyListBinaryFormat_v1_0
                                                                 options:0 error:&err];
         if (!out) { WPFLog(@"scene-session: 序列化失败(%@)", err.localizedDescription); return; }
         if ([out writeToFile:path atomically:YES]) {
-            WPFLog(@"scene-session: 已删除 %lu 个 SubScene 会话（原 %lu 字节 → 新 %lu 字节），本次只能新建默认 session",
-                   (unsigned long)kill.count, (unsigned long)raw.length, (unsigned long)out.length);
+            WPFLog(@"scene-session: 已删除 %lu 条多余会话，留下 %@（原 %lu 字节 → 新 %lu 字节）",
+                   (unsigned long)kill.count, keep ?: @"0 条（全是子场景，交给 UIKit 重建）",
+                   (unsigned long)raw.length, (unsigned long)out.length);
         } else {
             WPFLog(@"scene-session: 写回失败（路径 %@）", path);
         }
@@ -882,6 +900,89 @@ static void WPFUnlockMultiScene(void) {
     WPFLog(@"multi-scene: 共命中 %d 个、改写 %d 个（改写 0 个 = 找不到门槛，scene API 仍会被拒）", seen, hacked);
 }
 
+// ============================================================
+// v2.0.22 ③：把「子场景」分支掰回微信主场景（真正对症的一级）
+// ------------------------------------------------------------
+// 实机证据（v2.0.21 日志 03:47:43 / 03:47:55 / 03:48:17 三次黑屏）：
+//   前台 scene → delegate=MMSubSceneDelegate、window=MMSubSceneWindow(hidden)、rootVC=nil、可用=0
+//   主窗口 iConsoleWindow（rootVC=MainTabBarViewController）挂在**另一条** session 上 state=2（后台）
+//   ⇒ 黑屏不是「窗口没了」，是**前台被空子场景占着**，主窗口在后台场景里没资格上屏。
+//   系统级 scene 切换 API 在单场景 App 上一律同步被拒（v2.0.19/20/21 三版实证），
+//   所以只能在**微信决定这条 session 用哪套 delegate 的那一刻**下手：
+//   微信的 -application:configurationForConnectingSceneSession:options: 返回 UISceneConfiguration，
+//   其中的 delegateClass 决定了这条 session 是主场景还是子场景。
+//   hook 它：只要 delegateClass / name 里带 "SubScene"，就换成 MMMainSceneDelegate + "MainScene"，
+//   让微信自己走**原生主界面分支**。
+//   ⚠️ 边界：不自造窗口、不搬 windowScene、不伪造生命周期；用的仍是微信原生
+//      MMMainSceneDelegate + iConsoleWindow + MainTabBarViewController，
+//      只是把「被错分到子场景的那条 session」还原成它本来该有的主场景身份。
+//   找不到 hook 点（微信升级改名）就只打日志、不做任何动作。
+static Class gWPFFallbackMainSceneClass = Nil;
+static IMP   gWPFOrigConfigForConnecting = NULL;
+
+static id WPFConfigForConnecting(id self, SEL _cmd, id app, id session, id options) {
+    id cfg = nil;
+    if (gWPFOrigConfigForConnecting) {
+        cfg = ((id (*)(id, SEL, id, id, id))gWPFOrigConfigForConnecting)(self, _cmd, app, session, options);
+    }
+    @try {
+        if (!cfg) return cfg;
+        NSString *cname = nil;
+        Class dc = Nil;
+        @try { cname = (NSString *)[cfg valueForKey:@"name"]; } @catch (NSException *e) {}
+        @try { dc = (Class)[cfg valueForKey:@"delegateClass"]; } @catch (NSException *e) {}
+        NSString *dcn = dc ? NSStringFromClass(dc) : @"(nil)";
+        NSString *pid = @"?";
+        @try { pid = (NSString *)[session valueForKey:@"persistentIdentifier"]; } @catch (NSException *e) {}
+        BOOL isSub = ([dcn rangeOfString:@"SubScene" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
+                     (cname && [cname rangeOfString:@"SubScene" options:NSCaseInsensitiveSearch].location != NSNotFound);
+        WPFLog(@"scene-config: 分配 session=%@ name=%@ delegate=%@ → %@",
+               pid, cname ?: @"(nil)", dcn, isSub ? @"子场景(要掰回)" : @"主场景(不动)");
+        if (isSub && gWPFFallbackMainSceneClass) {
+            SEL setDC = NSSelectorFromString(@"setDelegateClass:");
+            if ([cfg respondsToSelector:setDC]) {
+                ((void (*)(id, SEL, Class))objc_msgSend)(cfg, setDC, gWPFFallbackMainSceneClass);
+            } else {
+                @try { [cfg setValue:gWPFFallbackMainSceneClass forKey:@"delegateClass"]; } @catch (NSException *e) {}
+            }
+            @try { [cfg setValue:@"MainScene" forKey:@"name"]; } @catch (NSException *e) {}
+            WPFLog(@"scene-config: ★ 已掰回主场景（delegate=%@, name=MainScene）",
+                   NSStringFromClass(gWPFFallbackMainSceneClass));
+        }
+    } @catch (NSException *e) { WPFLog(@"scene-config 异常: %@", e.reason); }
+    return cfg;
+}
+
+static void WPFForceMainScene(void) {
+    Class mainCls = NSClassFromString(@"MMMainSceneDelegate");
+    if (!mainCls) { WPFLog(@"scene-config: 找不到 MMMainSceneDelegate 类，跳过"); return; }
+    gWPFFallbackMainSceneClass = mainCls;
+
+    SEL sel = sel_registerName("application:configurationForConnectingSceneSession:options:");
+    int total = objc_getClassList(NULL, 0);
+    if (total <= 0) { WPFLog(@"scene-config: objc_getClassList 失败"); return; }
+    Class *all = (Class *)malloc(sizeof(Class) * (size_t)total);
+    if (!all) return;
+    total = objc_getClassList(all, (int)total);
+    NSMutableString *hits = [NSMutableString string];
+    int hooked = 0;
+    for (int i = 0; i < total; i++) {
+        Class c = all[i];
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) continue;
+        if (method_getImplementation(m) == (IMP)WPFConfigForConnecting) continue;  // 已被我们自己接管
+        NSString *cn = NSStringFromClass(c);
+        [hits appendFormat:@"%@,", cn];
+        // 只接管 App 自己的实现，UIKit/系统类不碰
+        if ([cn hasPrefix:@"UI"] || [cn hasPrefix:@"_UI"] || [cn hasPrefix:@"NS"]) continue;
+        IMP orig = method_setImplementation(m, (IMP)WPFConfigForConnecting);
+        if (!gWPFOrigConfigForConnecting) gWPFOrigConfigForConnecting = orig;
+        hooked++;
+    }
+    free(all);
+    WPFLog(@"scene-config: 命中实现类 [%@] 已接管 %d 个", hits, hooked);
+}
+
 // ⚠️ 这里必须用 `__attribute__((constructor))`，**不能用 Logos 的 %ctor**（v2.0.15 根因）：
 //   本文件历史上是 .xm + %ctor，编出来的 dylib 是**空壳** —— 实测该产物
 //   __TEXT 段只剩 Mach-O 头（16384B）、__LINKEDIT 仅 1104B、全文件只有 18 个字符串
@@ -909,8 +1010,11 @@ static void WCVKPFInit(void) {
         // ★★ v2.0.21 两件必须在这里做的事（ctor 早于 UIApplicationMain）：
         //   ① 把持久化的 SubScene 场景会话从磁盘删掉 —— UIKit 还没读，删了就不会被恢复/激活
         //   ② 绕开「不支持多个场景」门槛 —— 否则后面的 scene API 全在门口被拒
+        // ★★ v2.0.22 ③ 必须在 ctor 里（早于第一个 scene 连接）：接管
+        //   application:configurationForConnectingSceneSession:options:，把子场景掰回主场景
         WPFSanitizeKnownSceneSessions();
         WPFUnlockMultiScene();
+        WPFForceMainScene();
 
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         [nc addObserverForName:UIApplicationDidFinishLaunchingNotification

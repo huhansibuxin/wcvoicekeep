@@ -489,6 +489,14 @@ static int WCVKHeadlessLaunch(NSString *bid) {
 // ===== 目标（事件驱动看护）=====
 static const char *kKbdExtSuffix    = "/wxkb_plugin.appex/wxkb_plugin";
 static const int  kRelaunchDelaySec = 1;     // 事件 -> 拉起前等 1s（尊重系统回收动作）
+// ★ v2.0.22 短命退出退避（老板 2026-11-07 实测：「用 CocoaTop 杀掉微信后就一直黑屏」）
+//   实机证据：03:43:43~03:49:16 共 5.5 分钟里微信被拉起 25 次，平均 13 秒一轮 ——
+//   headless 拉起 → willEnterForeground(首次) → 1s 后检查 → didEnterBackground → 进程死 → 1s 再拉。
+//   每轮都会在 KnownSceneSessions 里留下一条 session，越滚越乱，系统恢复命中子场景就黑屏；
+//   而且用户此刻点开微信，撞上的是刚被拉起、还没稳定的半死进程 → 「直接进微信动不了」。
+//   ⇒ 存活 < kShortLifeSec 的退出算「短命」，连击按指数退避，彻底断掉这个风暴。
+static const int  kShortLifeSec     = 60;
+static const int  kShortLifeDelay[] = {1, 5, 15, 60, 300};   // 索引 = shortLives-1，超出取末位
 static const int  kFailCooldownSec  = 45;    // App 拉起失败后冷却，避免死循环
 static const int  kKbdDebounceSec   = 3;     // 键盘扩展只防抖 3s：拉起成功后必须能立刻再拉
 static const int  kArmRetrySecs[]   = {2, 5, 10, 20, 40};  // 拉起后找 pid 挂监视的重试点
@@ -504,6 +512,8 @@ static const int  kFuseFailLimit    = 3;
 @property (nonatomic, assign) time_t lastRelaunch;
 @property (nonatomic, assign) int fails;
 @property (nonatomic, assign) BOOL disabled;     // v2.0.6：连续失败熔断，摘掉不再看护
+@property (nonatomic, assign) time_t armedAt;    // v2.0.22：本次挂上监视（=进程被发现）的时间
+@property (nonatomic, assign) int shortLives;    // v2.0.22：连续「短命退出」次数（存活 < kShortLifeSec）
 @property (nonatomic, strong) dispatch_source_t src;
 @end
 
@@ -618,6 +628,7 @@ static void WCVKArmPid(WCVKTarget *t, int pid) {
     if (t.src) { dispatch_source_cancel(t.src); t.src = nil; }
     if (pid <= 0) return;
     t.pid = pid;
+    t.armedAt = time(NULL);   // v2.0.22：记下「第一次看到这个 pid」的时间，用于算存活时长
     dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t)pid,
                                                    DISPATCH_PROC_EXIT, WCVKQueue());
     if (!src) return;
@@ -625,10 +636,31 @@ static void WCVKArmPid(WCVKTarget *t, int pid) {
     dispatch_source_set_event_handler(src, ^{
         WCVKTarget *st = wt;
         if (!st) return;
-        LOG(@"### %@ (pid=%d) EXIT EVENT -> %ds 后拉起", st.display, st.pid, kRelaunchDelaySec);
+        // v2.0.22：短命退出识别 + 指数退避（只对 App；键盘扩展必须保持 1s 立刻重拉）
+        time_t life = (st.armedAt > 0) ? (time(NULL) - st.armedAt) : -1;
+        int delay = kRelaunchDelaySec;
+        if ([st.kind isEqualToString:@"app"] && life >= 0 && life < kShortLifeSec) {
+            st.shortLives++;
+            int n = (int)(sizeof(kShortLifeDelay) / sizeof(kShortLifeDelay[0]));
+            int idx = st.shortLives - 1; if (idx >= n) idx = n - 1;
+            delay = kShortLifeDelay[idx];
+            LOG(@"### %@ (pid=%d) 短命退出：只活了 %lds，连击 %d 次 -> 退避 %ds 再拉起",
+                st.display, st.pid, (long)life, st.shortLives, delay);
+            if (st.shortLives == 2)
+                WCVKRecord(st.display, st.ident, st.kind, NO,
+                           [NSString stringWithFormat:
+                            @"%@ 连续短命退出（每次只活十几秒），已退避 %ds，避免重启风暴",
+                            st.display, delay]);
+        } else {
+            if (st.shortLives > 0)
+                LOG(@"### %@ 这次活了 %lds -> 短命计数清零（原连击 %d 次）",
+                    st.display, (long)life, st.shortLives);
+            st.shortLives = 0;
+        }
+        st.armedAt = 0;
         st.pid = 0;
         if (st.src) { dispatch_source_cancel(st.src); st.src = nil; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRelaunchDelaySec * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                        WCVKQueue(), ^{
             WCVKDoRelaunch(st);
             WCVKArmTarget(st, 0);   // 拉起后重新挂监视
