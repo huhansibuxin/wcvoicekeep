@@ -38,7 +38,7 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.15-roothide"
+#define WCVK_BUILD_TAG "v2.0.16-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = YES;   // L1~L4 全失败时 exit(0) 兜底
 static double const kWPFCheckDelay  = 1.0;   // 首次前台激活后多久检查
@@ -49,6 +49,7 @@ static BOOL gWasHeadless   = NO;   // 本次进程是后台无头启动的
 static BOOL gHandled       = NO;   // 已经做过一次检查/修复
 static BOOL gEnteredFG     = NO;   // 已经进过前台
 static int  gRepairLevel   = 0;    // 实际生效的修复级别（0=没修）
+static int  gCheckRetries  = 0;    // 非 Active 态复查次数（v2.0.16）
 
 // ===== 日志（v2.0.14）=====
 // 老板连续三次反馈「日志还是没有」。照 wctweak 的 WCPLLogger 对比，我旧版差在三个地方：
@@ -86,10 +87,14 @@ static void WPFMkdirParents(const char *path) {
     mkdir(dir, 0755);
 }
 
-static const char *WPFLogPath(void) {
-    if (gLogPath[0]) return gLogPath;
+// v2.0.16：探测和写入合并 —— 旧版单独 open(O_CREAT) 探测会在每个候选位置留下 0K 空文件，
+// 老板看到「三个地方都有日志但都是 0K」就是这些占位文件造成的误会（真正的内容全在主通道里）。
+// 现在只有「open 成功 → 立刻写入当前这行」才算数，失败的候选一个文件都不留。
+static char gCand[10][PATH_MAX];
+static int  gCandN = 0;
 
-    char cand[10][PATH_MAX];
+static void WPFPrepareCandidates(void) {
+    if (gCandN > 0) return;
     int n = 0;
 
     // HOME 优先，拿不到再退回 getenv（两条都记下来，方便排查沙盒根异常）
@@ -103,36 +108,26 @@ static const char *WPFLogPath(void) {
 
     if (home && home[0]) {
         // ① 主通道：Application Support（微信不扫、系统低存储时也不清）
-        snprintf(cand[n++], PATH_MAX, "%s/Library/Application Support/WCVK/wcprewarm.log", home);
+        snprintf(gCand[n++], PATH_MAX, "%s/Library/Application Support/WCVK/wcprewarm.log", home);
         // ② 常用位置
-        snprintf(cand[n++], PATH_MAX, "%s/Documents/wcprewarm.log", home);
-        snprintf(cand[n++], PATH_MAX, "%s/tmp/wcprewarm.log", home);
-        snprintf(cand[n++], PATH_MAX, "%s/Library/Caches/wcprewarm.log", home);
-        snprintf(cand[n++], PATH_MAX, "%s/Library/Preferences/wcprewarm.txt", home);
+        snprintf(gCand[n++], PATH_MAX, "%s/Documents/wcprewarm.log", home);
+        snprintf(gCand[n++], PATH_MAX, "%s/tmp/wcprewarm.log", home);
+        snprintf(gCand[n++], PATH_MAX, "%s/Library/Caches/wcprewarm.log", home);
         // ③ 微信自己的日志目录（一定存在）
-        snprintf(cand[n++], PATH_MAX, "%s/Documents/log/wcprewarm.log", home);
+        snprintf(gCand[n++], PATH_MAX, "%s/Documents/log/wcprewarm.log", home);
     }
     @try { tmpNS = NSTemporaryDirectory(); } @catch (NSException *e) {}
     {
         const char *t = tmpNS.length ? tmpNS.fileSystemRepresentation : NULL;
-        if (t && t[0]) snprintf(cand[n++], PATH_MAX, "%s/wcprewarm.log", t);
+        if (t && t[0]) snprintf(gCand[n++], PATH_MAX, "%s/wcprewarm.log", t);
     }
-    snprintf(cand[n++], PATH_MAX, "/var/mobile/wcprewarm.log");   // 沙盒外兜底（一般写不进，聊胜于无）
+    snprintf(gCand[n++], PATH_MAX, "/var/mobile/wcprewarm.log");   // 沙盒外兜底（一般写不进，聊胜于无）
 
-    size_t rl = snprintf(gProbeReport, sizeof(gProbeReport), "home=%s", (home && home[0]) ? home : "(null)");
-    for (int i = 0; i < n; i++) {
-        WPFMkdirParents(cand[i]);
-        int fd = open(cand[i], O_WRONLY | O_CREAT | O_APPEND, 0644);
-        int err = errno;
-        if (fd >= 0) { close(fd); }
-        if (rl < sizeof(gProbeReport) - 200) {
-            const char *tail = strrchr(cand[i], '/');
-            rl += snprintf(gProbeReport + rl, sizeof(gProbeReport) - rl,
-                           " |%s=%s%d", tail ? tail + 1 : cand[i], fd >= 0 ? "ok/" : "E", fd >= 0 ? 0 : err);
-        }
-        if (fd >= 0 && !gLogPath[0]) strlcpy(gLogPath, cand[i], PATH_MAX);   // 只缓存第一条成功的
-    }
-    return gLogPath[0] ? gLogPath : NULL;
+    for (int i = 0; i < n; i++) WPFMkdirParents(gCand[i]);
+
+    snprintf(gProbeReport, sizeof(gProbeReport), "home=%s",
+             (home && home[0]) ? home : "(null)");
+    gCandN = n;
 }
 
 // 通道 B：CFPreferences（cfprefsd 服务，沙盒 app 写自己容器 Preferences 一定成功）
@@ -150,6 +145,56 @@ static void WPFStoreAppend(const char *line) {
         CFPreferencesSetAppValue(key, (__bridge CFStringRef)nv, appID);
         if (!CFPreferencesAppSynchronize(appID)) sOff = YES;
     } @catch (NSException *e) { sOff = YES; }
+}
+
+static void WPFAppendRaw(const char *path, const char *buf, size_t len) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    close(fd);
+}
+
+// 文件通道：首次调用边走边探测边写，成功后把路径与 probe 结论各记一行，之后走快路径。
+static void WPFWriteFile(const char *line, size_t len) {
+    if (gLogPath[0]) {
+        WPFAppendRaw(gLogPath, line, len);
+        return;
+    }
+    WPFPrepareCandidates();
+    size_t rl = strlen(gProbeReport);
+    for (int i = 0; i < gCandN; i++) {
+        int fd = open(gCand[i], O_WRONLY | O_CREAT | O_APPEND, 0644);
+        int err = errno;
+        if (fd >= 0) {
+            size_t off = 0;
+            while (off < len) {
+                ssize_t w = write(fd, line + off, len - off);
+                if (w <= 0) break;
+                off += (size_t)w;
+            }
+            close(fd);
+            strlcpy(gLogPath, gCand[i], PATH_MAX);
+            if (rl < sizeof(gProbeReport) - 400) {
+                rl += snprintf(gProbeReport + rl, sizeof(gProbeReport) - rl,
+                               " |%s=ok", gCand[i]);
+            }
+            char rep[2600];
+            int n2 = snprintf(rep, sizeof(rep), "log channel: file=%s\nlog probe: %s\n",
+                              gLogPath, gProbeReport);
+            if (n2 > 0) WPFAppendRaw(gLogPath, rep, (size_t)(n2 < (int)sizeof(rep) ? n2 : (int)sizeof(rep) - 1));
+            return;
+        }
+        if (rl < sizeof(gProbeReport) - 400) {
+            const char *tail = strrchr(gCand[i], '/');
+            rl += snprintf(gProbeReport + rl, sizeof(gProbeReport) - rl,
+                           " |%s=E%d", tail ? tail + 1 : gCand[i], err);
+        }
+    }
 }
 
 static void WPFLog(NSString *fmt, ...) {
@@ -180,21 +225,7 @@ static void WPFLog(NSString *fmt, ...) {
     NSLog(@"[WCPrewarm] %s", cbody);
 
     // 通道 A：文件
-    const char *path = WPFLogPath();
-    if (path) {
-        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd >= 0) {
-            size_t off = 0, total = (size_t)len;
-            while (off < total) {
-                ssize_t w = write(fd, line + off, total - off);
-                if (w <= 0) break;
-                off += (size_t)w;
-            }
-            close(fd);
-        } else {
-            gLogPath[0] = 0;   // 路径失效（容器变了/文件被删）→ 下次重试全部候选
-        }
-    }
+    WPFWriteFile(line, (size_t)len);
 
     // 通道 B：CFPreferences（文件全失败也有一条命）
     WPFStoreAppend(line);
@@ -263,6 +294,57 @@ static BOOL WPFWindowAlive(UIWindow *w) {
     return YES;
 }
 
+// ⭐ v2.0.16：结构健康 ≠ 用户能看到画面。
+// v2.0.15 实机日志里 iConsoleWindow 满足全部结构条件（rootVC=MainTabBarViewController、
+// viewInWin=1、hidden=0、alpha=1），alive 判成 1 → 直接 return 不修，可用户看到的就是黑屏。
+// 所以判定必须换成「真的有没有像素」，再补一条「窗口绑的 scene 是不是在台上」。
+static BOOL WPFSceneOnStage(UIWindow *w) {
+    if (!w) return NO;
+    UIWindowScene *ws = w.windowScene;
+    if (!ws) return NO;                                        // 没有 scene → 不可能显示
+    UISceneActivationState st = ws.activationState;
+    if (st == UISceneActivationStateForegroundActive) return YES;
+    if (st == UISceneActivationStateForegroundInactive) return YES;
+    return NO;                                                 // background / unattached → 必然黑
+}
+
+// 离屏快照判黑：把窗口渲染到 16x16，统计"非黑"像素比例。
+// 返回 YES = 判定为黑屏。比例本身也会写进日志，方便人复核（微信深色界面可能天然偏暗，
+// 所以阈值取 3%，且只在 headless 首次进前台时跑一次，不影响日常）。
+static BOOL WPFSnapshotBlank(UIWindow *w) {
+    if (!w || w.bounds.size.width < 1 || w.bounds.size.height < 1) return YES;
+    CGFloat ratio = 0;
+    BOOL rendered = NO;
+    @try {
+        const size_t dim = 16;
+        UIGraphicsBeginImageContextWithOptions(CGSizeMake(dim, dim), YES, 1.0);
+        rendered = [w drawViewHierarchyInRect:CGRectMake(0, 0, dim, dim) afterScreenUpdates:NO];
+        UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        if (rendered && img.CGImage) {
+            CGImageRef cg = img.CGImage;
+            CFDataRef data = CGDataProviderCopyData(CGImageGetDataProvider(cg));
+            if (data) {
+                const UInt8 *px = CFDataGetBytePtr(data);
+                size_t n = (size_t)CFDataGetLength(data);
+                size_t nonzero = 0, total = n / 4;
+                for (size_t i = 0; i + 3 < n; i += 4) {
+                    if (px[i] > 12 || px[i + 1] > 12 || px[i + 2] > 12) nonzero++;
+                }
+                ratio = total ? (CGFloat)nonzero / (CGFloat)total : 0;
+                CFRelease(data);
+            }
+        }
+    } @catch (NSException *e) {
+        WPFLog(@"snapshot 异常: %@", e.reason);
+        return YES;
+    }
+    BOOL blank = (!rendered) || (ratio < 0.03);
+    WPFLog(@"snapshot: rendered=%d 非黑像素=%.1f%% → %@", rendered ? 1 : 0, ratio * 100.0,
+           blank ? @"判定黑屏" : @"有画面");
+    return blank;
+}
+
 // 全量状态 dump（诊断核心：黑屏那一刻微信内部到底是什么样）
 static void WPFDumpState(NSString *tag) {
     UIApplication *app = [UIApplication sharedApplication];
@@ -272,7 +354,7 @@ static void WPFDumpState(NSString *tag) {
 
     NSMutableString *sc = [NSMutableString string];
     for (UIScene *s in app.connectedScenes) {
-        [sc appendFormat:@"%@(state=%ld) ", NSStringFromClass([s class]), (long)s.activationState];
+        [sc appendFormat:@"%p(state=%ld) ", (void *)s, (long)s.activationState];
     }
     WPFLog(@"scenes(%lu): %@", (unsigned long)app.connectedScenes.count, sc.length ? sc : @"(none)");
 
@@ -281,16 +363,17 @@ static void WPFDumpState(NSString *tag) {
     for (UIWindow *w in wins) {
         UIViewController *vc = w.rootViewController;
         NSString *vcs = vc ? NSStringFromClass([vc class]) : @"(nil)";
-        NSString *winScene = w.windowScene ? NSStringFromClass([w.windowScene class]) : @"(nil)";
-        WPFLog(@"  win %@ hidden=%d alpha=%.2f level=%.1f frame=%.0fx%.0f scene=%@ rootVC=%@ viewInWin=%d subviews=%lu",
+        UIWindowScene *ws = w.windowScene;
+        WPFLog(@"  win %@ hidden=%d alpha=%.2f level=%.1f frame=%.0fx%.0f key=%d scene=%p/sceneState=%ld rootVC=%@ viewInWin=%d subviews=%lu",
                NSStringFromClass([w class]), (int)w.isHidden, w.alpha, w.windowLevel,
-               w.bounds.size.width, w.bounds.size.height, winScene, vcs,
-               (vc && vc.view.window == w) ? 1 : 0,
+               w.bounds.size.width, w.bounds.size.height, w.isKeyWindow ? 1 : 0,
+               (void *)ws, ws ? (long)ws.activationState : (long)-1,
+               vcs, (vc && vc.view.window == w) ? 1 : 0,
                (unsigned long)(vc ? vc.view.subviews.count : 0));
     }
     UIWindow *main = WPFMainWindow(app);
-    WPFLog(@"mainWindow=%@ alive=%d", main ? NSStringFromClass([main class]) : @"(nil)",
-           WPFWindowAlive(main) ? 1 : 0);
+    WPFLog(@"mainWindow=%@ alive=%d sceneOnStage=%d", main ? NSStringFromClass([main class]) : @"(nil)",
+           WPFWindowAlive(main) ? 1 : 0, WPFSceneOnStage(main) ? 1 : 0);
     WPFLog(@"---- END %@ ----", tag);
 }
 
@@ -419,14 +502,37 @@ static void WPFRepairChain_(int level) {
 
 static void WPFDoCheck(NSString *reason) {
     UIApplication *app = [UIApplication sharedApplication];
+    // 快照判定必须在 Active 态做：v2.0.15 日志里每次「1s 后检查」时 appState 已经从
+    // Active(0) 掉回 Inactive(1)，这时候离屏渲染本来就是空的，判黑没有意义。
+    if (app.applicationState != UIApplicationStateActive && gCheckRetries < 3) {
+        gCheckRetries++;
+        WPFLog(@"检查(%@): appState=%ld 非 Active，%.1fs 后复查（第 %d 次）",
+               reason, (long)app.applicationState, kWPFRetryDelay, gCheckRetries);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kWPFRetryDelay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ WPFDoCheck(reason); });
+        return;
+    }
+
     UIWindow *w = WPFMainWindow(app);
-    BOOL alive = WPFWindowAlive(w);
-    WPFLog(@"检查(%@): mainWindow=%@ alive=%d", reason,
-           w ? NSStringFromClass([w class]) : @"(nil)", alive ? 1 : 0);
+    BOOL alive  = WPFWindowAlive(w);
+    BOOL staged = WPFSceneOnStage(w);
+    WPFLog(@"检查(%@): mainWindow=%@ alive=%d sceneOnStage=%d appState=%ld", reason,
+           w ? NSStringFromClass([w class]) : @"(nil)", alive ? 1 : 0, staged ? 1 : 0,
+           (long)app.applicationState);
     WPFDumpState(reason);
-    if (alive) return;
-    WPFLog(@"判定黑屏 -> 开始 L1~L4 逐级修复");
-    WPFRepairChain_(1);
+    // 结构健康但 scene 不在台上（或压根没 scene）→ 一定是黑的，先修 scene
+    if (!alive || !staged) {
+        WPFLog(@"判定黑屏（结构/scene）-> 开始 L1~L4 逐级修复");
+        WPFRepairChain_(1);
+        return;
+    }
+    // 结构和 scene 都像样，最后用像素定死：真没画面才动
+    if (WPFSnapshotBlank(w)) {
+        WPFLog(@"判定黑屏（快照无画面）-> 开始 L1~L4 逐级修复");
+        WPFRepairChain_(1);
+        return;
+    }
+    WPFLog(@"界面确认为正常，本次不修");
 }
 
 // ===== 生命周期埋点 =====
@@ -488,9 +594,7 @@ static void WCVKPFInit(void) {
                getenv("HOME") ?: "(null)",
                getenv("ActivePrewarm") ?: "(null)",
                getenv("XPC_SERVICE_NAME") ?: "(null)");
-        const char *lp = WPFLogPath();
-        WPFLog(@"log channel: file=%s", lp ? lp : "(全部候选写不进)");
-        WPFLog(@"log probe: %s", gProbeReport[0] ? gProbeReport : "(未探测)");
+        // log channel / probe 两行由 WPFWriteFile 在首次成功写入时自动补上（含每个候选的 errno）
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
                         object:nil queue:[NSOperationQueue mainQueue]
