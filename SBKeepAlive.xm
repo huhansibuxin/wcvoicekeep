@@ -60,23 +60,59 @@ static void SBLog(NSString *fmt, ...) {
     } @catch (NSException *e) {}
 }
 
-// ===== 加载自证 marker（v1.9.34）=====
-// 目的：区分「dylib 根本没被注入」和「注入了但 SBLog 写文件失败」。
-// 用最原始的 open/write，不依赖 Foundation / NSBundle / NSString，
-// 保证在 constructor 的第一条指令就能留下痕迹。
-// 多路径尝试：任一可写即成功。
-#define WCVK_BUILD_TAG "v1.9.34-roothide"
+// ===== 加载自证（v1.9.35 三通道）=====
+// v1.9.34 教训（老板 CocoaTop 截图铁证）：wetypekeepalive.dylib 确实已被
+// ElleKit 加载进 SpringBoard（地址 1019EC000 可见于映射表），但
+//   /var/mobile/wcvk_sb_marker.txt
+//   /var/mobile/Documents/wcvk_sb_marker.txt
+//   /var/mobile/Library/Logs/wcvk_sb_marker.txt
+//   /var/mobile/wetypekeepalive.log
+// 四个文件一个都没生成 —— 说明不是"dylib 没注入"，而是 SpringBoard 的沙盒
+// 拒绝它在 /var/mobile 下创建文件（root LaunchDaemon 能写，SB 不能）。
+// 故改为三通道并行取证，任一通路成功即可判定 constructor 是否执行：
+//   通道 1  open/write  —— 原始文件（保留，若沙盒放行最直观）
+//   通道 2  CFPreferences —— SB 必然有权写自己的 prefs domain
+//   通道 3  Darwin 通知 —— 由 root 的 wcvoicekeep daemon 收到后落盘（必定成功）
+#define WCVK_BUILD_TAG "v1.9.36-roothide"
+
+// 通道 3：Darwin 通知（名字区分阶段，daemon 侧监听后写自己的日志）
+static void WCVKPostNotify(const char *name) {
+    CFStringRef n = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+    if (!n) return;
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                         n, NULL, NULL, true);
+    CFRelease(n);
+}
+
+// 通道 2：CFPreferences（AnyUser + CurrentUser 双写，覆盖 SB 以 root/mobile 跑的情况）
+static void WCVKPrefsMark(const char *tag) {
+    CFStringRef val = CFStringCreateWithFormat(NULL, NULL,
+                        CFSTR("%s pid=%d ts=%ld build=%s"),
+                        tag, getpid(), (long)time(NULL), WCVK_BUILD_TAG);
+    if (!val) return;
+    const void *users[2] = { kCFPreferencesAnyUser, kCFPreferencesCurrentUser };
+    for (int i = 0; i < 2; i++) {
+        CFPreferencesSetValue(CFSTR("lastLoad"), val, CFSTR("com.wcvoicekeep.sb"),
+                              (CFStringRef)users[i], kCFPreferencesCurrentHost);
+        CFPreferencesAppSynchronize(CFSTR("com.wcvoicekeep.sb"));
+    }
+    CFRelease(val);
+}
+
 static void WCVKMarkerRaw(const char *tag) {
     static const char *paths[] = {
-        "/var/mobile/wcvk_sb_marker.txt",              // 主位置（历史 SBLog 一直可写这里）
-        "/var/mobile/Documents/wcvk_sb_marker.txt",    // 备用：Filza/SSH 都好找
-        "/var/mobile/Library/Logs/wcvk_sb_marker.txt", // 备用：沙盒内 Logs
+        "/var/mobile/wcvk_sb_marker.txt",
+        "/var/mobile/Documents/wcvk_sb_marker.txt",
+        "/var/mobile/Library/Logs/wcvk_sb_marker.txt",
+        "/var/mobile/Library/Caches/wcvk_sb_marker.txt",
+        "/var/mobile/Library/Preferences/wcvk_sb_marker.txt",
         NULL
     };
     char buf[320];
     int n = snprintf(buf, sizeof(buf), "t=%ld pid=%d build=%s tag=%s\n",
                      (long)time(NULL), getpid(), WCVK_BUILD_TAG, tag);
     if (n <= 0) return;
+    // 通道 1：原始文件
     for (int i = 0; paths[i]; i++) {
         int fd = open(paths[i], O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
@@ -84,6 +120,14 @@ static void WCVKMarkerRaw(const char *tag) {
             (void)wr;
             close(fd);
         }
+    }
+    // 通道 2：prefs
+    WCVKPrefsMark(tag);
+    // 通道 3：通知（阶段用不同名字，便于 daemon 区分）
+    if (strcmp(tag, "ctor-enter") == 0) {
+        WCVKPostNotify("com.wcvoicekeep.sb.enter");
+    } else if (strcmp(tag, "ctor-bundleid-ok") == 0) {
+        WCVKPostNotify("com.wcvoicekeep.sb.ready");
     }
 }
 
@@ -211,6 +255,15 @@ static void KbdWarmupRun(NSString *reason) {
         BOOL before = KbdProcRunning();
         SBLog(@"[KBDWARM] ===== start (%@) wxkb_plugin_running_before=%d =====", reason, before);
 
+        // v1.9.36：扩展已经在跑就绝不打扰（不弹键盘、不建窗口）。
+        // 老板明确：扩展平时能一直活着，只有内存压力大才被杀；
+        // 本功能唯一职责 = 发现它不在时把它拉回来。
+        if (before) {
+            SBLog(@"[KBDWARM] skip: wxkb_plugin already running, nothing to do");
+            gKbdWarmBusy = NO;
+            return;
+        }
+
         UIWindowScene *scene = KbdWarmScene();
         if (!scene) {
             SBLog(@"[KBDWARM] ABORT: no foregroundActive UIWindowScene");
@@ -218,47 +271,54 @@ static void KbdWarmupRun(NSString *reason) {
             return;
         }
 
+        // v1.9.36 关键修正（v1.9.33/34 失败的根因）：
+        // 上一版为了"不干扰"设了 windowLevel = Normal-1 且不 makeKeyAndVisible，
+        // 结果 UITextField 虽拿到 firstResponder，但键盘根本没被真正请求
+        // （日志实证：becomeFirstResponder=1 而 wxkb_plugin_running 全程 0）。
+        // 键盘扩展只在「系统真的要显示键盘」时才会被 spawn，所以必须让窗口
+        // 可见 + 成为 key window，键盘才真的弹一次。
         UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
-        w.frame = CGRectMake(-4, -4, 2, 2);
-        w.windowLevel = UIWindowLevelNormal - 1;   // 低于 SB 常规层，尽量不挡界面
+        w.frame = CGRectMake(0, 0, 320, 2);          // 屏幕内、仅 2pt 高，尽量减少视觉干扰
+        w.windowLevel = UIWindowLevelNormal + 1;
         w.rootViewController = [[UIViewController alloc] init];
-        // 记录原 key window，结束后恢复；不调用 makeKeyAndVisible（避免抢可见层）
         gKbdPrevKeyWindow = [[UIApplication sharedApplication] keyWindow];
-        w.hidden = NO;
-        [w makeKeyWindow];
+        [w makeKeyAndVisible];                        // 必须：可见且 key，键盘才会真弹
 
         UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 2, 2)];
         tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autospellCheckingType = UITextSpellCheckingTypeNo;
+        tf.inputAssistantItem.leadingBarButtonGroups = @[];
+        tf.inputAssistantItem.trailingBarButtonGroups = @[];
         [w.rootViewController.view addSubview:tf];
         BOOL became = [tf becomeFirstResponder];
         BOOL attached = tf.isFirstResponder;
-        SBLog(@"[KBDWARM] becomeFirstResponder=%d isFirstResponder=%d (键盘可能闪现约 1.2s)",
-              became, attached);
+        SBLog(@"[KBDWARM] becomeFirstResponder=%d isFirstResponder=%d keyWindow=%@",
+              became, attached, NSStringFromClass([[w class] class]));
 
         gKbdWarmWindow = w;
         gKbdWarmField = tf;
 
-        // 700ms 后看进程是否起来（launchd 拉起 + dyld 加载 56MB 需要时间）
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
+        // 350ms：只留够系统发出键盘请求并 spawn 扩展的时间，然后立刻收掉
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            SBLog(@"[KBDWARM] T+0.7s wxkb_plugin_running=%d", KbdProcRunning());
+            SBLog(@"[KBDWARM] T+0.35s (键盘已弹) wxkb_plugin_running=%d", KbdProcRunning());
         });
 
-        // 1.2s 后撤掉键盘（模拟"收起键盘"），这是关键观察点
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+        // v1.9.36：收键盘（对应"用户收起键盘"），之后扩展应靠已有连接常驻
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            KbdWarmupFinish(@"T+1.2s");
-            SBLog(@"[KBDWARM] T+1.2s after resign wxkb_plugin_running=%d", KbdProcRunning());
+            KbdWarmupFinish(@"T+0.75s");
+            SBLog(@"[KBDWARM] T+0.75s after resign wxkb_plugin_running=%d", KbdProcRunning());
         });
 
-        // 撤掉后 3s / 10s 复检：验证 launchd 是否因无活跃连接把扩展回收
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.2 * NSEC_PER_SEC)),
+        // 复检：验证拉起后能否常驻（老板预期：能一直活，只有内存压力才被杀）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            SBLog(@"[KBDWARM] T+4.2s (resign+3s) wxkb_plugin_running=%d", KbdProcRunning());
+            SBLog(@"[KBDWARM] T+3s (resign+2.3s) wxkb_plugin_running=%d", KbdProcRunning());
         });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(11.2 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(9.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            SBLog(@"[KBDWARM] T+11.2s (resign+10s) wxkb_plugin_running=%d", KbdProcRunning());
+            SBLog(@"[KBDWARM] T+9s (resign+8.3s) wxkb_plugin_running=%d", KbdProcRunning());
             gKbdWarmBusy = NO;
             SBLog(@"[KBDWARM] ===== end =====");
         });
@@ -281,18 +341,14 @@ __attribute__((constructor)) static void SBKeepAliveInit(void) {
 
         // 仅 SpringBoard 内注册键盘预热（其他进程无前台 scene，做了也没用）
         if ([proc isEqualToString:@"com.apple.springboard"]) {
-            // 用公开的 Darwin 通知中心，避免 libnotify 链接依赖
+            // v1.9.36：去掉"注入后 25s 自动跑一次"的诊断触发。
+            // 那会在每次 respring 后都弹一次键盘骚扰老板；改为一律由 daemon
+            // 在发现 wxkb_plugin 不在时才发通知触发。
             CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                             NULL, KbdWarmNotifyCallback,
                                             CFSTR("com.wcvoicekeep.kbd.warmup"),
                                             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
             SBLog(@"[KBDWARM] darwin notify com.wcvoicekeep.kbd.warmup registered");
-
-            // 诊断版：注入 25s 后自动跑一次，装完即可验证
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                KbdWarmupRun(@"auto-25s");
-            });
         }
     }
 }

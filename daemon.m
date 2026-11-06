@@ -368,6 +368,21 @@ static void postTrigger(void) {
 // （gPipUp / gScreenBlank / gWarmupLaunchTs 声明在 warmupForeground 之前）
 
 static void registerNotifs(void) {
+    // v1.9.35：SpringBoard 侧 dylib 加载自证。
+    // 背景：v1.9.34 实测 wetypekeepalive.dylib 确实被 ElleKit 加载进 SB
+    // （CocoaTop 映射表可见），但 SB 沙盒不让它写 /var/mobile/*，
+    // 导致 marker 与 wetypekeepalive.log 全空。故 dylib 侧改为发 Darwin 通知，
+    // 由本 daemon（root，无沙盒）落盘取证。
+    static int sbEnterToken = 0;
+    notify_register_dispatch("com.wcvoicekeep.sb.enter", &sbEnterToken,
+                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
+        LOG(@"SB-TWEAK-LOADED: constructor entered in SpringBoard (dylib 已注入并执行)");
+    });
+    static int sbReadyToken = 0;
+    notify_register_dispatch("com.wcvoicekeep.sb.ready", &sbReadyToken,
+                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
+        LOG(@"SB-TWEAK-READY: constructor finished bundleId check in SpringBoard");
+    });
     // pip.built：走后台队列（main 线程在 sleep 轮询，主队列 block 不会执行）
     static int pipToken = 0;
     notify_register_dispatch(kPipBuiltName, &pipToken,
@@ -549,6 +564,46 @@ static int tfpCheck(int pid) {
     return 0;
 }
 
+// ===== v1.9.36 键盘扩展看护（wxkb_plugin）=====
+// 老板明确的需求（2026-11-06）：
+//   「wxkb 能一直活着，只有内存压力特别高才会把它杀掉，下一次点输入框才有冷启动。
+//     唯一需求就是：杀掉后让我们的插件把它拉起来。」
+// 所以这里只做一件事：发现 com.tencent.wetype.keyboard 不在 -> 通知 SpringBoard
+// 侧做一次真实键盘请求（wetypekeepalive 里 KbdWarmupRun），把它 spawn 回来。
+//
+// 落实「低开销」原则（老板否决过音频保活/心跳写盘）：
+//   - 只用 procExists 的 sysctl 快照，微秒级，不写盘、不建定时器
+//   - 仅在状态发生变化时写日志（不刷日志）
+//   - 失败后冷却 5 分钟：避免拉起不成功时反复弹键盘骚扰
+//   - 锁屏时不做（锁屏下弹键盘无意义且会亮屏）
+static time_t gKbdCooldownUntil = 0;
+static BOOL   gKbdEverSeen = NO;      // 曾经见过它活着（区分"被内存杀掉"与"开机后还没用过键盘"）
+static BOOL   gKbdLastRunning = NO;
+
+static void watchKeyboardExtension(void) {
+    BOOL running = procExists("wxkb_plugin");
+    if (running) {
+        if (!gKbdLastRunning) LOG(@"kbd ext (wxkb_plugin) UP");
+        gKbdLastRunning = YES;
+        gKbdEverSeen = YES;
+        return;
+    }
+    if (gKbdLastRunning) {
+        LOG(@"kbd ext (wxkb_plugin) went DOWN (jetsam / memory pressure)");
+        gKbdLastRunning = NO;
+    }
+    if (!gKbdEverSeen) return;                    // 开机后从未启动过，不主动弹键盘
+    if (gLocked) {                                 // 锁屏不弹
+        return;
+    }
+    time_t now = time(NULL);
+    if (now < gKbdCooldownUntil) return;           // 冷却中
+    LOG(@"kbd ext MISSING -> ask SpringBoard to issue a real keyboard request");
+    uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup");
+    LOG(@"kbd warmup notify posted -> %u (0=ok)", st);
+    gKbdCooldownUntil = now + 300;
+}
+
 // ===== v1.9.13 核心：读 wetype 的 Mach Task suspend_count 判定是否被系统挂起 =====
 // 微信视频 PiP 顶掉 wetype PiP -> wetype 无保活凭证 -> 系统挂起进程(S▲B, suspend_count>0)
 // -> PiP 失效 -> daemon 重拉。entitlements 需 platform-application + task_for_pid-allow
@@ -602,6 +657,45 @@ static int kbdWarmTrigger(void) {
     fprintf(stderr, "[WCVK-KBDWARM] notify_post(com.wcvoicekeep.kbd.warmup) -> %u (0=ok)\n", st);
     fflush(stderr);
     return st == 0 ? 0 : 1;
+}
+
+// v1.9.35：--kbd-warm-test —— 一次跑完给出完整结论的实验
+// 目的：老板要的是「键盘扩展被杀后能否被无头拉起并留存」，而无需反复 SSH 采样。
+// 流程：记录基线 -> post 预热通知（SB 侧建 UIKit 文本框触发键盘请求）
+//       -> 每 0.5s 采样 wxkb_plugin 与 kbd 的 pid，共 12s -> 打印时间线。
+// 判据：T+11s 若 wxkb_plugin 有新 pid 且持续存在 => B 路线（真实键盘请求）可用。
+static int kbdWarmTest(void) {
+    #define KBDTEST_MAX 24
+    int baseP = procPid("wxkb_plugin");
+    int baseK = procPid("kbd");
+    fprintf(stderr, "[WCVK-KBDTEST] baseline: wxkb_plugin=%d kbd=%d\n", baseP, baseK);
+    fprintf(stderr, "[WCVK-KBDTEST] posting com.wcvoicekeep.kbd.warmup ...\n");
+    fflush(stderr);
+    uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup");
+    fprintf(stderr, "[WCVK-KBDTEST] notify_post -> %u (0=ok)\n", st);
+
+    int prevP = baseP;
+    for (int i = 1; i <= KBDTEST_MAX; i++) {
+        usleep(500 * 1000);
+        int p = procPid("wxkb_plugin");
+        int k = procPid("kbd");
+        const char *ev = "";
+        if (prevP == 0 && p > 0) ev = "  <== wxkb_plugin APPEARED";
+        else if (prevP > 0 && p == 0) ev = "  <== wxkb_plugin GONE";
+        else if (prevP > 0 && p > 0 && p != prevP) ev = "  <== wxkb_plugin RESTARTED(new pid)";
+        prevP = p;
+        fprintf(stderr, "[WCVK-KBDTEST] t=+%.1fs wxkb_plugin=%d kbd=%d%s\n",
+                i * 0.5, p, k, ev);
+        fflush(stderr);
+    }
+    int endP = procPid("wxkb_plugin");
+    fprintf(stderr, "[WCVK-KBDTEST] RESULT final wxkb_plugin=%d (base=%d) kbd=%d\n",
+            endP, baseP, procPid("kbd"));
+    fprintf(stderr, "[WCVK-KBDTEST] VERDICT: %s\n",
+            (endP > 0) ? "ALIVE_AFTER_12S (B 路线可用：真实键盘请求能拉起并常驻)"
+                       : "GONE_AFTER_12S (B 路线不可用：resign 后 launchd 立即回收)");
+    fflush(stderr);
+    return 0;
 }
 
 // v1.9.34：--dlopen-test <dylib 路径>
@@ -678,7 +772,13 @@ int main(int argc, char *argv[]) {
         //    微信视频 PiP 顶掉保活凭证）-> PiP 失效 -> 择机重拉（锁屏等解锁/有音频不拉/5min 冷却）
         //  - 微信：被杀就无头拉（不管锁屏/息屏，无 UI 无打扰），120s 节流
         while (1) {
-            sleep(kCheckIntervalSec);
+            // v1.9.36：原有 60s 主 tick 拆成 4 段 15s，每段只跑一次键盘扩展检查。
+            // 这样 wxkb_plugin 被内存压力杀掉后，最迟 15s 内就会被发现并拉回，
+            // 而不是等满 60s。检查本身只是 sysctl 进程快照，无磁盘写、无定时器。
+            for (int _kb = 0; _kb < 4; _kb++) {
+                sleep(kCheckIntervalSec / 4);
+                @autoreleasepool { watchKeyboardExtension(); }
+            }
             @autoreleasepool {
                 watchWechat(); // 微信看护优先（老板要求：微信也要能拉起来）
 
