@@ -2,7 +2,7 @@ include $(THEOS)/makefiles/common.mk
 
 BUNDLE_NAME = BackgroundKeepPrefs
 
-BackgroundKeepPrefs_FILES = BKRootListController.m BKRecordsController.m
+BackgroundKeepPrefs_FILES = BKRootListController.m
 BackgroundKeepPrefs_INSTALL_PATH = /Library/PreferenceBundles
 BackgroundKeepPrefs_FRAMEWORKS = UIKit
 # AltList 不做链接依赖：ATL 控制器只是 Root.plist detail 里的类名字符串，代码零符号引用；

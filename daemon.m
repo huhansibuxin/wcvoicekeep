@@ -137,7 +137,13 @@ static BOOL     gLogging = NO;    // 日志开关（日志版才有实际作用�
 static BOOL     gRecord  = YES;   // 拉起记录开关：关掉后**完全不写**记录（零写入零开销）
 static NSArray *gAppBIDs = nil;   // 用户勾选的 App bundle id 数组
 
-static void WCVKReadPrefs(void) {
+// v2.0.5：返回「值是否有变化」。
+// 原因：com.apple.preferences-changed 是**系统级**广播，任何 App 改任何偏好都会打过来，
+// 以前每来一次就重读 + 全量重建目标（其中还要逐个 bid 走一遍 LaunchServices 解析），
+// 白干活。现在值没变就直接跳过，系统里别人改设置跟我们无关。
+static BOOL WCVKReadPrefs(void) {
+    BOOL    oldEnabled = gEnabled, oldLogging = gLogging, oldRecord = gRecord;
+    NSArray *oldBIDs   = gAppBIDs;
     NSString *p = WCVKPrefsPath();
 
     // v2.0.2：**优先走 CFPreferences（cfprefsd）读，而不是直读文件**。
@@ -179,8 +185,11 @@ static void WCVKReadPrefs(void) {
         }
     }
     gAppBIDs = bids;
-    LOG(@"prefs loaded (%s): enabled=%d logging=%d apps=%@",
-        viaCF ? "cfprefs" : "file", gEnabled, gLogging, gAppBIDs);
+    BOOL changed = (oldEnabled != gEnabled) || (oldLogging != gLogging) || (oldRecord != gRecord)
+                   || ![oldBIDs isEqualToArray:gAppBIDs];
+    LOG(@"prefs loaded (%s): enabled=%d logging=%d apps=%@ changed=%d",
+        viaCF ? "cfprefs" : "file", gEnabled, gLogging, gAppBIDs, changed);
+    return changed;
 }
 
 // ===== 拉起记录（纯净版也写；设置页「拉起记录」读它）=====
@@ -211,18 +220,22 @@ static void WCVKRecord(NSString *display, NSString *ident, NSString *kind, BOOL 
     // v2.0.1：改成 dict{rows:[...]} —— 顶层是 dict，cfprefsd 才能当域读；
     // 设置页因此可以走 CFPreferences 兜底（沙箱下直读文件可能被拦）
     NSDictionary *out = @{ @"rows": arr };
+    NSString *writtenPath = path;
     BOOL wrote = [out writeToFile:path atomically:YES];
     if (!wrote) {
         NSString *alt = @"/var/mobile/wcvoicekeep.records.plist";
         wrote = [out writeToFile:alt atomically:YES];
+        if (wrote) writtenPath = alt;
         LOG(@"record write fallback -> %@ (%d)", alt, wrote);
     }
     // v2.0.2：属主改成 mobile —— daemon 是 root，写出来是 root:mobile，
     // 设置页（mobile 身份）虽然能读，但「清空记录」按钮删不动 root 的文件，
     // cfprefsd 以 mobile 身份也无法把这份文件当成自己的域。统一交给 mobile。
     if (wrote) {
-        chown(path.fileSystemRepresentation, 501, 501);
-        chmod(path.fileSystemRepresentation, 0644);
+        // v2.0.5：fallback 路径也要 chown/chmod，以前只 chown 了 path（fallback 那份属主不对，
+        // 设置页读得到但删不掉）
+        chown(writtenPath.fileSystemRepresentation, 501, 501);
+        chmod(writtenPath.fileSystemRepresentation, 0644);
     }
 }
 
@@ -391,7 +404,14 @@ static NSString *WCVKProxyString(id proxy, NSArray<NSString *> *sels) {
     return nil;
 }
 
+// v2.0.5：加缓存。以前每次重建目标都要对每个 bid 走一遍 LaunchServices 解析
+// （最坏情况枚举 allApplications，几十毫秒级），而显示名/路径基本不变。
+// 只在解析成功时缓存；失败不缓存（App 之后装回来还能重新解析）。
+static NSMutableDictionary *gMetaCache = nil;
 static NSDictionary *WCVKAppMeta(NSString *bid) {
+    if (!gMetaCache) gMetaCache = [NSMutableDictionary dictionary];
+    NSDictionary *cached = gMetaCache[bid];
+    if (cached) return cached;
     id proxy = WCVKLSProxyForBID(bid);
     if (!proxy) {
         LOG(@"AppMeta(%@) 失败：LaunchServices 未返回代理", bid);
@@ -426,8 +446,10 @@ static NSDictionary *WCVKAppMeta(NSString *bid) {
         return nil;
     }
     LOG(@"AppMeta(%@) = %@ / %@", bid, name ?: @"?", appDir);
-    return @{ @"exeSuffix": [NSString stringWithFormat:@"/%@/%@", appDir, exe],
+    NSDictionary *out = @{ @"exeSuffix": [NSString stringWithFormat:@"/%@/%@", appDir, exe],
               @"display": [name isKindOfClass:[NSString class]] && name.length ? name : bid };
+    gMetaCache[bid] = out;
+    return out;
 }
 
 // ===== 无头拉起（完全后台，不切前台）=====
@@ -673,8 +695,12 @@ static void WCVKArmPrefsWatch(void);
 static void WCVKHandlePrefsChanged(void);
 
 static void WCVKHandlePrefsChanged(void) {
-    LOG(@"prefs 变更 -> 重读并重建目标");
-    WCVKReadPrefs();
+    // v2.0.5：值没变就不重建（系统级 preferences-changed 广播非常杂）
+    if (!WCVKReadPrefs()) {
+        LOG(@"prefs 通知：值与当前一致，跳过重建");
+        return;
+    }
+    LOG(@"prefs 变更 -> 重建目标");
     WCVKRebuildTargets();
 }
 

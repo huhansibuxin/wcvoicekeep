@@ -91,15 +91,13 @@
 		</dict>
 		<dict>
 			<key>cell</key>
-			<string>PSLinkCell</string>
+			<string>PSGroupCell</string>
+			<key>id</key>
+			<string>recGroup</string>
 			<key>label</key>
-			<string>查看拉起记录</string>
-			<key>detail</key>
-			<string>BKRecordsController</string>
-			<key>bundle</key>
-			<string>BackgroundKeepPrefs</string>
-			<key>isController</key>
-			<true/>
+			<string>最近拉起记录</string>
+			<key>footerText</key>
+			<string>读取中…</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -109,7 +107,7 @@
 			<key>footerText</key>
 			<string>1. 键盘扩展（微信输入法 wxkb_plugin）：始终保活。被回收后插件请系统重新拉起，保持热启动。
 2. 保活 App：你在上面勾选的 App，被系统或手动杀掉后在后台重新拉起（不切前台、不亮屏、不打扰）。
-3. 记录：每次拉起都会在「查看拉起记录」里留一条时间 + 目标 + 结果；关掉开关则完全不写。
+3. 记录：每次拉起都会在「最近拉起记录」里留一条时间 + 目标 + 结果；关掉开关则完全不写。
 4. 原理：每个目标单独挂一个内核进程退出事件，只有目标真的退出时才会回调，平时没有任何轮询与定时器，CPU 占用为 0。</string>
 		</dict>
 		<dict>
