@@ -29,6 +29,10 @@
 #import <objc/message.h>
 #import <unistd.h>
 #import <stdlib.h>
+#import <limits.h>
+#import <string.h>
+#import <fcntl.h>
+#import <sys/time.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
 static BOOL const kWPFEnable        = YES;   // 总开关
@@ -43,17 +47,50 @@ static BOOL gEnteredFG     = NO;   // 已经进过前台
 static int  gRepairLevel   = 0;    // 实际生效的修复级别（0=没修）
 
 // ===== 日志 =====
-static NSString *WPFLogPath(void) {
-    static NSString *p = nil;
-    if (p) return p;
-    @try {
-        NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *dir = dirs.count ? dirs[0] : NSTemporaryDirectory();
-        p = [dir stringByAppendingPathComponent:@"wcprewarm.log"];
-    } @catch (NSException *e) {
-        p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wcprewarm.log"];
+// v2.0.12 修的三处致命缺陷（老板实测「日志一条都没写进去、Filza 里也找不到文件」）：
+//   ① 用 NSSearchPathForDirectoriesInDomains + NSFileHandle —— %ctor 阶段 Foundation 还没就绪，
+//      取到的路径可能是 nil 或无效值；
+//   ② `static NSString *p` 把**第一次取到的路径永久缓存** —— 第一次拿到错路径，之后全写错地方；
+//   ③ createFileAtPath: 的返回值完全没检查，fileHandleForWritingAtPath 拿不到就静默 return ——
+//      整条链路没有任何痕迹，所以既没文件也没报错。
+// 现在：
+//   ① 纯 POSIX open/write/close + strftime 拼时间，完全不依赖 Foundation 是否就绪；
+//   ② 候选路径按序试（第一顺位 getenv("HOME")，进程一启动就有，沙盒根最可靠），
+//      只缓存**真正 open 成功**的那条；写入失败立刻清缓存，下次重新试全部候选；
+//   ③ 每次写同时 NSLog 一份 —— 文件万一写不进去，还能用系统日志捞（log show）。
+static char gLogPath[PATH_MAX] = {0};   // 空 = 还没找到可写路径
+
+static const char *WPFLogPath(void) {
+    if (gLogPath[0]) return gLogPath;
+
+    char cand[8][PATH_MAX];
+    int n = 0;
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        snprintf(cand[n++], PATH_MAX, "%s/Documents/wcprewarm.log", home);
+        snprintf(cand[n++], PATH_MAX, "%s/tmp/wcprewarm.log", home);
+        snprintf(cand[n++], PATH_MAX, "%s/Library/Caches/wcprewarm.log", home);
     }
-    return p;
+    @try {
+        NSArray *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        if (d.count) {
+            const char *u = [d[0] UTF8String];
+            if (u && u[0]) snprintf(cand[n++], PATH_MAX, "%s/wcprewarm.log", u);
+        }
+        const char *t = NSTemporaryDirectory().UTF8String;
+        if (t && t[0]) snprintf(cand[n++], PATH_MAX, "%s/wcprewarm.log", t);
+    } @catch (NSException *e) {}
+    snprintf(cand[n++], PATH_MAX, "/var/mobile/wcprewarm.log");   // 沙盒外兜底（一般写不进，聊胜于无）
+
+    for (int i = 0; i < n; i++) {
+        int fd = open(cand[i], O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            close(fd);
+            strlcpy(gLogPath, cand[i], PATH_MAX);
+            return gLogPath;
+        }
+    }
+    return NULL;
 }
 
 static void WPFLog(NSString *fmt, ...) {
@@ -61,24 +98,39 @@ static void WPFLog(NSString *fmt, ...) {
     va_start(ap, fmt);
     NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
+    if (!body) return;
+    const char *cbody = body.UTF8String;
+    if (!cbody) return;
 
-    NSDateFormatter *df = [[NSDateFormatter alloc] init];
-    df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-    df.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
-    NSString *line = [NSString stringWithFormat:@"[%@][%d] %@\n",
-                      [df stringFromDate:[NSDate date]], getpid(), body];
+    // 系统日志兜底：即使文件写不进去，log show 也能捞到
+    NSLog(@"[WCPrewarm] %s", cbody);
 
-    NSString *path = WPFLogPath();
-    if (![path isKindOfClass:[NSString class]] || path.length < 2) return;   // dyld 早期路径可能还取不到
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!fh) return;
-    @try {
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    } @catch (NSException *e) {}
+    // 时间用 POSIX，绕开 NSDateFormatter（ctor 早期不可靠）
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tmv;
+    time_t sec = tv.tv_sec;
+    localtime_r(&sec, &tmv);
+    char ts[32] = {0};
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+
+    char line[2048];
+    int len = snprintf(line, sizeof(line), "[%s.%03d][%d] %s\n",
+                       ts, (int)(tv.tv_usec / 1000), getpid(), cbody);
+    if (len <= 0) return;
+    if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
+
+    const char *path = WPFLogPath();
+    if (!path) return;
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) { gLogPath[0] = 0; return; }      // 路径失效（容器变了/文件被删）→ 下次重试全部候选
+    size_t off = 0, total = (size_t)len;
+    while (off < total) {
+        ssize_t w = write(fd, line + off, total - off);
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    close(fd);
 }
 
 // ===== 工具 =====
@@ -349,8 +401,15 @@ static void WPFOnEnterBackground(void) {
 
 %ctor {
     @autoreleasepool {
+        // v2.0.12：ctor 里就把「日志到底写去哪」交代清楚（同时 NSLog 一份），
+        // 万一文件写不进去，log show 里也能直接看到 HOME 和选中的路径。
         WPFLog(@"==== WCPrewarmFix inject (pid=%d) ====", getpid());
-        WPFLog(@"env: ActivePrewarm=%s", getenv("ActivePrewarm") ?: "(null)");
+        WPFLog(@"env: HOME=%s ActivePrewarm=%s XPC=%s",
+               getenv("HOME") ?: "(null)",
+               getenv("ActivePrewarm") ?: "(null)",
+               getenv("XPC_SERVICE_NAME") ?: "(null)");
+        const char *lp = WPFLogPath();
+        WPFLog(@"log path = %s", lp ? lp : "(全部候选都写不进去！)");
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
                         object:nil queue:[NSOperationQueue mainQueue]
