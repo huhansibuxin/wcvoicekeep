@@ -73,7 +73,7 @@ static void SBLog(NSString *fmt, ...) {
 //   通道 1  open/write  —— 原始文件（保留，若沙盒放行最直观）
 //   通道 2  CFPreferences —— SB 必然有权写自己的 prefs domain
 //   通道 3  Darwin 通知 —— 由 root 的 wcvoicekeep daemon 收到后落盘（必定成功）
-#define WCVK_BUILD_TAG "v1.9.40-roothide"
+#define WCVK_BUILD_TAG "v1.9.41-roothide"
 
 // 通道 3：Darwin 通知（名字区分阶段，daemon 侧监听后写自己的日志）
 static void WCVKPostNotify(const char *name) {
@@ -586,6 +586,105 @@ static void KbdApiProbeCallback(CFNotificationCenterRef center, void *observer,
     dispatch_async(dispatch_get_main_queue(), ^{ KbdApiProbe(); });
 }
 
+// ===== v1.9.41：PlugInKit 无头拉起（目标：任意时刻、零 UI）=====
+// 依据 v1.9.40 --kbd-api-probe 在设备上 dump 到的真实签名（不是猜的）：
+//   PKHost:       +defaultHost / -findPlugInByPathURL:reply: / -activatePlugIn:
+//   PKHostPlugIn: -beginUsingWithSubsystemOptions:completion:
+//                 -beginUsingRequest:withSubsystemOptions:error:
+//                 -startPlugInRequest:synchronously:subsystemOptions:completion:
+// PKHost/PKHostPlugIn 都存在于 SpringBoard，且 SpringBoard 本身有 pkd 的 host
+// 权限 —— 所以这条路如果成立，"键盘扩展被杀就拉起"就不再依赖前台 App 或桌面。
+static NSString *KbdAppexPath(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *dirs = [fm contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:nil];
+    for (NSString *d in dirs) {
+        NSString *appDir = [@"/var/containers/Bundle/Application" stringByAppendingPathComponent:d];
+        NSArray *apps = [fm contentsOfDirectoryAtPath:appDir error:nil];
+        for (NSString *a in apps) {
+            if (![a hasSuffix:@".app"]) continue;
+            NSString *plugins = [appDir stringByAppendingPathComponent:
+                                 [a stringByAppendingPathComponent:@"PlugIns"]];
+            NSArray *exes = [fm contentsOfDirectoryAtPath:plugins error:nil];
+            for (NSString *e in exes) {
+                if (![e hasSuffix:@".appex"]) continue;
+                if ([e.lowercaseString containsString:@"wxkb"] ||
+                    [e.lowercaseString containsString:@"keyboard"]) {
+                    return [plugins stringByAppendingPathComponent:e];
+                }
+            }
+        }
+    }
+    return nil;
+}
+
+static void KbdPkSpawn(void) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        NSString *appex = KbdAppexPath();
+        SBLog(@"[KBDSPAWN] ===== start appex=%@ running_before=%d =====", appex, KbdProcRunning());
+        if (!appex) { SBLog(@"[KBDSPAWN] appex not found"); return; }
+
+        Class PKHostC = NSClassFromString(@"PKHost");
+        if (!PKHostC) { SBLog(@"[KBDSPAWN] PKHost class missing"); return; }
+
+        id host = nil;
+        @try {
+            host = ((id (*)(id, SEL))objc_msgSend)((id)PKHostC,
+                                                    sel_registerName("defaultHost"));
+        } @catch (NSException *e) { SBLog(@"[KBDSPAWN] defaultHost threw %@", e.reason); return; }
+        SBLog(@"[KBDSPAWN] host=%s", host ? object_getClassName(host) : "nil");
+        if (!host) return;
+
+        // ① findPlugInByPathURL:reply: —— 拿 PKHostPlugIn
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block id found = nil;
+        NSURL *url = [NSURL fileURLWithPath:appex];
+        @try {
+            ((void (*)(id, SEL, id, id))objc_msgSend)(host,
+                sel_registerName("findPlugInByPathURL:reply:"), url,
+                ^(id plugin, id err) {
+                    found = plugin;
+                    SBLog(@"[KBDSPAWN] find -> %s err=%@",
+                          plugin ? object_getClassName(plugin) : "nil", err);
+                    dispatch_semaphore_signal(sem);
+                });
+        } @catch (NSException *e) { SBLog(@"[KBDSPAWN] find threw %@", e.reason); }
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
+        if (!found) { SBLog(@"[KBDSPAWN] no plugin handle -> abort"); return; }
+
+        // ② PKHost -activatePlugIn:
+        @try {
+            id r = ((id (*)(id, SEL, id))objc_msgSend)(host,
+                     sel_registerName("activatePlugIn:"), found);
+            SBLog(@"[KBDSPAWN] activatePlugIn -> %s running=%d",
+                  r ? object_getClassName(r) : "nil", KbdProcRunning());
+        } @catch (NSException *e) { SBLog(@"[KBDSPAWN] activatePlugIn threw %@", e.reason); }
+        if (KbdProcRunning()) { SBLog(@"[KBDSPAWN] OK after activatePlugIn"); return; }
+
+        // ③ PKHostPlugIn -beginUsingWithSubsystemOptions:completion:
+        //    块签名用 (id,id) 兜底，避免签名不符把 SpringBoard 打崩
+        dispatch_semaphore_t s2 = dispatch_semaphore_create(0);
+        @try {
+            ((void (*)(id, SEL, id, id))objc_msgSend)(found,
+                sel_registerName("beginUsingWithSubsystemOptions:completion:"), nil,
+                ^(id a, id b) {
+                    SBLog(@"[KBDSPAWN] beginUsing -> %@ / %@ running=%d", a, b, KbdProcRunning());
+                    dispatch_semaphore_signal(s2);
+                });
+        } @catch (NSException *e) { SBLog(@"[KBDSPAWN] beginUsing threw %@", e.reason); }
+        dispatch_semaphore_wait(s2, dispatch_time(DISPATCH_TIME_NOW, 6ull * NSEC_PER_SEC));
+
+        // ④ 最后看结果
+        for (int i = 0; i < 4 && !KbdProcRunning(); i++) usleep(500 * 1000);
+        SBLog(@"[KBDSPAWN] ===== end running=%d =====", KbdProcRunning());
+    });
+}
+
+static void KbdPkSpawnCallback(CFNotificationCenterRef center, void *observer,
+                               CFStringRef name, const void *object,
+                               CFDictionaryRef userInfo) {
+    KbdPkSpawn();
+}
+
 static void KbdWarmNotifyCallback(CFNotificationCenterRef center, void *observer,
                                   CFStringRef name, const void *object,
                                   CFDictionaryRef userInfo) {
@@ -643,6 +742,13 @@ __attribute__((constructor)) static void SBKeepAliveInit(void) {
                                             CFSTR("com.wcvoicekeep.kbd.probe"),
                                             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
             SBLog(@"[KBDAPI] darwin notify com.wcvoicekeep.kbd.probe registered");
+
+            // v1.9.41：PlugInKit 无头拉起通道（零 UI，任意时刻）
+            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                            NULL, KbdPkSpawnCallback,
+                                            CFSTR("com.wcvoicekeep.kbd.pkspawn"),
+                                            NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+            SBLog(@"[KBDSPAWN] darwin notify com.wcvoicekeep.kbd.pkspawn registered");
         }
     }
 }

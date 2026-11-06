@@ -730,6 +730,14 @@ static int kbdApiProbeTrigger(void) {
     return st == 0 ? 0 : 1;
 }
 
+// v1.9.41：--kbd-pk-spawn —— 让 SpringBoard 用 PKHost 无头拉起键盘扩展（零 UI）
+static int kbdPkSpawnTrigger(void) {
+    uint32_t st = notify_post("com.wcvoicekeep.kbd.pkspawn");
+    fprintf(stderr, "[WCVK-KBDSPAWN] notify_post(com.wcvoicekeep.kbd.pkspawn) -> %u (0=ok)\n", st);
+    fflush(stderr);
+    return st == 0 ? 0 : 1;
+}
+
 // v1.9.35：--kbd-warm-test —— 一次跑完给出完整结论的实验
 // 目的：老板要的是「键盘扩展被杀后能否被无头拉起并留存」，而无需反复 SSH 采样。
 // 流程：记录基线 -> post 预热通知（SB 侧建 UIKit 文本框触发键盘请求）
@@ -1154,6 +1162,10 @@ int main(int argc, char *argv[]) {
         // v1.9.40：--kbd-api-probe 让 SpringBoard dump 键盘私有 API 签名
         if (strcmp(argv[i], "--kbd-api-probe") == 0) {
             return kbdApiProbeTrigger();
+        }
+        // v1.9.41：--kbd-pk-spawn 走 PKHost 无头拉起键盘扩展
+        if (strcmp(argv[i], "--kbd-pk-spawn") == 0) {
+            return kbdPkSpawnTrigger();
         }
     }
 
