@@ -51,9 +51,18 @@ wcvoicekeep_CFLAGS = -fobjc-arc -fno-modules -w -DWCVK_NO_LOG=$(WCVK_NO_LOG)
 # ===== 注入微信侧：后台预热黑屏 诊断 + 四级修复（2.0.9）=====
 # TrollFools 注入 com.tencent.xin（也可随 deb 装到 DynamicLibraries，靠 wcprewarmfix.plist 限定只注入微信）
 # 目的：daemon 后台拉起微信后点开黑屏 —— 从 App 内部检查主窗口健康度并逐级修复
+#
+# ⚠️ v2.0.13 关键修复：**这份 dylib 绝对不能链接 CydiaSubstrate**。
+# 之前照 SBKeepAlive 的写法加了 `-F$(THEOS_PROJECT_DIR)/Frameworks -framework CydiaSubstrate`，
+# 生成出来的依赖是 `@loader_path/.jbroot/usr/lib/libsubstrate.dylib` —— 相对路径，
+# 在 TrollFools 注入环境里展开成 WeChat.app/Frameworks/.jbroot/usr/lib/libsubstrate.dylib，
+# 在 ElleKit 环境里展开成 /var/jb/Library/MobileSubstrate/DynamicLibraries/.jbroot/...，**两处都不存在**
+# → dlopen 直接失败 → %ctor 一次都没执行 → 日志文件/系统日志全空（老板实测就是这样）。
+# 本文件只用 %ctor + NSNotificationCenter + UIKit 调用，**没有任何 %hook/%orig/%group**，
+# 不需要 substrate；去掉依赖后只依赖系统库，注入即生效。
 wcprewarmfix_FILES = WCPrewarmFix.xm
 wcprewarmfix_FRAMEWORKS = UIKit Foundation
-wcprewarmfix_LDFLAGS = -Wl,-no_warn_inits -F$(THEOS_PROJECT_DIR)/Frameworks -framework CydiaSubstrate
+wcprewarmfix_LDFLAGS = -Wl,-no_warn_inits
 wcprewarmfix_CFLAGS = -fobjc-arc -fno-modules -w
 TWEAK_NAME = wetypekeepalive wcprewarmfix
 
