@@ -85,22 +85,7 @@ jobs:
             echo "=== contents ==="; dpkg-deb -c "$OUT" | grep -E "PreferenceBundles|PreferenceLoader|usr/bin|TweakInject|LaunchDaemons" | head -20
           } 2>&1 | tee -a build.log
 
-      - name: Collect injected dylib
-        if: success()
-        run: |
-          DYLIB=$(find .theos -name 'wcprewarmfix.dylib' -type f -print -quit)
-          echo "dylib=$DYLIB"
-          mkdir -p packages/out
-          if [ -z "$DYLIB" ]; then echo "ERROR: wcprewarmfix.dylib not produced"; exit 1; fi
-          cp "$DYLIB" packages/out/wcprewarmfix.dylib
-          ls -l packages/out
-
-      - name: Upload injected dylib
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wcprewarmfix-dylib-${{ matrix.variant }}-${{ matrix.flavor }}
-          path: packages/out/wcprewarmfix.dylib
+      # v2.0.31：注入微信侧的 dylib 整套剥离，产物只有 deb（不再上传 injected dylib）。
 
       - name: Upload build log
         if: always()

@@ -1,6 +1,6 @@
-# wcvoicekeep / 后台保活 —— 2.0.0
+# wcvoicekeep / 后台保活 —— 2.0.31
 #
-# 架构（2.0.0 大改，老板 2026-11-06 定案）：
+# 架构（2.0.0 大改，老板 2026-11-06 定案；v2.0.31 剥离注入端，daemon 只负责拉起）：
 #   * 只管「后台保活」：键盘扩展 wxkb_plugin + 用户在设置里勾选的任意 App
 #   * 微信输入法主程序（com.tencent.wetype）的 PiP 保活整套**已删除**（输入法更新后不再需要）
 #   * 事件驱动：daemon 给每个目标单独挂内核进程退出事件（DISPATCH_PROC_EXIT），零轮询
@@ -48,27 +48,13 @@ wcvoicekeep_FRAMEWORKS = Foundation MobileCoreServices
 wcvoicekeep_CODESIGN_FLAGS = -S$(THEOS_PROJECT_DIR)/entitlements.plist
 wcvoicekeep_CFLAGS = -fobjc-arc -fno-modules -w -DWCVK_NO_LOG=$(WCVK_NO_LOG)
 
-# ===== 注入微信侧：后台预热黑屏 诊断 + 四级修复（2.0.9）=====
-# TrollFools 注入 com.tencent.xin（也可随 deb 装到 DynamicLibraries，靠 wcprewarmfix.plist 限定只注入微信）
-# 目的：daemon 后台拉起微信后点开黑屏 —— 从 App 内部检查主窗口健康度并逐级修复
-#
-# ⚠️ v2.0.13 关键修复：**这份 dylib 绝对不能链接 CydiaSubstrate**。
-# 之前照 SBKeepAlive 的写法加了 `-F$(THEOS_PROJECT_DIR)/Frameworks -framework CydiaSubstrate`，
-# 生成出来的依赖是 `@loader_path/.jbroot/usr/lib/libsubstrate.dylib` —— 相对路径，
-# 在 TrollFools 注入环境里展开成 WeChat.app/Frameworks/.jbroot/usr/lib/libsubstrate.dylib，
-# 在 ElleKit 环境里展开成 /var/jb/Library/MobileSubstrate/DynamicLibraries/.jbroot/...，**两处都不存在**
-# → dlopen 直接失败 → %ctor 一次都没执行 → 日志文件/系统日志全空（老板实测就是这样）。
-# 本文件只用 %ctor + NSNotificationCenter + UIKit 调用，**没有任何 %hook/%orig/%group**，
-# 不需要 substrate；去掉依赖后只依赖系统库，注入即生效。
-# ⚠️ v2.0.15：文件是 .m 不是 .xm —— 本文件不用任何 %hook/%orig/%group，
-# 之前写成 .xm + %ctor 编出来的 dylib 是空壳（__TEXT 只有 Mach-O 头、
-# 链接报 no debug symbols），注入后一行代码都不执行，日志自然永远为空。
-# 同工程 wetypekeepalive 用 __attribute__((constructor)) 一直正常，照它来即可。
-wcprewarmfix_FILES = WCPrewarmFix.m WCSceneBlackFix.m
-wcprewarmfix_FRAMEWORKS = UIKit Foundation
-wcprewarmfix_LDFLAGS = -Wl,-no_warn_inits
-wcprewarmfix_CFLAGS = -fobjc-arc -fno-modules -w -DWCVK_NO_LOG=$(WCVK_NO_LOG)
-TWEAK_NAME = wetypekeepalive wcprewarmfix
+# ===== v2.0.31：注入微信侧整套剥离 =====
+# 黑屏修复（WCSceneBlackFix）已合进 wctweak 并实机验证通过，本工程不再注入任何 App 进程：
+# 再留一份就是同一个 willConnect hook 装两遍，且纯属多余开销。
+# 现在只保留两个产物：
+#   wetypekeepalive.dylib —— 注入 SpringBoard，被 daemon 叫醒时弹一下键盘（拉起 wxkb_plugin）
+#   wcvoicekeep           —— LaunchDaemon，事件驱动地后台拉起勾选的 App
+# （TWEAK_NAME 已在上面设为 wetypekeepalive，此处不再重复赋值）
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 include $(THEOS_MAKE_PATH)/tool.mk

@@ -19,14 +19,10 @@ chown root:wheel "$BIN" 2>/dev/null || true
 chmod 0755 "$BIN" 2>/dev/null || true
 
 # 2) 清除上一个版本的日志（避免新旧日志混淆，符合“更新清日志”约定；老板在外不必 SSH 手清）
-rm -f /var/mobile/wcvoicekeep.log \
-      /var/mobile/wcvoicekeep.daemon.log \
+rm -f /var/mobile/wcvoicekeep.daemon.log \
       /var/mobile/wcvoicekeep.daemon.out \
       /var/mobile/wcvoicekeep.daemon.err \
-      /var/mobile/wetypekeepalive.log \
-      /var/mobile/wcvk_sb_marker.txt \
-      /var/mobile/Documents/wcvk_sb_marker.txt \
-      /var/mobile/Library/Logs/wcvk_sb_marker.txt 2>/dev/null || true
+      /var/mobile/wetypekeepalive.log 2>/dev/null || true
 
 # 3) 先卸后载，避免 "already loaded" 报错
 launchctl unload "$PLIST" >/dev/null 2>&1 || true

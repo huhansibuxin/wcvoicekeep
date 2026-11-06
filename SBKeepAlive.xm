@@ -1,28 +1,48 @@
-// SBKeepAlive — SpringBoard 侧（2.0.0「后台保活」）
+// SBKeepAlive — SpringBoard 侧（v2.0.31「后台保活 / 只负责拉起」）
 //
 // 唯一职责：daemon 发现 wxkb_plugin（微信输入法键盘扩展）不在了，发一条 Darwin 通知过来，
 // 这里就在 SpringBoard 里弹一下键盘 —— 系统收到真实键盘请求才会去 spawn 键盘扩展，
-// 扩展起来后立刻收键盘。扩展一起来，daemon 就能在它的新 pid 上重新挂退出事件监视。
+// 扩展起来后立刻收键盘，并发 kbd.up 让 daemon 在新 pid 上重挂退出事件监视。
 //
-// 2.0.0 相对 1.9.x 的删除项（老板 2026-11-06 定案）：
-//   * 微信输入法主程序（com.tencent.wetype）PiP 保活 / FBScene 拦截 / scene 保活 —— 整套删除
-//     （输入法更新后不再需要，主程序完全不管）
-//   * 隐藏键盘那一整套（KbdForceHide* / KbdDumpWindows / alpha 压制 / 挪屏外）—— 实测无效，
-//     桌面弹键盘无解，接受它弹
-//   * alert 备选通道 / PKHost 无头 spawn 探测 / 键盘私有 API dump —— 实验代码全部删除
+// v2.0.31 剥离（老板 2026-11-07）：
+//   注入微信侧 wcprewarmfix.dylib 整套已删除（黑屏修复已合进 wctweak），随之删掉：
+//     * com.wcvoicekeep.prewarm.ctor 探针回调 + 注册（只写日志的自证通道）
+//     * com.wcvoicekeep.prewarm.reveal 通道 + WCVKRevealRun（v2.0.19 起已降级为「只记录」）
+//     * WCVKMarker 写 marker 文件（每次启动两次 open/write，纯诊断开销）
+//   本文件不再引用任何微信侧注入/黑屏逻辑。
 //
-// 关键实测结论（保留备查）：
+// v2.0.31 性能（不卡 SpringBoard 主线程，老板要求「能缓存就缓存、别每次全局扫描」）：
+//   * 扩展 pid 全程缓存：命中时只做 1 次 proc_pidpath 单点校验（防 pid 复用），
+//     只有缓存失效才全表扫一次；扫描用 C 串后缀比较，零 NSString 分配。
+//   * T+0.6s / T+1.2s / T+3s / DidShow 里那 4 次进程表扫描纯粹是给日志填数字，全删。
+//   * 新 pid 通过 com.wcvoicekeep.kbd.up 的 notify state 直接递给 daemon，两端都不用遍历。
+//   * 日志走后台串行队列 + 持久 fd（一次 open，之后只 write），主线程不再做
+//     attributesOfItemAtPath / open / seekToEnd / close 这一串同步文件 IO。
+//   * pure 版 SBLog 编译期整体剥离，连参数求值都不发生（KbdSceneTag 等不会被调用）。
+//
+// 关键实测结论（保留备查，别改）：
 //   * 键盘只能由「有真实输入焦点的前台宿主 + SpringBoard 自己的 scene」发起；
 //     connectedScenes 无序，必须先取 keyWindow.windowScene，否则会选中
 //     SBSystemAperture* 这种没有显示层的辅助 scene，窗口 isKeyWindow=1 但键盘永不出（8/8 失败）
 //   * 窗口必须 windowLevel = Normal+1 且 makeKeyAndVisible；2pt 高会被判定不可见
+//   * 收键盘必须先 resign -> 等 0.35s 动画走完 -> 再拆窗口/恢复 keyWindow，
+//     顺序反了键盘会一直留在桌面（v2.0.2 实测）
+//   * ⛔ 绝不要调 SBSLaunchApplicationWithIdentifier 做前台激活：该私有 API 在
+//     SpringBoard 主线程同步阻塞 11 秒（v2.0.18 实测全系统卡死），v2.0.19 起整条删除
 
 #import <Foundation/Foundation.h>
-#import <objc/runtime.h>
 #import <UIKit/UIKit.h>
-#import <sys/sysctl.h>
-// iOS SDK 没有 macOS 的 libproc.h —— 只声明用到的两个 libproc 函数（iOS 上在 libSystem 里）
 #include <stdint.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <notify.h>
+
+// iOS SDK 没有 macOS 的 libproc.h —— 只声明用到的两个 libproc 函数（iOS 上在 libSystem 里）
 #ifndef PROC_PIDPATHINFO_MAXSIZE
 #define PROC_PIDPATHINFO_MAXSIZE 4096
 #endif
@@ -36,20 +56,12 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 }
 #endif
 
-#import <string.h>
-#import <fcntl.h>
-#import <unistd.h>
-#import <time.h>
-#import <stdio.h>
-#import <stdlib.h>   // calloc / free
-#import <dlfcn.h>    // dlopen/dlsym：v2.0.18 原生前台激活用
-
-#define WCVK_BUILD_TAG "v2.0.21-roothide"
+#define WCVK_BUILD_TAG "v2.0.31-roothide"
 
 // 键盘扩展进程的精确特征：可执行文件路径以 /wxkb_plugin.appex/wxkb_plugin 结尾
-static NSString *const kKbdExtPathSuffix = @"/wxkb_plugin.appex/wxkb_plugin";
+static const char kKbdExtPathSuffix[] = "/wxkb_plugin.appex/wxkb_plugin";
 
-// ===== 日志（纯净版编译期整体剥离：WCVK_NO_LOG=1）=====
+// ===== 日志（纯净版编译期整体剥离；日志版强制后台队列）=====
 #ifndef WCVK_NO_LOG
 #define WCVK_NO_LOG 0
 #endif
@@ -57,82 +69,102 @@ static NSString *const kKbdExtPathSuffix = @"/wxkb_plugin.appex/wxkb_plugin";
 #if WCVK_NO_LOG
 #define SBLog(...) do {} while (0)
 #else
+static dispatch_queue_t SBLogQueue(void) {
+    static dispatch_queue_t q = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.wcvoicekeep.sb.log", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+static int gSBLogFd = -1;
+
 static void SBLog(NSString *fmt, ...) {
-    static NSString *path = @"/var/mobile/wetypekeepalive.log";
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-    if ([attr[NSFileSize] unsignedLongLongValue] > 2 * 1024 * 1024) {
-        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
-    }
+    // 时间戳在调用线程就生成，投递到后台后才写盘也不会错序
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!fh) {
-        [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!fh) return;
-    }
-    @try {
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    } @catch (NSException *e) {}
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    dispatch_async(SBLogQueue(), ^{
+        if (gSBLogFd < 0)
+            gSBLogFd = open("/var/mobile/wetypekeepalive.log",
+                            O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (gSBLogFd < 0) return;
+        struct stat st;
+        if (fstat(gSBLogFd, &st) == 0 && st.st_size > 2 * 1024 * 1024)
+            ftruncate(gSBLogFd, 0);
+        (void)write(gSBLogFd, data.bytes, data.length);
+    });
 }
 #endif
 
-// 加载自证（纯净版不写）
-static void WCVKMarker(const char *tag) {
-#if !WCVK_NO_LOG
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf), "t=%ld pid=%d build=%s tag=%s\n",
-                     (long)time(NULL), getpid(), WCVK_BUILD_TAG, tag);
-    if (n <= 0) return;
-    static const char *paths[] = {
-        "/var/mobile/wcvk_sb_marker.txt",
-        "/var/mobile/Documents/wcvk_sb_marker.txt",
-        NULL
-    };
-    for (int i = 0; paths[i]; i++) {
-        int fd = open(paths[i], O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd >= 0) {
-            ssize_t wr = write(fd, buf, (size_t)n);
-            (void)wr;
-            close(fd);
-        }
-    }
-#else
-    (void)tag;
-#endif
+// ===== 进程检测：缓存 pid + 单点校验，缓存失效才全表扫一次 =====
+// v2.0.31（老板要求）：能缓存就用缓存，不要每次全局扫描/遍历。
+//   * 命中缓存时只做 1 次 proc_pidpath 单点校验（防 pid 复用），零全表扫描
+//   * 只有缓存失效（扩展被回收 / pid 被复用）才全表扫一次并写回缓存
+//   * 全表扫描用 C 串后缀比较，不再为每个 pid 构造 NSString
+static int gKbdPidCache = 0;
+static const size_t kKbdSuffixLen = sizeof(kKbdExtPathSuffix) - 1;
+
+static BOOL KbdPidMatches(int pid) {
+    if (pid <= 1) return NO;
+    char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+    if (proc_pidpath(pid, path, sizeof(path)) <= 0) return NO;
+    size_t l = strlen(path);
+    return l >= kKbdSuffixLen &&
+           memcmp(path + l - kKbdSuffixLen, kKbdExtPathSuffix, kKbdSuffixLen) == 0;
 }
 
-// ===== Darwin 通知 =====
-static void WCVKPostDarwin(const char *name) {
-    CFStringRef n = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
-    if (!n) return;
-    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                         n, NULL, NULL, true);
-    CFRelease(n);
-}
-
-// ===== 进程检测（精确到可执行文件路径，不靠 16 字符截断的进程名）=====
-static BOOL KbdExtRunning(void) {
+static int KbdScanPid(void) {
     int n = proc_listallpids(NULL, 0);
-    if (n <= 0) return NO;
-    pid_t *pids = (pid_t *)calloc((size_t)n + 64, sizeof(pid_t));
-    if (!pids) return NO;
-    int cnt = proc_listallpids(pids, (int)((size_t)(n + 64) * sizeof(pid_t)));
-    BOOL found = NO;
+    if (n <= 0) return 0;
+    int cap = n + 64;
+    pid_t *pids = (pid_t *)calloc((size_t)cap, sizeof(pid_t));
+    if (!pids) return 0;
+    int cnt = proc_listallpids(pids, cap * (int)sizeof(pid_t));
+    // 进程数在两次调用之间涨过预留量时，重扫一次（鲁棒性）
+    if (cnt >= cap) {
+        free(pids);
+        n = proc_listallpids(NULL, 0);
+        if (n <= 0) return 0;
+        cap = n + 128;
+        pids = (pid_t *)calloc((size_t)cap, sizeof(pid_t));
+        if (!pids) return 0;
+        cnt = proc_listallpids(pids, cap * (int)sizeof(pid_t));
+    }
+    int found = 0;
     for (int i = 0; i < cnt; i++) {
         char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
         if (proc_pidpath(pids[i], path, sizeof(path)) <= 0) continue;
-        NSString *p = [NSString stringWithUTF8String:path];
-        if ([p hasSuffix:kKbdExtPathSuffix]) { found = YES; break; }
+        size_t l = strlen(path);
+        if (l >= kKbdSuffixLen &&
+            memcmp(path + l - kKbdSuffixLen, kKbdExtPathSuffix, kKbdSuffixLen) == 0) {
+            found = pids[i]; break;
+        }
     }
     free(pids);
+    gKbdPidCache = found;
     return found;
 }
-#define KbdProcRunning() KbdExtRunning()
+
+static int KbdExtPid(void) {
+    if (gKbdPidCache > 1 && KbdPidMatches(gKbdPidCache)) return gKbdPidCache;
+    gKbdPidCache = 0;
+    return KbdScanPid();
+}
+
+// ===== Darwin 通知：把新扩展 pid 直接放进 notify state 递给 daemon =====
+// daemon 收到 kbd.up 后用 notify_get_state 取 pid 直接挂监视，两端都零全表扫描。
+// state=0 或单点校验不过时 daemon 回退一次扫描，不影响可靠性。
+static int gKbdUpToken = 0;
+static void KbdPostUp(void) {
+    int pid = KbdExtPid();
+    if (gKbdUpToken) notify_set_state(gKbdUpToken, (uint64_t)(pid > 0 ? pid : 0));
+    notify_post("com.wcvoicekeep.kbd.up");
+    SBLog(@"[KBDWARM] kbd.up posted (state pid=%d)", pid);
+}
 
 // ===== 宿主 scene 选择（实测关键：必须拿到有显示层的那个）=====
 static UIWindowScene *KbdWarmScene(void) {
@@ -178,7 +210,7 @@ static UITextField *gWarmField = nil;
 static UIWindow    *gPrevKeyWindow = nil;
 static BOOL         gWarmBusy = NO;
 static BOOL         gDidShow = NO;
-static BOOL         gUpPosted = NO;   // v2.0.1：本次预热是否已发过 kbd.up（去抖）
+static BOOL         gUpPosted = NO;   // 本次预热是否已发过 kbd.up（去抖）
 static id           gShowObs = nil;
 static id           gHideObs = nil;
 
@@ -193,24 +225,26 @@ static void KbdInstallObservers(void) {
         gDidShow = YES;
         SBLog(@"[KBDWARM] *** UIKeyboardDidShow 收到 = 键盘弹出来了，扩展应已被系统 spawn");
         // 告诉 daemon：扩展已经起来，去新 pid 上重新挂退出事件（事件驱动，零轮询）。
-        // v2.0.1：DidShow 在一次预热里会被系统连发很多次（实测 12 次/秒级），
-        // 每次都要 daemon 遍历进程表重挂 —— 纯浪费。这里按「新 pid + 3s 去抖」只发一次。
+        // DidShow 在一次预热里会被系统连发很多次（实测 12 次/秒级），
+        // 每次都要 daemon 遍历进程表重挂 —— 纯浪费。按「3s 去抖」只发一次。
         static time_t sLastUpAt = 0;
         time_t nowT = time(NULL);
         if (!gUpPosted || nowT - sLastUpAt >= 3) {
-            gUpPosted  = YES;
-            sLastUpAt  = nowT;
-            WCVKPostDarwin("com.wcvoicekeep.kbd.up");
+            gUpPosted = YES;
+            sLastUpAt = nowT;
+            // 稍等 0.25s 再取 pid 发 kbd.up：DidShow 那一刻扩展可能刚被 spawn，
+            // 缓存还没建立；这段延迟远小于扩展的 3s 回收窗口。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ KbdPostUp(); });
         } else {
             SBLog(@"[KBDWARM] kbd.up 去抖：本次预热已发过，忽略重复 DidShow");
         }
-        // v2.0.4（老板要求）：**键盘一弹出来就立刻收**。
-        // 扩展进程这时已经在内存里了，收键盘不会把它带走（它靠 exit timeout=3 才回收），
-        // 所以没必要让键盘在屏幕上多待。放到下一轮 runloop 再收，避开键盘正在 setup 的瞬间。
+        // 键盘一弹出来就立刻收：扩展进程这时已在内存里，收键盘不会把它带走
+        // （它靠 exit timeout=3 才回收）。放到下一轮 runloop 避开键盘正在 setup 的瞬间。
         if (gWarmBusy && gWarmField) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 KbdWarmupFinish(@"DidShow-immediate");
-                SBLog(@"[KBDWARM] DidShow 即刻收键盘 -> wxkb_plugin_running=%d", KbdProcRunning());
+                SBLog(@"[KBDWARM] DidShow 即刻收键盘");
             });
         }
     }];
@@ -223,9 +257,8 @@ static void KbdInstallObservers(void) {
 }
 
 static void KbdWarmupFinish(NSString *tag) {
-    // v2.0.2：收尾顺序重排。以前是 resign 之后**立刻**把窗口 hidden + 销毁 + 恢复 keyWindow，
-    // 键盘收起动画被打断，键盘就留在屏幕上了（老板实测"注销后键盘一直在桌面"）。
-    // 现在：resign 生效 -> 让动画先走完 -> 再销毁窗口、恢复 key window。幂等，可重复调用。
+    // 收尾顺序（v2.0.2 实测）：resign 生效 -> 让动画先走完 -> 再销毁窗口、恢复 key window。
+    // 幂等，可重复调用。
     UITextField *f = gWarmField;
     UIWindow *w = gWarmWindow;
     UIWindow *prev = gPrevKeyWindow;
@@ -257,9 +290,10 @@ static void KbdWarmupRun(NSString *reason) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gWarmBusy) { SBLog(@"[KBDWARM] skip, busy (%@)", reason); return; }
         gWarmBusy = YES;
-        gUpPosted = NO;              // v2.0.1：新一轮预热，允许发一次 kbd.up
+        gUpPosted = NO;              // 新一轮预热，允许发一次 kbd.up
 
-        if (KbdProcRunning()) {
+        // ★ 缓存优先：命中时只做 1 次 proc_pidpath 单点校验；扩展已在跑就完全没必要弹键盘
+        if (KbdExtPid() > 0) {
             SBLog(@"[KBDWARM] skip: wxkb_plugin 已在运行，无需预热");
             gWarmBusy = NO;
             return;
@@ -300,104 +334,43 @@ static void KbdWarmupRun(NSString *reason) {
         SBLog(@"[KBDWARM] becomeFirstResponder=%d isFirstResponder=%d isKeyWindow=%d",
               became, (int)tf.isFirstResponder, (int)w.isKeyWindow);
 
-        // T+0.6s：确认键盘是否真弹（只记日志，不再用它决定要不要收）
+        // T+0.6s：确认键盘是否真弹，只补一次（绝不做 3 连重试 —— 键盘会在桌面反复闪）
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            SBLog(@"[KBDWARM] T+0.6s keyboardShown=%d wxkb_plugin_running=%d",
-                  gDidShow, KbdProcRunning());
-            // 只补一次：真没弹出来再 become 一次。绝不再做 3 连重试 ——
-            // 那会让键盘在桌面上反复闪、且迟迟不收（老板实测"注销后键盘一直留在桌面"）。
+            SBLog(@"[KBDWARM] T+0.6s keyboardShown=%d", gDidShow);
             if (!gDidShow && gWarmField && !gWarmField.isFirstResponder) {
                 @try { [gWarmField becomeFirstResponder]; } @catch (NSException *e) {}
             }
         });
 
-        // T+1.2s：**兜底**收键盘（正常路径在 DidShow 那一刻就收掉了）。
-        // 以前这里写的是 `if (!gDidShow) return;` —— 而 SpringBoard 里 UIKeyboardDidShow
-        // 经常收不到，结果"键盘弹出来了却永远不收"，一直挂在桌面上。
-        // 所以无论有没有收到 DidShow，到点都无条件收一遍。
+        // T+1.2s：兜底收键盘（正常路径在 DidShow 那一刻已收）。SpringBoard 里
+        // UIKeyboardDidShow 经常收不到，所以无论有没有收到，到点都无条件收一遍。
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             KbdWarmupFinish(@"T+1.2s-fallback");
-            SBLog(@"[KBDWARM] T+1.2s 兜底收键盘完成 wxkb_plugin_running=%d", KbdProcRunning());
+            SBLog(@"[KBDWARM] T+1.2s 兜底收键盘完成");
         });
 
-        // T+1.1s 的"补收"已并入上面的 T+1.2s 兜底（KbdWarmupFinish 本身幂等）
-
-        // T+3s：最终判定 + 释放 busy（无论成败都要释放，否则下次预热会被 busy 挡住）
+        // T+3s：释放 busy（无论成败都要释放，否则下次预热会被 busy 永久挡住）
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            BOOL running = KbdProcRunning();
-            SBLog(@"[KBDWARM] T+3s FINAL keyboardShown=%d wxkb_plugin_running=%d (%@)",
-                  gDidShow, running, running ? @"成功" : @"失败");
+            SBLog(@"[KBDWARM] T+3s FINAL keyboardShown=%d", gDidShow);
             KbdWarmupFinish(@"T+3s-final");
             gWarmBusy = NO;
         });
     });
 }
 
-// ===== Darwin 通知入口（daemon -> SpringBoard）=====
+// ===== Darwin 通知入口（daemon -> SpringBoard）：只此一个通道 =====
 static void WCVKNotifyCallback(CFNotificationCenterRef center, void *observer,
                                CFStringRef name, const void *object,
                                CFDictionaryRef userInfo) {
-    NSString *n = (__bridge NSString *)name;
-    if ([n isEqualToString:@"com.wcvoicekeep.kbd.warmup"]) {
+    if ([(__bridge NSString *)name isEqualToString:@"com.wcvoicekeep.kbd.warmup"])
         KbdWarmupRun(@"darwin-notify");
-    }
-}
-
-// 微信侧 wcprewarmfix.dylib 的 ctor 探针回调（见 WCVKInit 里的注册说明）。
-// 只写一行日志，不做任何其它动作，零副作用。
-static void WCVKPrewarmNotifyCallback(CFNotificationCenterRef center, void *observer,
-                                      CFStringRef name, const void *object,
-                                      CFDictionaryRef userInfo) {
-    SBLog(@"[PREWARM] ctor reached —— 微信侧 wcprewarmfix.dylib 已注入并执行");
-    WCVKMarker("prewarm-ctor");
-}
-
-// ===== reveal 通道（v2.0.19 起降级为「只记录」）=====
-// v2.0.18 曾在这里用 SBSLaunchApplicationWithIdentifier(bid, false) 做前台激活，
-// 想让微信走「用户点图标」的原生路径自愈。实测判死（原因见 WCVKRevealRun 里注释）：
-// 该私有 API 在 SpringBoard 主线程同步阻塞 11 秒、rc=11 未被受理、且导致全系统卡死。
-// 现在保留通道本身（方便将来换成非阻塞方案时复用），但绝不调用任何启动 API。
-static CFAbsoluteTime gWCVKLastReveal = 0;
-
-static void WCVKRevealRun(const char *bid) {
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - gWCVKLastReveal < 2.0) {
-        SBLog(@"[REVEAL] 去重：2s 内已收到过，忽略");
-        return;
-    }
-    gWCVKLastReveal = now;
-    if (!bid || !bid[0]) bid = "com.tencent.xin";
-
-    // ⛔⛔ v2.0.19：**这里绝对不能调 SBSLaunchApplicationWithIdentifier**。
-    // 2026-11-07 02:58 老板实测：直接进微信后整个系统卡死，切后台都切不了，很久才闪退重启。
-    // 本机日志铁证（/var/mobile/wetypekeepalive.log）：
-    //   [18:56:46] [REVEAL] 收到原生激活请求
-    //   [18:56:56] [REVEAL] 原生前台激活 com.tencent.xin rc=11（0=已受理）
-    //   —— 中间整整 11 秒，这个私有 API 在 SpringBoard 主线程**同步阻塞**，
-    //      SpringBoard 主线程一卡，全系统就跟着卡（Home/切后台全部无响应）；
-    //      而且 rc=11 说明这次启动根本没被受理，等于白卡。
-    //      微信侧同一时刻的复查也被从 1.5s 拖到 10s（02:57:43.364 → 02:57:53.675），
-    //      两边互锁：SB 等微信响应，微信主线程在等 SB。
-    // 现在这条通道只留「收到即记录」，不做任何系统调用、不阻塞任何线程。
-    // 微信侧 v2.0.19 起也不再发这个 notify（见 WCPrewarmFix.m 的 kWPFSafeMode）。
-    SBLog(@"[REVEAL] 收到请求 %s —— v2.0.19 只记录，不调用任何启动 API（避免阻塞 SpringBoard）", bid);
-}
-
-// userInfo 里带 bundleId 就用它，不带默认微信
-static void WCVKRevealNotifyCallback(CFNotificationCenterRef center, void *observer,
-                                     CFStringRef name, const void *object,
-                                     CFDictionaryRef userInfo) {
-    // 微信侧只发裸 notify（不带 payload），目标固定是微信
-    SBLog(@"[REVEAL] 收到原生激活请求");
-    WCVKRevealRun("com.tencent.xin");
 }
 
 __attribute__((constructor))
 static void WCVKInit(void) {
-    WCVKMarker("ctor");
     SBLog(@"[KBDWARM] dylib loaded pid=%d build=%s", getpid(), WCVK_BUILD_TAG);
     // 键盘显示/隐藏观察先装好（daemon 侧靠 kbd.up 重新挂监视）
     dispatch_async(dispatch_get_main_queue(), ^{ KbdInstallObservers(); });
@@ -408,23 +381,6 @@ static void WCVKInit(void) {
                                     NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     SBLog(@"[KBDWARM] darwin notify com.wcvoicekeep.kbd.warmup registered");
 
-    // ★ 微信侧 wcprewarmfix.dylib 的「我被执行了」探针（v2.0.14）。
-    //   微信是沙盒 App，它的日志写不写得出来受容器/权限影响，这条走 darwin notify 完全
-    //   不碰文件系统：只要 wcprewarmfix 的 %ctor 跑到，这里就一定落一行 [PREWARM]。
-    //   有这行 = dylib 确实被注入并执行；没这行 = 注入链路本身没走通。
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    NULL, WCVKPrewarmNotifyCallback,
-                                    CFSTR("com.wcvoicekeep.prewarm.ctor"),
-                                    NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-    SBLog(@"[KBDWARM] prewarm probe registered (com.wcvoicekeep.prewarm.ctor)");
-
-    // ★ v2.0.18：原生「黑屏转显示」通道。
-    //   微信侧检测到黑屏就发 com.wcvoicekeep.prewarm.reveal，这里用 SpringBoard 原生
-    //   前台激活接口把微信重新激活一次 —— 等价于用户点图标，让微信自己把界面显示出来，
-    //   全程不碰 window / windowScene，微信内部状态保持一致。
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    NULL, WCVKRevealNotifyCallback,
-                                    CFSTR("com.wcvoicekeep.prewarm.reveal"),
-                                    NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-    SBLog(@"[KBDWARM] reveal channel registered (com.wcvoicekeep.prewarm.reveal)");
+    // kbd.up 的 token 只用来写 notify state（把新扩展 pid 递给 daemon），不注册回调
+    notify_register_check("com.wcvoicekeep.kbd.up", &gKbdUpToken);
 }
