@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>title</key>
+	<string>后台保活</string>
+	<key>items</key>
+	<array>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>后台保活</string>
+			<key>footerText</key>
+			<string>进程退出用系统内核事件监听，被杀的那一刻才回调，平时零 CPU 占用。任何设置改动都立即生效，无需注销。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>后台保活总开关</string>
+			<key>key</key>
+			<string>enabled</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.wcvoicekeep.bgkeep</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>微信输入法键盘扩展</string>
+			<key>footerText</key>
+			<string>键盘扩展（wxkb_plugin）必需保活、不提供关闭选项：它被系统内存压力回收后，插件会让系统重新把它拉起来，保持热启动，下次弹键盘不再等冷启动。副作用：在桌面时被回收会看到键盘闪一下（系统限制，无法隐藏）。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>后台保活 App</string>
+			<key>footerText</key>
+			<string>选中 = 该 App 被杀后在后台重新拉起，不切前台、屏幕不动，下次打开就是热启动。未选中 = 完全不干预。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>label</key>
+			<string>选择保活 App</string>
+			<key>detail</key>
+			<string>ATLApplicationListMultiSelectionController</string>
+			<key>defaults</key>
+			<string>com.wcvoicekeep.bgkeep</string>
+			<key>key</key>
+			<string>enabledApps</string>
+			<key>sections</key>
+			<array>
+				<dict>
+					<key>sectionType</key>
+					<string>Visible</string>
+				</dict>
+			</array>
+			<key>showIdentifiersAsSubtitle</key>
+			<true/>
+			<key>defaultApplicationSwitchValue</key>
+			<false/>
+			<key>useSearchBar</key>
+			<true/>
+			<key>hideSearchBarWhileScrolling</key>
+			<true/>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>拉起记录</string>
+			<key>footerText</key>
+			<string>关闭后插件不再写任何记录文件（零写入、零开销），已存在的记录也会忽略。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>记录拉起动作</string>
+			<key>key</key>
+			<string>record</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.wcvoicekeep.bgkeep</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSLinkCell</string>
+			<key>label</key>
+			<string>查看拉起记录</string>
+			<key>detail</key>
+			<string>BKRecordsController</string>
+			<key>bundle</key>
+			<string>BackgroundKeepPrefs</string>
+			<key>isController</key>
+			<true/>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>功能说明</string>
+			<key>footerText</key>
+			<string>1. 键盘扩展（微信输入法 wxkb_plugin）：始终保活。被回收后插件请系统重新拉起，保持热启动。
+2. 保活 App：你在上面勾选的 App，被系统或手动杀掉后在后台重新拉起（不切前台、不亮屏、不打扰）。
+3. 记录：每次拉起都会在「查看拉起记录」里留一条时间 + 目标 + 结果；关掉开关则完全不写。
+4. 原理：每个目标单独挂一个内核进程退出事件，只有目标真的退出时才会回调，平时没有任何轮询与定时器，CPU 占用为 0。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>© 2026 huhansibuxin (GitHub: huhansibuxin)</string>
+		</dict>
+	</array>
+</dict>
+</plist>

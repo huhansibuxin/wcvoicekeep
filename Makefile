@@ -1,57 +1,59 @@
-# wcvoicekeep — 微信输入法语音免跳转 (rootless / ElleKit / NathanLR / TrollFools)
+# wcvoicekeep / 后台保活 —— 2.0.0
+#
+# 架构（2.0.0 大改，老板 2026-11-06 定案）：
+#   * 只管「后台保活」：键盘扩展 wxkb_plugin + 用户在设置里勾选的任意 App
+#   * 微信输入法主程序（com.tencent.wetype）的 PiP 保活整套**已删除**（输入法更新后不再需要）
+#   * 事件驱动：daemon 给每个目标单独挂内核进程退出事件（DISPATCH_PROC_EXIT），零轮询
+#   * 完全后台拉起：SBSLaunchApplicationWithIdentifier(bid, 1)（flag=Background，不切前台）
+#   * 设置页：wcvkprefs（PreferenceLoader bundle，结构照 notification-island-persist/niprefs）
+#
+# 双版本编译（照 wctweak 流程）：
+#   环境变量 WCVK_NO_LOG=1 -> 编译期剥掉所有日志埋点（纯净版 pure）；=0 -> 带日志版（log）
+#   CI 用 matrix flavor [log, pure] 各出一份 deb。
+#
 # 编译方式照搬已验证的 chatswipe / wctweak：
 # - TrollFools + ElleKit 只加载「链接了 substrate(=ellekit)」的 dylib，
 #   故必须链接仓库内自带 CydiaSubstrate.framework（见 Frameworks/）。
-# - 注入目标 com.tencent.wetype 由 TF 选 App，Filter plist 仅作 ElleKit 兜底。
 
 export TARGET = iphone:clang:latest:16.0
 export ARCHS = arm64 arm64e
-# v1.9.34：切 roothide scheme（老板设备 = Relaxin 隐根）。
-# 参考 watch-both-notify 的验证做法：必须配合 roothide 官方 fork 的 theos，
-# 普通 theos 不认 roothide scheme。CI 侧已改为 clone github.com/roothide/theos。
+# 老板设备 = roothide 隐根；必须配合 roothide 官方 fork 的 theos（普通 theos 不认该 scheme）
 export THEOS_PACKAGE_SCHEME = roothide
 export _THEOS_PLATFORM_DPKG_DEB_COMPRESSION = gzip
 export ERROR_ON_WARNINGS = 0
 export LOGOS_DEFAULT_GENERATOR = internal
 
+# 日志开关：CI 传 1 出纯净版；本地/默认 0 出带日志版
+WCVK_NO_LOG ?= 0
+export WCVK_NO_LOG
+
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = WCVoiceKeep wetypekeepalive
-
-WCVoiceKeep_FILES = Tweak.xm
-WCVoiceKeep_FRAMEWORKS = UIKit AudioToolbox
-# 关键：链接 CydiaSubstrate(=ellekit)，TF 注入才能被 ElleKit 加载执行。
-WCVoiceKeep_LDFLAGS = -Wl,-no_warn_inits -F$(THEOS_PROJECT_DIR)/Frameworks -framework CydiaSubstrate
-WCVoiceKeep_CFLAGS = -fobjc-arc -fno-modules -w
-
-# ===== SpringBoard 侧注入：让 wetype 永不被挂起 + scene 保持 active =====
-# 参考 Immortalizer（iOS14-16.7.7 开源验证）：FBScene updateSettings 拦截去激活
-# （进程不挂起）+ UIMutableApplicationSceneSettings setDeactivationReasons 拦截
-# （scene 保持 active）-> 微信视频 PiP 顶掉后 PiP 可自动恢复/后台重建。
-# v1.9.18 融合进本 deb（老板要求：不要单独插件避免冲突）。
+# ===== SpringBoard 侧：唯一职责 = 被 daemon 叫醒时把键盘弹一下，让系统把 wxkb_plugin 拉起来 =====
+# （2.0.0 删除了原来的 FBScene PiP 保活 —— 那是给微信输入法主程序用的，现在整套不要了）
+TWEAK_NAME = wetypekeepalive
 wetypekeepalive_FILES = SBKeepAlive.xm
-# UIKit：v1.9.33 键盘扩展预热实验需要 UIWindow/UITextField/UIWindowLevelNormal
 wetypekeepalive_FRAMEWORKS = UIKit Foundation
 wetypekeepalive_LDFLAGS = -Wl,-no_warn_inits -F$(THEOS_PROJECT_DIR)/Frameworks -framework CydiaSubstrate
-wetypekeepalive_CFLAGS = -fobjc-arc -fno-modules -w
+wetypekeepalive_CFLAGS = -fobjc-arc -fno-modules -w -DWCVK_NO_LOG=$(WCVK_NO_LOG)
 
-# ===== 守护进程（注销/重启后自动把 Wetype 主 App 后台拉起，触发 dylib 建 PiP standby）=====
-# rootless 下 TOOL_INSTALL_PATH=/usr/bin -> 实际落到 /var/jb/usr/bin/wcvoicekeep，
-# 与 layout 里 com.wcvoicekeep.daemon.plist 的 Program 路径一致。
+# ===== 守护进程：事件驱动看护 + 后台拉起 =====
+# roothide 下落到 /usr/bin/wcvoicekeep（与 layout 里 LaunchDaemons 的 Program 路径一致）
 TOOL_NAME = wcvoicekeep
 wcvoicekeep_FILES = daemon.m
 wcvoicekeep_INSTALL_PATH = /usr/bin
-# Foundation + MobileCoreServices：LSApplicationWorkspace 类在 MobileCoreServices
-# framework 里，daemon 独立进程必须显式链接/ dlopen 才能 NSClassFromString 找到。
-# AudioToolbox：v1.9.13 otherAudioPlaying() 用 AudioSessionGetProperty 查其他 App 是否在播音频
-#（有音频（视频 PiP/音乐）时不重拉，避免打断）。
-wcvoicekeep_FRAMEWORKS = Foundation MobileCoreServices AudioToolbox
-# 关键：SBSLaunchApplicationWithIdentifier 需要 com.apple.springboard.launchapplications 权限，
-# 不签这个 entitlement，daemon 拉 App 会被拒/被杀。
+# Foundation + MobileCoreServices：LSApplicationWorkspace / LSApplicationProxy 解析 App 可执行路径
+wcvoicekeep_FRAMEWORKS = Foundation MobileCoreServices
+# SBSLaunchApplicationWithIdentifier 需要 com.apple.springboard.launchapplications 权限
 wcvoicekeep_CODESIGN_FLAGS = -S$(THEOS_PROJECT_DIR)/entitlements.plist
+wcvoicekeep_CFLAGS = -fobjc-arc -fno-modules -w -DWCVK_NO_LOG=$(WCVK_NO_LOG)
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 include $(THEOS_MAKE_PATH)/tool.mk
+
+# ===== 设置页（显示名「后台保活」）=====
+SUBPROJECTS += wcvkprefs
+include $(THEOS_MAKE_PATH)/aggregate.mk
 
 before-package::
 	@chmod 755 layout/DEBIAN/postinst

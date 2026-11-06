@@ -1,1365 +1,528 @@
+// wcvoicekeep daemon — 2.0.0「后台保活」
 //
-//  wcvoicekeep daemon  (v1.9.32)
+// 职责（老板 2026-11-06 定案）：
+//   1) 键盘扩展 wxkb_plugin —— **必须保活**（不可关闭）。它一退出，立刻请 SpringBoard 弹一下键盘
+//      把系统重新 spawn 出来（系统只认真实键盘请求，无其它后门）。
+//   2) 用户在设置里勾选的任意 App —— 被杀后在**后台**无头拉起（SBSLaunchApplicationWithIdentifier
+//      flag=Background，完全不切前台）。
+//   3) 每次拉起都写一条**记录**（纯净版/日志版都写），设置页「拉起记录」里可查。
 //
-//  目标：让 WeChat Keyboard (Wetype, com.tencent.wetype) 主 App 在注销/重启后
-//  自动被前台预热一次，建起原生 PiP standby 并自动退后台自保活（见 Tweak.xm）。
+// 事件驱动（老板明确要求，零轮询）：
+//   进程退出用内核事件 DISPATCH_SOURCE_TYPE_PROC + DISPATCH_PROC_EXIT 监听，
+//   目标进程一死内核立刻回调，我们才动作；平时 CPU 开销为 0，不采样、不定时器扫描。
+//   只监听"勾选的目标"，其它进程一概不碰 —— 这就是"精准命中"。
 //
-//  === 架构 ===
-//    dylib(Tweak.xm, TF 注入主 App) : 监听 DidFinishLaunching / DidBecomeActive
-//                                     / 达尔文通知 com.wcvoicekeep.pip.trigger；
-//                                     前台激活时建 PiP standby；预热模式下建完自动退后台。
-//    daemon(本文件, LaunchDaemon)   : RunAtLoad 自动起 → 前台预热 Wetype 一次（带
-//                                     --wcvk-warmup 参数）→ 之后 60s 轮询看护。
-//
-//  === v1.8.2 修复（根因） ===
-//  v1.8.1 用 dlopen SpringBoardServices + dlsym "SBSLaunchApplicationWithIdentifier"。
-//  该函数签名在 iOS 14+ 已变(原两参 Boolean suspended -> 新版本 enum flags)，
-//  iOS 16 上 dlsym 返回 NULL，调用 NULL function pointer -> SIGSEGV -> 进程 exit -9。
-//  所以 v1.8.1 实测"daemon 没生效"=启动即段错误自杀，跟 launchctl 激活无关。
-//
-//  修复：用 ObjC runtime 拿 LSApplicationWorkspace.defaultWorkspace，调
-//  openApplicationWithBundleID:active: (Bool)。iOS 13+ 名字稳定、不会 SIGSEGV。
-//  第二参 active=NO 本意是后台拉起，但【实测 iOS 16 照样弹 UI】——active:NO 只是
-//  "不抢已运行 App 的前台"，新 App launch 时界面仍渲染。所以这条路做不到真无头。
-//
-//  === v1.8.7 修复（无头启动，v1.9.0 弃用改预热）===
-//  SBSLaunchApplicationWithIdentifier(CFStringRef, int flags)，flags=1=Background 可无头拉起。
-//  但实测：后台拉起的 App 里 startPictureInPicture 被系统硬拒（UIScene 必须
-//  ForegroundActive，AVKit 错误 -1001），dylib 建不起 PiP -> 无保活凭证 -> App 挂起被杀。
-//  v1.8.8 音频保活（静音循环）能保活但耗 media 服务（老板否决）。
-//
-//  === v1.9.0 架构（最终，老板拍板）===
-//  唯一可行 = 开机后前台预热一次：
-//    1) 前台拉起让 App 激活出 UI（闪 ~0.5s，带 --wcvk-warmup 参数）
-//    2) dylib 立即建 PiP（isActive=1）
-//    3) dylib 判定预热 -> [[UIApplication suspend]] 自动退后台
-//    4) PiP 常驻后台 = 自保活凭证（无 media 服务、0 CPU），点语音按钮不跳转
-//  预热节流：成功拉起后 15min 内不重复（防反复闪屏）；锁屏期失败不记录，每 60s 重试。
-//
-//  进程存在检测也由 SBS 改 proc_listpids，避免 dlsym 失败时拿不到 pid 误判"未跑"。
-//
-//  编译：Makefile 的 TOOL_NAME=wcvoicekeep (rootless -> /var/jb/usr/bin/wcvoicekeep)
-//        + entitlements.plist 中的 com.apple.springboard.launchapplications (LSApplicationWorkspace
-//        在 daemon 上下文仍受 entitlement 管控，缺这个会被拒)。
-//
-#include <Foundation/Foundation.h>
-#include <objc/message.h>   // objc_msgSend (强转调 active: BOOL 参数)
-#include <dlfcn.h>          // dlopen LSApplicationWorkspace 所在 framework
+// 2.0.0 删除：微信输入法主程序（com.tencent.wetype）PiP 保活/前台预热/僵尸判定整套。
+
+#import <Foundation/Foundation.h>
+#import <MobileCoreServices/MobileCoreServices.h>
+#import <objc/message.h>
 #include <sys/sysctl.h>
-#include <sys/param.h>      // PATH_MAX
-#include <sys/proc.h>       // struct kinfo_proc / KERN_PROC_*
-#include <stdlib.h>
+#include <sys/stat.h>
+#include <libproc.h>
+#include <dlfcn.h>
+#include <dispatch/dispatch.h>
+#include <notify.h>
+#include <fcntl.h>
 #include <string.h>
-#include <time.h>           // time() 预热节流
-#include <signal.h>         // SIGKILL
-#include <fcntl.h>          // v1.9.23：日志 3M 上限（open O_TRUNC）
-#include <sys/stat.h>       // v1.9.23：stat 日志大小
-#include <glob.h>           // v1.9.39：动态定位 wxkb_plugin.appex（UUID 路径）
+#include <time.h>
+#include <stdlib.h>
+#include <stdio.h>
 
-// notify.h 在 theos iOS SDK 16.5 路径里默认找不全 - 手动声明 Darwin 通知 API
-// 而不依赖 <notify.h>。这是私有 API 但 iOS 13+ 名/签名都稳定。
-extern uint32_t notify_post(const char *name);
-extern uint32_t notify_register_dispatch(const char *name, int *out_token,
-                                         dispatch_queue_t queue, void (^handler)(int));
-extern uint32_t notify_get_state(int token, uint64_t *state);
+// ===== 日志（纯净版编译期整体剥离；记录不走这里，纯净版照样写）=====
+#ifndef WCVK_NO_LOG
+#define WCVK_NO_LOG 0
+#endif
 
-#include <dispatch/dispatch.h>   // v1.9.42：DISPATCH_SOURCE_TYPE_PROC 事件监听
+static NSString *const kLogPath     = @"/var/mobile/wcvoicekeep.daemon.log";
+static NSString *const kPrefsDomain = @"com.wcvoicekeep.bgkeep";
+static NSString *const kRecordsName = @"com.wcvoicekeep.bgkeep.records.plist";
 
-// v1.9.42：事件驱动键盘扩展看护（定义在后，注册处先声明）
-static void armKbdProcWatch(void);
-static void onKbdWarmupOk(void);
-static dispatch_queue_t kbdEventQueue(void);
-static int  gKbdOkToken = 0;    // "拉起成功"回报的 notify token（注册处在前面）
-
-#define SBS_PATH "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices"
-
-// ===== 配置 =====
-static NSString *const kTargetBundleID = @"com.tencent.wetype";
-static NSString *const kWechatBundleID = @"com.tencent.xin"; // 注销后错开无头拉起（老板要求）
-static const char    *const kTriggerName = "com.wcvoicekeep.pip.trigger"; // 与 Tweak.xm 一致
-static const char    *const kPipBuiltName = "com.wcvoicekeep.pip.built";  // dylib->daemon：PiP 已建
-static const int    kBootDelaySec     = 1;        // v1.9.20：1s（原 3s），注销后尽早开始预热
-static const int    kCheckIntervalSec = 60;       // 守护轮询
-// v1.9.42：键盘扩展不再用轮询间隔（改事件驱动，见 armKbdProcWatch）
-static const int    kFastRetrySec     = 5;        // 预热快循环间隔（锁屏期重试）
-static const int    kPipWaitTimeoutSec = 15;      // 等 dylib 报 pip.built 超时
-static const int    kKillStaleSec     = 25;       // 进程在跑但迟迟无 pip.built -> kill 重试（锁屏僵尸）
-static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.daemon.log";
-
-// 前向声明：maybeWarmWechat / reWarm / watchWechat 定义在 registerNotifs 之后，但回调里要用
-static void maybeWarmWechat(void);
-static void reWarm(void);
-static void watchWechat(void);
-static int taskSuspendCount(int pid); // v1.9.15：warmupOnce(361) 在定义(465)之前使用
-static BOOL otherAudioPlaying(void);  // v1.9.21：pip.lost 回调(364)在定义(551)之前使用
-
-// ===== 无头启动：SBS 后台 flag=1（首选），LSA active:NO（兜底）=====
-// SBS background flag=1 = 真后台启动（不显 UI）。LSA active:NO 仅兜底（会带 UI）。
-@interface LSAppWorkspaceShim : NSObject
-+ (id)defaultWorkspace;
-- (BOOL)openApplicationWithBundleID:(id)arg1 active:(BOOL)arg2;
-@end
-
-// ===== 工具：append 写日志(原子写避免半行) =====
-// v1.9.23：日志上限 3M（kLogPath + stderr 重定向文件），每 30s 检查一次超限清空
-static void TrimDaemonLogs(void) {
-    static time_t lastCheck = 0;
-    time_t now = time(NULL);
-    if (now - lastCheck < 30) return;
-    lastCheck = now;
-    @autoreleasepool {
-        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:kLogPath error:nil];
-        if ([attr[NSFileSize] unsignedLongLongValue] > 3ull * 1024 * 1024) {
-            [[NSData data] writeToFile:kLogPath atomically:YES]; // 清空
-        }
-    }
-    const char *errPath = "/var/log/wcvoicekeep.daemon.err";
-    struct stat est;
-    if (stat(errPath, &est) == 0 && est.st_size > 3ll * 1024 * 1024) {
-        int fd = open(errPath, O_WRONLY | O_TRUNC);
-        if (fd >= 0) close(fd);
-    }
-}
+#if WCVK_NO_LOG
+#define LOG(...) do {} while (0)
+#else
 static void LOG(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
+    NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:kLogPath error:nil];
+    if ([attr[NSFileSize] unsignedLongLongValue] > 2 * 1024 * 1024) {
+        [[NSFileManager defaultManager] removeItemAtPath:kLogPath error:nil];
+    }
     NSString *line = [NSString stringWithFormat:@"[%@][daemon] %@\n", [NSDate date], msg];
-    NSLog(@"[WCVK-daemon] %@", msg);
-    // 镜像到 stderr → launchd StandardErrorPath(/var/log/wcvoicekeep.daemon.err)
-    // 进程被 SIGKILL/SIGSEGV/launchd throttle 时不至于丢全部上下文
-    fprintf(stderr, "%s", [line UTF8String]); fflush(stderr);
-    TrimDaemonLogs(); // v1.9.23：3M 上限
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLogPath];
     if (!fh) {
-        [[NSData data] writeToFile:kLogPath atomically:YES]; // touch
+        [line writeToFile:kLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         fh = [NSFileHandle fileHandleForWritingAtPath:kLogPath];
         if (!fh) return;
     }
-    @try { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; }
-    @catch (NSException *e) {}
-    @try { [fh closeFile]; } @catch (NSException *e) {}
+    @try {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } @catch (NSException *e) {}
+}
+#endif
+
+// ===== 越狱根定位（roothide 隐根：不硬编码，靠自身路径反推）=====
+static NSString *WCVKJbroot(void) {
+    static NSString *root = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Dl_info info;
+        if (dladdr((void *)&WCVKJbroot, &info) && info.dli_fname) {
+            NSString *self = [NSString stringWithUTF8String:info.dli_fname];
+            NSRange r = [self rangeOfString:@"/usr/bin/"];
+            if (r.location != NSNotFound) root = [self substringToIndex:r.location];
+        }
+        if (!root) root = @"";
+    });
+    return root;
 }
 
-// ===== 进程存在性：通过 sysctl(KERN_PROC_ALL) + kinfo_proc.kp_proc.p_comm =====
-// 不用 libproc.h (Theos iOS SDK 找不到头)，手写 sysctl 路径稳如老狗。
-// 主 App 进程名 "wetype"（<=16 字节，正常），扩展进程名 "wxkb" 或 "WxKeyboard"，
-// 模糊匹配任一即认为 Wetype 在跑。
-// 通用：进程表里是否有精确匹配 comm 的进程（v1.9.7 抽出来给 wetype/微信共用）
-static BOOL procExists(const char *want) {
-    if (!want || !want[0]) return NO;
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-    size_t sz = 0;
-    if (sysctl(mib, 4, NULL, &sz, NULL, 0) != 0 || sz == 0) return NO;
-    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(sz);
-    if (!procs) return NO;
-    if (sysctl(mib, 4, procs, &sz, NULL, 0) != 0) { free(procs); return NO; }
-    int n = (int)(sz / sizeof(struct kinfo_proc));
-    BOOL found = NO;
-    for (int i = 0; i < n; i++) {
-        // v1.9.4：必须 strcmp 精确匹配——键盘扩展进程名 wxkb_plugin 含 wxkb 子串，
-        // strstr 会把它误判成"活着"（主 App 被杀也不重拉）。排除 *_plugin。
-        if (strcmp(procs[i].kp_proc.p_comm, want) == 0) { found = YES; break; }
+// prefs / 记录候选路径：roothide 下设置进程把 plist 写进隐根内部，daemon 视角可能不同，
+// 因此几个候选都试，取"真实存在且更新"的那份（NIP 项目实测教训：suiteName 通道读不到）。
+static NSArray<NSString *> *WCVKPrefsDirCandidates(void) {
+    NSString *jb = WCVKJbroot();
+    NSMutableArray *a = [NSMutableArray array];
+    if (jb.length) [a addObject:[jb stringByAppendingString:@"/var/mobile/Library/Preferences"]];
+    [a addObject:@"/var/mobile/Library/Preferences"];
+    if (![jb isEqualToString:@"/rootfs"]) [a addObject:@"/rootfs/private/var/mobile/Library/Preferences"];
+    return a;
+}
+
+static NSString *WCVKExistingPrefsDir(void) {
+    static NSString *cached = nil;
+    if (cached) return cached;
+    NSString *best = nil;
+    double bestM = -1;
+    for (NSString *dir in WCVKPrefsDirCandidates()) {
+        NSString *p = [dir stringByAppendingFormat:@"/%@.plist", kPrefsDomain];
+        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+        if (!attr) continue;
+        double m = [attr[NSFileModificationDate] timeIntervalSince1970];
+        if (m > bestM) { bestM = m; best = dir; }
     }
-    free(procs);
-    return found;
+    if (!best) best = WCVKPrefsDirCandidates().firstObject;
+    cached = best;
+    return cached;
 }
 
-// wetype 主 App 进程名：wxkb（扩展进程 wxkb_plugin 不算）
-static BOOL isAppRunning(NSString *bundleID) {
-    (void)bundleID;
-    return procExists("wxkb") || procExists("wetype") || procExists("WxKeyboard");
+static NSString *WCVKPrefsPath(void) {
+    return [WCVKExistingPrefsDir() stringByAppendingFormat:@"/%@.plist", kPrefsDomain];
+}
+static NSString *WCVKRecordsPath(void) {
+    return [WCVKExistingPrefsDir() stringByAppendingFormat:@"/%@", kRecordsName];
 }
 
-// v1.9.13：返回匹配 comm 的第一个进程 pid（找不到 -1）。wetype 主 App = wxkb
-static int procPid(const char *want) {
-    if (!want || !want[0]) return -1;
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-    size_t sz = 0;
-    if (sysctl(mib, 4, NULL, &sz, NULL, 0) != 0 || sz == 0) return -1;
-    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(sz);
-    if (!procs) return -1;
-    if (sysctl(mib, 4, procs, &sz, NULL, 0) != 0) { free(procs); return -1; }
-    int n = (int)(sz / sizeof(struct kinfo_proc));
-    int pid = -1;
-    for (int i = 0; i < n; i++) {
-        if (strcmp(procs[i].kp_proc.p_comm, want) == 0) { pid = procs[i].kp_proc.p_pid; break; }
-    }
-    free(procs);
-    return pid;
-}
+// ===== 设置读取 =====
+static BOOL     gEnabled = YES;   // 总开关
+static BOOL     gLogging = NO;    // 日志开关（日志版才有实际作用）
+static BOOL     gRecord  = YES;   // 拉起记录开关：关掉后**完全不写**记录（零写入零开销）
+static NSArray *gAppBIDs = nil;   // 用户勾选的 App bundle id 数组
 
-// 微信主进程名：WeChat
-// v1.9.17：官方微信检测改为「一次性缓存容器路径 + proc_pidpath 轻量判定」。
-// 不能用 procExists("WeChat")——设备两个微信（官方 com.tencent.xin + 企业
-// com.tencent.qy.xin）主进程名都叫 WeChat，企业微信在跑会误判官方微信活着。
-// v1.9.16 的 allApplications 每次 tick 遍历太重 -> 内存暴涨被 jetsam 杀 14 次
-// （last exit reason = JETSAM_REASON_MEMORY_PERPROCESSLIMIT）-> 微信看护失效。
-// 现改为：启动时用 LSApplicationWorkspace 拿一次官方微信容器路径（一次性开销），
-// 之后 isWechatRunning 纯 sysctl + proc_pidpath 路径前缀匹配（轻量、零内存增长）。
-// theos SDK 缺 libproc.h，手写声明（libproc 系统库符号稳定）。
-extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
-static char gWechatPathPrefix[PATH_MAX] = {0}; // 官方微信容器路径前缀（如 .../720ADACF-.../）
-// v1.9.18：文件系统扫描找官方微信容器——读每个 WeChat.app/Info.plist 的
-// CFBundleIdentifier，匹配 com.tencent.xin 即记录其容器路径。
-// 不用 LSApplicationWorkspace（v1.9.17 实测 allApplications 遍历拿不到/不触发，
-// container cached 日志=0，fallback 回"任意 WeChat"-> 企业微信顶替 bug 复活）。
-static void cacheWechatPath(void) {
-    if (gWechatPathPrefix[0]) return; // 只做一次
-    NSArray *dirs = [[NSFileManager defaultManager]
-                     contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:nil];
-    for (NSString *uuid in dirs) {
-        NSString *plistPath = [NSString stringWithFormat:
-            @"/var/containers/Bundle/Application/%@/WeChat.app/Info.plist", uuid];
-        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plistPath];
-        if ([info[@"CFBundleIdentifier"] isEqualToString:kWechatBundleID]) {
-            NSString *container = [NSString stringWithFormat:
-                @"/var/containers/Bundle/Application/%@/", uuid];
-            strlcpy(gWechatPathPrefix, [container UTF8String], PATH_MAX);
-            LOG(@"wechat(xin) container cached: %@", container);
-            return;
+static void WCVKReadPrefs(void) {
+    NSString *p = WCVKPrefsPath();
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+    if (!d) {
+        for (NSString *dir in WCVKPrefsDirCandidates()) {
+            NSDictionary *t = [NSDictionary dictionaryWithContentsOfFile:
+                               [dir stringByAppendingFormat:@"/%@.plist", kPrefsDomain]];
+            if (t) { d = t; break; }
         }
     }
-    LOG(@"wechat(xin) container NOT FOUND in filesystem scan");
+    id en = d[@"enabled"];
+    gEnabled = en ? [en boolValue] : YES;
+    id lg = d[@"logging"];
+    gLogging = lg ? [lg boolValue] : NO;
+    id rec = d[@"record"];
+    gRecord = rec ? [rec boolValue] : YES;
+    id apps = d[@"enabledApps"];
+    NSMutableArray *bids = [NSMutableArray array];
+    if ([apps isKindOfClass:[NSArray class]]) {
+        for (id b in apps) {
+            if ([b isKindOfClass:[NSString class]] && [b length]) [bids addObject:b];
+        }
+    }
+    gAppBIDs = bids;
+    LOG(@"prefs loaded (%@): enabled=%d logging=%d apps=%@", p, gEnabled, gLogging, gAppBIDs);
 }
-static BOOL isWechatRunning(void) {
-    cacheWechatPath();
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-    size_t sz = 0;
-    if (sysctl(mib, 4, NULL, &sz, NULL, 0) != 0 || sz == 0) return NO;
-    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(sz);
-    if (!procs) return NO;
-    if (sysctl(mib, 4, procs, &sz, NULL, 0) != 0) { free(procs); return NO; }
-    int n = (int)(sz / sizeof(struct kinfo_proc));
-    BOOL found = NO;
-    for (int i = 0; i < n; i++) {
-        if (strcmp(procs[i].kp_proc.p_comm, "WeChat") != 0) continue;
-        if (gWechatPathPrefix[0]) {
-            char pathbuf[PATH_MAX];
-            int len = (int)proc_pidpath(procs[i].kp_proc.p_pid, pathbuf, sizeof(pathbuf));
-            if (len > 0 && strncmp(pathbuf, gWechatPathPrefix, strlen(gWechatPathPrefix)) == 0) { found = YES; break; }
-        } else {
-            found = YES; // 缓存失败 fallback：任意 WeChat 进程
+
+// ===== 拉起记录（纯净版也写；设置页「拉起记录」读它）=====
+static void WCVKRecord(NSString *display, NSString *ident, NSString *kind, BOOL ok, NSString *detail) {
+    // 记录开关关掉时**直接返回**：不读文件、不写文件，零 syscall、零 CPU
+    if (!gRecord) return;
+    NSString *path = WCVKRecordsPath();
+    id old = [NSArray arrayWithContentsOfFile:path];
+    NSMutableArray *arr = [old isKindOfClass:[NSArray class]] ? [old mutableCopy] : [NSMutableArray array];
+    NSMutableDictionary *row = [NSMutableDictionary dictionary];
+    row[@"t"] = [NSDate date];
+    row[@"name"] = display ?: ident ?: @"?";
+    row[@"bid"] = ident ?: @"";
+    row[@"kind"] = kind ?: @"app";
+    row[@"ok"] = @(ok);
+    if (detail.length) row[@"detail"] = detail;
+    [arr insertObject:row atIndex:0];
+    while (arr.count > 60) [arr removeLastObject];
+    if (![arr writeToFile:path atomically:YES]) {
+        NSString *alt = @"/var/mobile/wcvoicekeep.records.plist";
+        [arr writeToFile:alt atomically:YES];
+        LOG(@"record write fallback -> %@", alt);
+    }
+}
+
+// ===== 进程工具（精确到可执行文件路径，不靠 16 字符截断的进程名）=====
+static int WCVKPidForPathSuffix(NSString *suffix, NSString *exactPath) {
+    int n = proc_listallpids(NULL, 0);
+    if (n <= 0) return 0;
+    pid_t *pids = (pid_t *)calloc((size_t)n + 64, sizeof(pid_t));
+    if (!pids) return 0;
+    int cnt = proc_listallpids(pids, (int)((size_t)(n + 64) * sizeof(pid_t)));
+    int found = 0;
+    for (int i = 0; i < cnt; i++) {
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(pids[i], path, sizeof(path)) <= 0) continue;
+        NSString *p = [NSString stringWithUTF8String:path];
+        if (!p.length) continue;
+        if (exactPath.length ? [p isEqualToString:exactPath] : [p hasSuffix:suffix]) {
+            found = pids[i];
             break;
         }
     }
-    free(procs);
+    free(pids);
     return found;
 }
 
-// ===== 关键：daemon 是独立进程，默认不链接 MobileCoreServices/LSApplicationWorkspace
-// framework，NSClassFromString(@"LSApplicationWorkspace") 会返回 NULL → 之前的
-// [FATAL] class not found。必须显式 dlopen 让 dyld 把 ObjC 类注册进 runtime。
-// iOS 16 上 LSApplicationWorkspace 在 MobileCoreServices.framework（旧）里，
-// 同时 iOS 14+ 也独立成 PrivateFrameworks/LSApplicationWorkspace.framework，
-// 两处都试，谁先注册成功就用谁的。
-static void ensureLSFrameworkLoaded(void) {
+// ===== App 可执行文件 / 显示名解析（LaunchServices）=====
+static void WCVKEnsureLSLoaded(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        const char *cands[] = {
-            "/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices",
-            "/System/Library/PrivateFrameworks/LSApplicationWorkspace.framework/LSApplicationWorkspace",
-            NULL
-        };
-        for (int i = 0; cands[i]; i++) {
-            void *h = dlopen(cands[i], RTLD_LAZY | RTLD_GLOBAL);
-            if (h) LOG(@"dlopen %s OK", cands[i]);
-            else  LOG(@"dlopen %s FAILED: %s", cands[i], dlerror());
-        }
+        dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
+        dlopen("/System/Library/PrivateFrameworks/LaunchServices.framework/LaunchServices", RTLD_LAZY);
     });
 }
 
-// ===== SBS 后台无头启动（首选）=====
-// SpringBoardServices 私有 API：int SBSLaunchApplicationWithIdentifier(CFStringRef, int)
-// flags=1 (SBSApplicationLaunchFlagBackground) = 真后台启动，不显 UI、不进前台。
-// 需要 com.apple.springboard.launchapplications entitlement（entitlements.plist 已有）。
-// iOS 16 上该 framework 二进制被合进 dyld shared cache，dlopen 可能失败 -> 走 LSA 兜底。
-static int (*g_SBSLaunch)(CFStringRef, int) = NULL;
-static BOOL sbsReady(void) {
-    static dispatch_once_t once; static void *h = NULL; static BOOL ok = NO;
-    dispatch_once(&once, ^{
-        h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
-                   RTLD_LAZY);
-        if (h) {
-            g_SBSLaunch = dlsym(h, "SBSLaunchApplicationWithIdentifier");
-            if (g_SBSLaunch) {
-                // 部分版本需先建立 SpringBoard server 端口，建立即可（返回值不用）
-                void (*portfn)(void) = dlsym(h, "SBSSpringBoardServerPort");
-                if (portfn) portfn();
-                ok = YES;
-                LOG(@"SBS ready (SpringBoardServices loaded, SBSLaunchApplicationWithIdentifier found)");
-            } else {
-                LOG(@"SBS dlsym SBSLaunchApplicationWithIdentifier FAILED: %s", dlerror());
-            }
-        } else {
-            LOG(@"SBS dlopen FAILED: %s", dlerror());
-        }
-    });
-    return ok;
-}
-
-// ===== 预热：前台拉起（激活出 UI）→ dylib 建 PiP → 自动退后台 =====
-// v1.9.0 架构（老板拍板）：后台起 PiP 被系统硬限制（UIScene 必须 ForegroundActive，
-// AVKit 错误 -1001 铁证，无私有 API 可绕）；音频保活又耗 media 服务（已否决）。
-// 唯一可行 = 开机后前台预热一次：
-//   1) 前台拉起让 App 激活出 UI（闪 ~0.5s）
-//   2) dylib 立即建 PiP（isActive=1）
-//   3) dylib 判定预热（--wcvk-warmup 参数）-> [[UIApplication suspend]] 自动退后台
-//   4) PiP 常驻后台 = 自保活凭证（无 media 服务、0 CPU），点语音按钮不跳转
-// 首选 SBSLaunchApplicationForDebugging 带 --wcvk-warmup 参数；
-// 兜底 SBS flag=0 前台激活 / LSA active:YES。
-static time_t gLastWarmup = 0; // pip.built 时间戳（日志参考）
-
-// 状态（warmupForeground 里要用，须先声明）
-static BOOL gPipUp = NO;       // dylib 确认 PiP 已建（自保活生效）
-static BOOL gScreenBlank = NO; // 屏幕熄灭（hasBlankedScreen 通知）
-static BOOL gLocked = NO;      // v1.9.10：设备锁定（lockstate 通知，1=锁定）——锁屏拉起输入法是僵尸没 PiP
-static time_t gWarmupLaunchTs = 0;
-
-static BOOL warmupForeground(void) {
-    LOG(@"warmupForeground called");
-    // (1) 首选：SBSLaunchApplicationForDebugging 带 --wcvk-warmup 参数（dylib 据此自动退后台）
-    if (sbsReady() && g_SBSLaunch) {
-        static int (*sbsDbg)(CFStringRef, CFURLRef, CFArrayRef, CFDictionaryRef,
-                             CFStringRef, CFStringRef, char) = NULL;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
-                             RTLD_LAZY);
-            if (h) sbsDbg = dlsym(h, "SBSLaunchApplicationForDebugging");
-        });
-        if (sbsDbg) {
-            NSArray *args = @[@"--wcvk-warmup"];
-            // v1.9.2：息屏时带 SBSApplicationLaunchUnlockDevice(4) 亮屏唤醒预热
-            char flags = gScreenBlank ? 4 : 0;
-            int r = sbsDbg((__bridge CFStringRef)kTargetBundleID, NULL,
-                           (__bridge CFArrayRef)args, NULL, NULL, NULL, flags);
-            LOG(@"warmup SBSLaunchApplicationForDebugging(--wcvk-warmup, flags=%d) -> %d (0=ok)", (int)flags, r);
-            if (r == 0) return YES;
-            LOG(@"warmup debug-launch failed(%d), fallback", r);
-        } else {
-            LOG(@"warmup SBSLaunchApplicationForDebugging dlsym FAILED, fallback");
-        }
-        // (2) 兜底：SBS 前台激活（亮屏 flag=0；息屏 flag=4 亮屏唤醒）；
-        //     dylib 用「启动后<8s 且刚建 PiP」启发式判定
-        int flags = gScreenBlank ? 4 : 0;
-        int r = g_SBSLaunch((__bridge CFStringRef)kTargetBundleID, flags);
-        LOG(@"warmup SBSLaunchApplicationWithIdentifier(flags=%d) -> %d (0=ok)", flags, r);
-        if (r == 0) return YES;
-    }
-    // (3) 最后兜底：LSA active:YES 前台
-    ensureLSFrameworkLoaded();
-    Class cls = NSClassFromString(@"LSApplicationWorkspace");
-    if (cls == Nil) { LOG(@"[FATAL] LSApplicationWorkspace class not found"); return NO; }
-    id ws = nil;
-    @try { ws = [cls performSelector:@selector(defaultWorkspace)]; }
-    @catch (NSException *e) { LOG(@"[FATAL] defaultWorkspace threw: %@", e); return NO; }
-    if (ws == nil) { LOG(@"[FATAL] defaultWorkspace nil"); return NO; }
-    SEL sel = NSSelectorFromString(@"openApplicationWithBundleID:active:");
-    if (![ws respondsToSelector:sel]) { LOG(@"[FATAL] no openApplicationWithBundleID:active:"); return NO; }
-    BOOL ok = NO;
+static NSDictionary *WCVKAppMeta(NSString *bid) {
+    WCVKEnsureLSLoaded();
+    Class WS = NSClassFromString(@"LSApplicationWorkspace");
+    if (!WS) return nil;
+    id ws = nil, proxy = nil;
     @try {
-        BOOL (*impl)(id, SEL, id, BOOL) = (BOOL(*)(id, SEL, id, BOOL))objc_msgSend;
-        ok = impl(ws, sel, kTargetBundleID, YES);
-    } @catch (NSException *e) { LOG(@"[FATAL] LSA launch threw: %@", e); return NO; }
-    LOG(@"warmup LSA openApplicationWithBundleID:active:YES -> %d", ok);
+        ws = ((id (*)(id, SEL))objc_msgSend)((id)WS, sel_registerName("defaultWorkspace"));
+        if (ws) proxy = ((id (*)(id, SEL, id))objc_msgSend)(ws,
+                            sel_registerName("applicationProxyForIdentifier:"), bid);
+    } @catch (NSException *e) {}
+    if (!proxy) return nil;
+
+    NSString *exe = nil, *appDir = nil, *name = nil;
+    @try { exe = ((id (*)(id, SEL))objc_msgSend)(proxy, sel_registerName("bundleExecutable")); } @catch (NSException *e) {}
+    @try {
+        NSURL *u = ((id (*)(id, SEL))objc_msgSend)(proxy, sel_registerName("bundleURL"));
+        appDir = u.lastPathComponent;
+    } @catch (NSException *e) {}
+    @try {
+        NSDictionary *d2 = ((id (*)(id, SEL))objc_msgSend)(proxy, sel_registerName("localizedInfoDictionary"));
+        name = d2[@"CFBundleDisplayName"] ?: d2[@"CFBundleName"];
+    } @catch (NSException *e) {}
+    if (!name) {
+        @try { name = ((id (*)(id, SEL))objc_msgSend)(proxy, sel_registerName("localizedName")); } @catch (NSException *e) {}
+    }
+    if (![exe isKindOfClass:[NSString class]] || ![appDir isKindOfClass:[NSString class]]) return nil;
+    return @{ @"exeSuffix": [NSString stringWithFormat:@"/%@/%@", appDir, exe],
+              @"display": [name isKindOfClass:[NSString class]] ? name : bid };
+}
+
+// ===== 无头拉起（完全后台，不切前台）=====
+static int (*g_SBSLaunch)(CFStringRef, int) = NULL;
+static BOOL WCVKSBSReady(void) {
+    static dispatch_once_t once;
+    static BOOL ok = NO;
+    dispatch_once(&once, ^{
+        void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+                         RTLD_LAZY);
+        if (h) {
+            g_SBSLaunch = (int (*)(CFStringRef, int))dlsym(h, "SBSLaunchApplicationWithIdentifier");
+            void (*portfn)(void) = (void (*)(void))dlsym(h, "SBSSpringBoardServerPort");
+            if (portfn) portfn();
+            ok = (g_SBSLaunch != NULL);
+        }
+        LOG(@"SBS ready=%d", ok);
+    });
     return ok;
 }
 
-// ===== 触发：发 Darwin 通知让 dylib 兜底建 PiP =====
-static void postTrigger(void) {
-    uint32_t st = notify_post(kTriggerName);
-    LOG(@"notify_post(%s) -> %u (0=ok)", kTriggerName, st); // 测试版：详细日志
+// flag 1 = SBSApplicationLaunchFlagBackground -> 后台启动，不激活前台
+static int WCVKHeadlessLaunch(NSString *bid) {
+    if (!WCVKSBSReady() || !g_SBSLaunch) return -1;
+    int r = g_SBSLaunch((__bridge CFStringRef)bid, 1);
+    LOG(@"headless launch %@ -> %d (0=ok)", bid, r);
+    return r;
 }
 
-// ===== v1.9.1 状态机：dylib 反向通知 pip.built + 屏幕状态 =====
-// 为什么：isAppRunning 只能判断"进程在"，区分不了"带着 PiP 活着"还是"锁屏期起的僵尸"。
-// 让 dylib 建好 PiP 后反向发 Darwin 通知 com.wcvoicekeep.pip.built，daemon 才知道预热真成功。
-// （gPipUp / gScreenBlank / gWarmupLaunchTs 声明在 warmupForeground 之前）
+// ===== 目标（事件驱动看护）=====
+static const char *kKbdExtSuffix    = "/wxkb_plugin.appex/wxkb_plugin";
+static const int  kRelaunchDelaySec = 1;     // 事件 -> 拉起前等 1s（尊重系统回收动作）
+static const int  kFailCooldownSec  = 45;    // 拉起失败后冷却，避免死循环
+static const int  kArmRetrySecs[]   = {2, 5, 10, 20, 40};  // 拉起后找 pid 挂监视的重试点
 
-static void registerNotifs(void) {
-    // v1.9.35：SpringBoard 侧 dylib 加载自证。
-    // 背景：v1.9.34 实测 wetypekeepalive.dylib 确实被 ElleKit 加载进 SB
-    // （CocoaTop 映射表可见），但 SB 沙盒不让它写 /var/mobile/*，
-    // 导致 marker 与 wetypekeepalive.log 全空。故 dylib 侧改为发 Darwin 通知，
-    // 由本 daemon（root，无沙盒）落盘取证。
-    static int sbEnterToken = 0;
-    notify_register_dispatch("com.wcvoicekeep.sb.enter", &sbEnterToken,
-                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
-        LOG(@"SB-TWEAK-LOADED: constructor entered in SpringBoard (dylib 已注入并执行)");
-    });
-    static int sbReadyToken = 0;
-    notify_register_dispatch("com.wcvoicekeep.sb.ready", &sbReadyToken,
-                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
-        LOG(@"SB-TWEAK-READY: constructor finished bundleId check in SpringBoard");
-    });
-    // pip.built：走后台队列（main 线程在 sleep 轮询，主队列 block 不会执行）
-    static int pipToken = 0;
-    notify_register_dispatch(kPipBuiltName, &pipToken,
-                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
-        gPipUp = YES;
-        gLastWarmup = time(NULL);
-        LOG(@"PIP.BUILT received -> warmup success, self keep-alive active");
-    });
-    // v1.9.19：pip.lost（dylib 检测 PiP 被视频顶掉）-> 立即回发 trigger 让 dylib
-    // 在 scene active 下后台重建 PiP（秒级，不等 60s tick，无跳转）
-    // v1.9.21：回发前查音频——微信视频 PiP 在播（有声音）时不 trigger，
-    // 避免 wetype 重建抢唯一 PiP 通道顶掉微信视频 PiP（老板实测恶性循环）
-    static int lostToken = 0;
-    notify_register_dispatch("com.wcvoicekeep.pip.lost", &lostToken,
-                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
-        gPipUp = NO;
-        if (otherAudioPlaying()) {
-            LOG(@"PIP.LOST but OTHER AUDIO playing (WeChat video PiP?) -> hold, no rebuild");
-            return;
-        }
-        LOG(@"PIP.LOST received -> immediate re-trigger (dylib rebuilds PiP in background)");
-        postTrigger();
-    });
-    // 屏幕状态：1=息屏，0=亮屏
-    static int scrToken = 0;
-    notify_register_dispatch("com.apple.springboard.hasBlankedScreen", &scrToken,
-                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
-        uint64_t st = 0;
-        notify_get_state(scrToken, &st);
-        gScreenBlank = (st == 1);
-        LOG(@"screen %@ (state=%llu)", gScreenBlank ? @"BLANK" : @"UNBLANK", (unsigned long long)st);
-        watchWechat(); // 微信看护：屏幕事件也顺带查（微信无头不需激活，息屏/亮屏都拉）
-        // wetype：仅亮屏且未锁定时才拉（锁屏拉起是僵尸没 PiP，老板实测）。解锁由 lockstate 回调触发。
-        if (!gScreenBlank && !gLocked && !gPipUp) {
-            LOG(@"screen ON & unlocked & wetype not kept-alive -> immediate re-warm");
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                gPipUp = NO;
-                reWarm();
-                if (gPipUp) maybeWarmWechat();
-            });
-        }
-    });
+@interface WCVKTarget : NSObject
+@property (nonatomic, copy)   NSString *ident;      // bundle id 或 "wxkb_plugin"
+@property (nonatomic, copy)   NSString *display;    // 显示名（写记录用）
+@property (nonatomic, copy)   NSString *kind;       // @"kbd" / @"app"
+@property (nonatomic, copy)   NSString *exeSuffix;  // App 精确匹配后缀
+@property (nonatomic, assign) int pid;
+@property (nonatomic, assign) time_t lastRelaunch;
+@property (nonatomic, assign) int fails;
+@property (nonatomic, strong) dispatch_source_t src;
+@end
 
-    // v1.9.10 锁屏状态：1=锁定，0=解锁。锁屏拉起输入法是僵尸（无法激活没 PiP），
-    // 所以 wetype 只在解锁后重拉；微信无头拉起不受锁屏影响，照拉。
-    static int lockToken = 0;
-    notify_register_dispatch("com.apple.springboard.lockstate", &lockToken,
-                             dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
-        uint64_t st = 0;
-        notify_get_state(lockToken, &st);
-        gLocked = (st == 1);
-        LOG(@"lock %@ (state=%llu)", gLocked ? @"LOCKED" : @"UNLOCKED", (unsigned long long)st);
-        watchWechat(); // 微信：锁屏/解锁都拉（无头不需激活）
-        // 解锁瞬间：wetype 没保活 -> 立即重拉（补完注销后锁屏期没完成的预热）
-        if (!gLocked && !gPipUp) {
-            LOG(@"unlocked & wetype not kept-alive -> immediate re-warm");
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                gPipUp = NO;
-                reWarm();
-                if (gPipUp) maybeWarmWechat();
-            });
-        }
-    });
-    // v1.9.42：键盘扩展事件通道（SpringBoard 观察到键盘出现 / 拉起成功时发）
-    static int kbdUpToken = 0;
-    notify_register_dispatch("com.wcvoicekeep.kbd.up",
-                             &kbdUpToken,
-                             kbdEventQueue(), ^(int t) {
-        LOG(@"kbd.up received -> arm proc watch");
-        armKbdProcWatch();
-    });
-    // v1.9.42：SpringBoard 拉起成功回报
-    notify_register_dispatch("com.wcvoicekeep.kbd.warmup.ok", &gKbdOkToken,
-                             kbdEventQueue(), ^(int t) {
-        onKbdWarmupOk();
-        armKbdProcWatch();
-    });
-    LOG(@"notifs registered (pip.built + hasBlankedScreen + lockstate)");
+@implementation WCVKTarget
+@end
+
+static NSMutableArray<WCVKTarget *> *gTargets = nil;
+static dispatch_queue_t gQueue = nil;
+
+static dispatch_queue_t WCVKQueue(void) {
+    if (!gQueue) gQueue = dispatch_queue_create("com.wcvoicekeep.bgkeep", DISPATCH_QUEUE_SERIAL);
+    return gQueue;
 }
 
-// 杀进程：锁屏期 SBS 拉起可能只起进程不激活（不建 PiP），杀掉让下轮重试激活。
-// v1.9.14：改用 procPid("wxkb") + kill——实测 SBSProcessIDForDisplayIdentifier 拿不到
-// pid（静默失败），导致 zombie 分支 kill 无效、wetype 永远挂着不重建。
-static void killApp(void) {
-    int pid = procPid("wxkb");
-    if (pid > 0) {
-        kill(pid, SIGKILL);
-        LOG(@"kill %@ pid=%d (SIGKILL) - retry activation next cycle", kTargetBundleID, pid);
-    } else {
-        LOG(@"killApp: wxkb pid not found (procPid)");
-    }
+static void WCVKArmTarget(WCVKTarget *t, int attempt);
+
+static int WCVKTargetPid(WCVKTarget *t) {
+    if ([t.kind isEqualToString:@"kbd"])
+        return WCVKPidForPathSuffix([NSString stringWithUTF8String:kKbdExtSuffix], nil);
+    return WCVKPidForPathSuffix(t.exeSuffix, nil);
 }
 
-// 一次预热尝试：没起 -> 前台拉起等 pip.built；起了但挂起超时无 pip.built -> kill 重试。
-// v1.9.15：kill 前必须查 suspend_count——只有进程真被挂起（sc>0，锁屏僵尸/视频 PiP 顶掉）
-// 才杀；进程活着（sc==0）或拿不到（-1）绝不杀（可能带着 PiP 活着 / pip.built 延迟上报）。
-static void warmupOnce(void) {
-    if (gPipUp) return;
-    if (isAppRunning(kTargetBundleID)) {
-        int sc = taskSuspendCount(procPid("wxkb"));
-        if (time(NULL) - gWarmupLaunchTs > kKillStaleSec && sc > 0) {
-            killApp();
-        } else if (sc <= 0) {
-            LOG(@"%@ running sc=%d -> alive-ish, no kill (dylib will report pip.built)", kTargetBundleID, sc);
-        }
-        return;
-    }
-    gWarmupLaunchTs = time(NULL);
-    LOG(@"%@ NOT running -> foreground warmup (attempt)", kTargetBundleID);
-    warmupForeground();
-    // 等 dylib 报 pip.built（非阻塞轮询，最多 kPipWaitTimeoutSec 秒）
-    for (int i = 0; i < kPipWaitTimeoutSec; i++) {
-        if (gPipUp) return;
-        sleep(1);
-    }
-    LOG(@"%@ no pip.built in %ds - will retry", kTargetBundleID, kPipWaitTimeoutSec);
-}
-
-// v1.9.2 重预热：死了就拉（老板拍板）。v1.9.8 加 gWarmingUp 防并发
-// （回调线程 + 主循环可能同时触发）。v1.9.10：只在解锁态被调用，去掉息屏分支。
-// v1.9.15：3 次尝试 -> 2 次，缩短主循环阻塞（否则 watchWechat 被饿死，微信被杀拉不回）
-static BOOL gWarmingUp = NO;
-static void reWarm(void) {
-    if (gWarmingUp) { LOG(@"reWarm: already warming, skip"); return; } // 测试版：详细日志
-    gWarmingUp = YES;
-    int attempts = 0;
-    while (!gPipUp && attempts < 2) {
-        @autoreleasepool { warmupOnce(); }
-        if (gPipUp) break;
-        attempts++;
-        sleep(3);
-    }
-    gWarmingUp = NO;
-}
-
-// v1.9.4：无头拉起微信（后台 flag=1，不显 UI 不闪屏），让微信主 App 后台待命。
-// 仅 wetype 预热成功后错开几秒执行一次（gWechatWarmed 防重复）。
-static BOOL gWechatWarmed = NO;
-static time_t gLastWechatPull = 0;   // v1.9.7：微信重拉节流时间戳
-static const time_t kWechatRePullInterval = 60; // v1.9.15：120->60，老板要求微信被杀要尽快拉回
-static void warmWechatHeadless(void) {
-    if (!sbsReady() || !g_SBSLaunch) { LOG(@"wechat headless: SBS unavailable"); return; }
-    int r = g_SBSLaunch((__bridge CFStringRef)kWechatBundleID, 1); // SBSApplicationLaunchFlagBackground
-    gLastWechatPull = time(NULL);
-    LOG(@"wechat headless SBSLaunchApplicationWithIdentifier(%@, Background=1) -> %d (0=ok)",
-        kWechatBundleID, r);
-}
-
-// v1.9.5：微信无头拉起封装（防重复）。开机路径 + 看护僵尸分支（开机锁屏导致预热稍后
-// 才成功）都会调，保证只要 wetype 预热成功过，微信就一定被拉起一次。
-// v1.9.15：加节流检查——daemon 重启会重置 gWechatWarmed 导致重复拉，统一用
-// gLastWechatPull 节流（与 watchWechat 一致），重复调用直接跳过。
-static void maybeWarmWechat(void) {
-    if (gWechatWarmed) return;
-    gWechatWarmed = YES; // 先置位防重复（sleep 期间若重复进入也只会拉一次）
-    if (isWechatRunning()) { LOG(@"wechat already running, skip"); return; }
-    if (time(NULL) - gLastWechatPull < kWechatRePullInterval) { LOG(@"wechat pull throttle, skip"); return; }
-    LOG(@"sleeping 5s then headless-pull WeChat...");
-    sleep(5);
-    warmWechatHeadless();
-}
-
-// v1.9.7：微信看护——被杀就无头拉（不管息屏，无 UI 无打扰），60s 节流（v1.9.15 缩短）
-static void watchWechat(void) {
-    if (isWechatRunning()) return;
+static void WCVKDoRelaunch(WCVKTarget *t) {
     time_t now = time(NULL);
-    if (now - gLastWechatPull < kWechatRePullInterval) {
-        LOG(@"wechat not running but throttle (%.0fs left)",
-            (double)(kWechatRePullInterval - (now - gLastWechatPull)));
+    if (t.lastRelaunch && now - t.lastRelaunch < kFailCooldownSec) {
+        LOG(@"%@ 冷却中（%lds 前刚处理过），跳过", t.display, (long)(now - t.lastRelaunch));
         return;
     }
-    LOG(@"wechat killed -> headless re-pull (screen %s)", gScreenBlank ? "BLANK" : "ON");
-    warmWechatHeadless();
+    t.lastRelaunch = now;
+
+    if ([t.kind isEqualToString:@"kbd"]) {
+        // 键盘扩展没有别的门路：只能让 SpringBoard 弹一次键盘，系统才会 spawn 它
+        uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup");
+        LOG(@"kbd warmup notify posted -> %u", st);
+        WCVKRecord(t.display, t.ident, t.kind, st == 0, @"键盘预热请求已发出");
+        return;
+    }
+    int r = WCVKHeadlessLaunch(t.ident);
+    BOOL ok = (r == 0);
+    if (ok) {
+        t.fails = 0;
+        t.lastRelaunch = 0;              // 成功立刻清冷却
+    } else {
+        t.fails++;
+    }
+    WCVKRecord(t.display, t.ident, t.kind, ok,
+               ok ? @"后台拉起成功" : [NSString stringWithFormat:@"后台拉起失败 rc=%d", r]);
 }
 
-// ===== v1.9.11 测试：task_for_pid 能否拿其他进程 task port =====
-// 用途：判定「纯 daemon 用 Mach Task State 检测 wetype 是否被挂起」方案是否可行。
-// 用法：wcvoicekeep --tfp-check <pid>  （真实 daemon 环境 root+platform-application）
-#include <mach/mach.h>
-#include <mach/task_info.h>
-static int tfpCheck(int pid) {
-    mach_port_t task = MACH_PORT_NULL;
-    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
-    fprintf(stderr, "[TFP-CHECK] task_for_pid(%d) -> %d (%s)\n", pid, kr,
-            kr == KERN_SUCCESS ? "OK" : mach_error_string(kr));
-    if (kr != KERN_SUCCESS) return 1;
-    struct task_basic_info info;
-    mach_msg_type_number_t cnt = TASK_BASIC_INFO_COUNT;
-    kr = task_info(task, TASK_BASIC_INFO, (task_info_t)&info, &cnt);
-    fprintf(stderr, "[TFP-CHECK] task_info -> %d suspend_count=%d resident=%lluKB\n",
-            kr, info.suspend_count, (unsigned long long)(info.resident_size / 1024));
-    mach_port_deallocate(mach_task_self(), task);
-    return 0;
-}
-
-// ===== v1.9.36 键盘扩展看护（wxkb_plugin）=====
-// 老板明确的需求（2026-11-06）：
-//   「wxkb 能一直活着，只有内存压力特别高才会把它杀掉，下一次点输入框才有冷启动。
-//     唯一需求就是：杀掉后让我们的插件把它拉起来。」
-// 所以这里只做一件事：发现 com.tencent.wetype.keyboard 不在 -> 通知 SpringBoard
-// 侧做一次真实键盘请求（wetypekeepalive 里 KbdWarmupRun），把它 spawn 回来。
-//
-// 落实「低开销」原则（老板否决过音频保活/心跳写盘）：
-//   - 只用 procExists 的 sysctl 快照，微秒级，不写盘、不建定时器
-//   - 仅在状态发生变化时写日志（不刷日志）
-//   - 失败后冷却 5 分钟：避免拉起不成功时反复弹键盘骚扰
-//   - 锁屏时不做（锁屏下弹键盘无意义且会亮屏）
-static time_t gKbdCooldownUntil = 0;
-static BOOL   gKbdEverSeen = NO;      // 曾经见过它活着（区分"被内存杀掉"与"开机后还没用过键盘"）
-static BOOL   gKbdLastRunning = NO;
-static BOOL   gKbdStartupLogged = NO;
-// v1.9.39：区分"预热成功"与"预热失败"，冷却只惩罚失败。
-// 实测（2026-11-06 19:30:04 那次成功）：预热后 5s 扩展就 UP 了，
-// 但旧代码无论成败都锁死 300s，导致老板"第一次能重启、后面杀掉再也不重启"。
-static time_t gKbdPendAt = 0;         // 已发预热请求、等待结果的时刻（0=无待定）
-static time_t gKbdLastSkipLog = 0;
-static const time_t kKbdFailCooldownSec = 45;   // 失败后仅冷却 45s，20s 待定窗口后很快会再试
-
-// v1.9.42：拉起成功由 SpringBoard 主动回报，不再靠"下一次采样是否看到进程"。
-// 设备实测（12:24:12）正是因为采样窗口与真实拉起时刻错位，把成功判成 FAILED
-// 并锁 45s —— 老板看到的现象就是"第三次杀掉很久才拉起"。
-static void onKbdWarmupOk(void) {
-    LOG(@"kbd warmup OK reported by SpringBoard -> 成功, 冷却清零");
-    gKbdPendAt = 0;
-    gKbdCooldownUntil = 0;
-    gKbdEverSeen = YES;
-    gKbdLastRunning = YES;
-}
-
-// ===== v1.9.42：键盘扩展退出**事件监听**（老板要求：事件驱动，不要轮询）=====
-// 原理：dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, pid, DISPATCH_PROC_EXIT)
-// 由内核在进程退出那一刻回调，不需要任何定时器/sysctl 轮询。
-// 流程：SpringBoard 观察到键盘 DidShow（扩展必然已 spawn）或拉起成功 -> 发
-// com.wcvoicekeep.kbd.up -> daemon 取当前 pid 挂监视 -> 进程一退出立刻回调
-// -> 等 1.2s（留出系统回收时间）-> 发预热请求 -> SB 拉起 -> 又发 kbd.up
-// -> 重新挂监视，闭环。全程零轮询。
-static dispatch_source_t gKbdProcSrc = NULL;
-static int gKbdWatchedPid = 0;
-
-static dispatch_queue_t kbdEventQueue(void) {
-    static dispatch_queue_t q;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ q = dispatch_queue_create("com.wcvoicekeep.kbdevent", NULL); });
-    return q;
-}
-
-static void armKbdProcWatch(void) {
-    int pid = procPid("wxkb_plugin");
-    if (pid <= 0) { LOG(@"kbd watch: ext absent -> 先不挂监视，等 kbd.up / 兜底自检"); return; }
-    if (gKbdProcSrc && pid == gKbdWatchedPid) return;      // 已挂在同一个 pid 上
-    if (gKbdProcSrc) { dispatch_source_cancel(gKbdProcSrc); gKbdProcSrc = NULL; }
-
-    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC,
-                                                   (uintptr_t)pid,
-                                                   DISPATCH_PROC_EXIT,
-                                                   kbdEventQueue());
-    if (!src) { LOG(@"kbd watch: dispatch_source_create failed pid=%d", pid); return; }
-
+// 在 pid 上挂退出事件；进程一死内核回调（零轮询）
+static void WCVKArmPid(WCVKTarget *t, int pid) {
+    if (t.src) { dispatch_source_cancel(t.src); t.src = nil; }
+    if (pid <= 0) return;
+    t.pid = pid;
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t)pid,
+                                                   DISPATCH_PROC_EXIT, WCVKQueue());
+    if (!src) return;
+    __weak WCVKTarget *wt = t;
     dispatch_source_set_event_handler(src, ^{
-        unsigned long data = dispatch_source_get_data(src);
-        LOG(@"kbd ext (pid=%d) EXIT EVENT (data=0x%lx) -> 1.2s 后拉起", pid, data);
-        gKbdWatchedPid = 0;
-        gKbdLastRunning = NO;
-        if (gKbdProcSrc) { dispatch_source_cancel(gKbdProcSrc); gKbdProcSrc = NULL; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                       kbdEventQueue(), ^{
-            if (procExists("wxkb_plugin")) {
-                LOG(@"kbd 已在跑(用户自己弹了键盘?) -> 重新挂监视");
-                armKbdProcWatch();
-                return;
-            }
-            if (gLocked) { LOG(@"kbd 退出但锁屏 -> 等解锁(解锁事件会再触发)"); return; }
-            if (time(NULL) < gKbdCooldownUntil) {
-                LOG(@"kbd 退出但冷却中 -> 跳过（%lds 后兜底自检会重试）",
-                    (long)(gKbdCooldownUntil - time(NULL)));
-                return;
-            }
-            LOG(@"kbd ext MISSING (exit event) -> ask SpringBoard to issue a keyboard request");
-            uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup");
-            LOG(@"kbd warmup notify posted -> %u (0=ok)", st);
-            gKbdPendAt = time(NULL);
+        WCVKTarget *st = wt;
+        if (!st) return;
+        LOG(@"### %@ (pid=%d) EXIT EVENT -> %ds 后拉起", st.display, st.pid, kRelaunchDelaySec);
+        st.pid = 0;
+        if (st.src) { dispatch_source_cancel(st.src); st.src = nil; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRelaunchDelaySec * NSEC_PER_SEC)),
+                       WCVKQueue(), ^{
+            WCVKDoRelaunch(st);
+            WCVKArmTarget(st, 0);   // 拉起后重新挂监视
         });
     });
+    t.src = src;
     dispatch_resume(src);
-    gKbdProcSrc = src;
-    gKbdWatchedPid = pid;
-    LOG(@"kbd watch ARMED on pid=%d (event-driven, 无轮询)", pid);
+    LOG(@"watch ARMED: %@ (pid=%d)", t.display, pid);
 }
 
-static void watchKeyboardExtension(void) {
-    BOOL running = procExists("wxkb_plugin");
-    if (running) {
-        if (!gKbdLastRunning) LOG(@"kbd ext (wxkb_plugin) UP");
-        if (gKbdPendAt) {
-            LOG(@"kbd warmup SUCCESS in %lds (cooldown cleared)", (long)(time(NULL) - gKbdPendAt));
-            gKbdPendAt = 0;
-        }
-        gKbdLastRunning = YES;
-        gKbdEverSeen = YES;
-        gKbdCooldownUntil = 0;   // v1.9.39：成功即清零，下次被杀可立刻再拉
-        // v1.9.42：确保退出事件监视挂在当前 pid 上（幂等，同 pid 直接返回）
-        armKbdProcWatch();
+static void WCVKArmTarget(WCVKTarget *t, int attempt) {
+    int pid = WCVKTargetPid(t);
+    if (pid > 0) { WCVKArmPid(t, pid); return; }
+    if (attempt >= (int)(sizeof(kArmRetrySecs) / sizeof(kArmRetrySecs[0]))) {
+        LOG(@"%@ 重试结束仍未在运行（等下次退出事件/设置变更）", t.display);
         return;
     }
-    if (gKbdLastRunning) {
-        LOG(@"kbd ext (wxkb_plugin) went DOWN (jetsam / memory pressure)");
-        gKbdLastRunning = NO;
+    int delay = kArmRetrySecs[attempt];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   WCVKQueue(), ^{ WCVKArmTarget(t, attempt + 1); });
+}
+
+static void WCVKStopTarget(WCVKTarget *t) {
+    if (t.src) { dispatch_source_cancel(t.src); t.src = nil; }
+    t.pid = 0;
+}
+
+// 按当前设置重建目标表：键盘扩展永远在内（必需），加上用户勾选的 App
+static void WCVKRebuildTargets(void) {
+    if (!gTargets) gTargets = [NSMutableArray array];
+
+    NSMutableArray *want = [NSMutableArray array];
+    WCVKTarget *kbd = [WCVKTarget new];
+    kbd.ident = @"wxkb_plugin";
+    kbd.display = @"微信输入法键盘扩展";
+    kbd.kind = @"kbd";
+    [want addObject:kbd];
+
+    for (NSString *bid in gAppBIDs) {
+        NSDictionary *meta = WCVKAppMeta(bid);
+        WCVKTarget *t = [WCVKTarget new];
+        t.ident = bid;
+        t.display = meta[@"display"] ?: bid;
+        t.kind = @"app";
+        t.exeSuffix = meta[@"exeSuffix"];
+        if (!t.exeSuffix) { LOG(@"skip %@：解析不到可执行路径", bid); continue; }
+        [want addObject:t];
     }
-    // v1.9.37 修 bug：原来这里写死 `if (!gKbdEverSeen) return;`，导致
-    // daemon 启动时扩展就已经被杀（respring / 内存压力，非常常见）就永远
-    // 不会预热——设备日志实证：10:58:23 daemon 起来时扩展已死，此后日志里
-    // kbd 相关一行都没有。改成用系统开机时长兜底：
-    //   开机不足 180s（用户还没开始用键盘）-> 不主动弹，避免开机就弹键盘；
-    //   开机超过 180s 却看不到扩展 -> 说明它被杀了，直接补拉。
-    if (!gKbdEverSeen) {
-        struct timeval bt;
-        size_t bsz = sizeof(bt);
-        int bmib[2] = {CTL_KERN, KERN_BOOTTIME};
-        if (sysctl(bmib, 2, &bt, &bsz, NULL, 0) != 0) return;
-        long up = (long)(time(NULL) - bt.tv_sec);
-        if (up < 180) {
-            if (!gKbdStartupLogged) {
-                gKbdStartupLogged = YES;
-                LOG(@"kbd ext absent & uptime=%lds<180 -> hold (boot phase)", up);
-            }
-            return;
+
+    for (WCVKTarget *old in gTargets) {
+        BOOL keep = NO;
+        for (WCVKTarget *n in want) if ([n.ident isEqualToString:old.ident]) { keep = YES; break; }
+        if (!keep) { LOG(@"target 移除: %@", old.display); WCVKStopTarget(old); }
+    }
+    NSMutableArray *merged = [NSMutableArray array];
+    for (WCVKTarget *n in want) {
+        WCVKTarget *exist = nil;
+        for (WCVKTarget *old in gTargets) if ([old.ident isEqualToString:n.ident]) { exist = old; break; }
+        if (exist) { exist.display = n.display; exist.exeSuffix = n.exeSuffix; [merged addObject:exist]; }
+        else       { [merged addObject:n]; }
+    }
+    gTargets = merged;
+
+    LOG(@"targets 重建：共 %lu 个（键盘扩展 + App %lu）",
+        (unsigned long)gTargets.count, (unsigned long)(gTargets.count ? gTargets.count - 1 : 0));
+    for (WCVKTarget *t in gTargets) {
+        if (t.src && t.pid > 0 && WCVKTargetPid(t) == t.pid) continue;
+        WCVKArmTarget(t, 0);
+    }
+}
+
+// ===== 设置热生效：VNODE 监听 Preferences 目录，不轮询 =====
+static void WCVKArmPrefsWatch(void);
+static void WCVKHandlePrefsChanged(void);
+
+static void WCVKHandlePrefsChanged(void) {
+    LOG(@"prefs 变更 -> 重读并重建目标");
+    WCVKReadPrefs();
+    WCVKRebuildTargets();
+}
+
+static void WCVKArmPrefsWatch(void) {
+    NSArray<NSString *> *dirs = WCVKPrefsDirCandidates();
+    int armed = 0;
+    for (NSString *dir in dirs) {
+        int fd = open([dir fileSystemRepresentation], O_RDONLY);
+        if (fd < 0) continue;
+        dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE, (uintptr_t)fd,
+            DISPATCH_VNODE_WRITE | DISPATCH_VNODE_RENAME | DISPATCH_VNODE_DELETE,
+            WCVKQueue());
+        if (!src) { close(fd); continue; }
+        armed++;
+        NSString *dirPath = [dir copy];
+        __block time_t lastM = 0;
+        {
+            NSDictionary *a = [[NSFileManager defaultManager]
+                attributesOfItemAtPath:[dirPath stringByAppendingFormat:@"/%@.plist", kPrefsDomain] error:nil];
+            if (a) lastM = (time_t)[a[NSFileModificationDate] timeIntervalSince1970];
         }
+        dispatch_source_set_event_handler(src, ^{
+            // 目录里任何写入都会唤醒：只在我们的 plist 真变了（mtime 变）才重读，零成本
+            NSString *p = [dirPath stringByAppendingFormat:@"/%@.plist", kPrefsDomain];
+            NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+            if (!a) return;
+            time_t m = (time_t)[a[NSFileModificationDate] timeIntervalSince1970];
+            if (m == lastM) return;
+            lastM = m;
+            WCVKHandlePrefsChanged();
+        });
+        dispatch_source_set_cancel_handler(src, ^{ close(fd); });
+        dispatch_resume(src);
     }
-    // v1.9.39：待定超时判定。预热请求发出后 12s 内还没起来就算失败，
-    // 只锁 45s；15s tick 下最多 1 分钟内会再试，不会像旧版那样锁死 5 分钟。
-    time_t now = time(NULL);
-    if (gKbdPendAt) {
-        // v1.9.42：待定窗口 12s -> 20s。旧值比采样间隔还短，采样点一错位就误判失败。
-        // 正常路径已由 SpringBoard 的 OK 回报瞬间收尾，这里只是兜底超时。
-        if (now - gKbdPendAt < 20) return;             // 还在等结果
-        LOG(@"kbd warmup FAILED (20s 内未收到成功回报) -> cooldown %lds", (long)kKbdFailCooldownSec);
-        gKbdPendAt = 0;
-        gKbdCooldownUntil = now + kKbdFailCooldownSec;
-        return;
-    }
-    if (gLocked) {                                 // 锁屏不弹
-        if (now - gKbdLastSkipLog > 60) {
-            gKbdLastSkipLog = now;
-            LOG(@"kbd ext absent but LOCKED -> 不弹键盘等解锁");
+    LOG(@"prefs watch armed on %d 个目录", armed);
+}
+
+// ===== 键盘扩展拉起成功后，SpringBoard 会发 kbd.up -> 在新 pid 上重挂 =====
+static int gKbdUpToken = 0;
+static void WCVKRegisterKbdUp(void) {
+    notify_register_dispatch("com.wcvoicekeep.kbd.up", &gKbdUpToken, WCVKQueue(), ^(int token) {
+        LOG(@"kbd.up received -> 在新 pid 上重挂监视");
+        for (WCVKTarget *t in gTargets) {
+            if ([t.kind isEqualToString:@"kbd"]) { WCVKArmTarget(t, 0); break; }
         }
-        return;
-    }
-    if (now < gKbdCooldownUntil) {                 // 冷却中（只在失败后进入）
-        if (now - gKbdLastSkipLog > 60) {
-            gKbdLastSkipLog = now;
-            LOG(@"kbd ext absent but cooldown %lds left -> 等待重试", (long)(gKbdCooldownUntil - now));
-        }
-        return;
-    }
-    LOG(@"kbd ext MISSING -> ask SpringBoard to issue a real keyboard request");
-    uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup");
-    LOG(@"kbd warmup notify posted -> %u (0=ok)", st);
-    gKbdPendAt = now;                              // 待定，结果由上面的 UP/失败判定收尾
+    });
 }
 
-// ===== v1.9.13 核心：读 wetype 的 Mach Task suspend_count 判定是否被系统挂起 =====
-// 微信视频 PiP 顶掉 wetype PiP -> wetype 无保活凭证 -> 系统挂起进程(S▲B, suspend_count>0)
-// -> PiP 失效 -> daemon 重拉。entitlements 需 platform-application + task_for_pid-allow
-// （v1.9.12 实测 OK：root daemon -> mobile wetype task_for_pid 0、suspend_count 可读）。
-// 挂在 60s 守护 tick 上查一次，微秒级，不增加任何独立轮询/定时器/磁盘写。
-static int taskSuspendCount(int pid) {
-    if (pid <= 0) return -1;
-    mach_port_t task = MACH_PORT_NULL;
-    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
-    if (kr != KERN_SUCCESS) return -1;
-    struct task_basic_info info;
-    mach_msg_type_number_t cnt = TASK_BASIC_INFO_COUNT;
-    kr = task_info(task, TASK_BASIC_INFO, (task_info_t)&info, &cnt);
-    mach_port_deallocate(mach_task_self(), task);
-    if (kr != KERN_SUCCESS) return -1;
-    return info.suspend_count;
-}
-
-// 其他 App 是否在播音频（视频 PiP/音乐）——有声音时绝不重拉（避免打断看视频）。
-// AudioSessionGetProperty 已被 SDK 标记 deprecated，include 头会触发 -Wdeprecated-declarations
-// 被 tool 目标的 -Werror 判死，故手写声明绕过（kAudioSessionProperty_OtherAudioIsPlaying='othr'）。
-extern int AudioSessionGetProperty(unsigned int inID, unsigned int *ioDataSize, void *outData);
-static BOOL otherAudioPlaying(void) {
-    unsigned int playing = 0;
-    unsigned int sz = sizeof(playing);
-    int st = AudioSessionGetProperty('othr', &sz, &playing);
-    if (st != 0) { LOG(@"audio check err=%d", st); return NO; }
-    return playing != 0;
-}
-
-// v1.9.13：PiP 失效重拉冷却（挂起检测到 -> 拉一次失败 -> 5min 内不再试，防反复闪）
-static time_t gPiPLostCooldownUntil = 0;
-static const time_t kPiPLostCooldownSec = 300;
-static void handlePiPLost(int sc) {
-    time_t now = time(NULL);
-    if (gLocked) { LOG(@"  PiP lost & LOCKED -> wait unlock"); return; }
-    if (now < gPiPLostCooldownUntil) { LOG(@"  PiP lost cooldown (%.0fs left) -> skip", (double)(gPiPLostCooldownUntil - now)); return; }
-    if (otherAudioPlaying()) { LOG(@"  PiP lost but other audio playing (video/music) -> hold, no flash"); return; }
-    gPiPLostCooldownUntil = now + kPiPLostCooldownSec; // 先置冷却，失败也不反复闪
-    LOG(@"  PiP lost (suspend_count=%d) & idle & unlocked -> re-warm to rebuild PiP", sc);
-    gPipUp = NO;
-    reWarm();
-    if (gPipUp) maybeWarmWechat();
-}
-
-// v1.9.33：--kbd-warm 手动触发 SpringBoard 侧键盘扩展预热。
-// 设备上没有 notifyutil，用它从 SSH 反复触发实验（等价 notifyutil -p）。
-// 预热逻辑在 wetypekeepalive（注入 com.apple.springboard）里，本函数只发 Darwin 通知。
-static int kbdWarmTrigger(void) {
-    uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup");
-    fprintf(stderr, "[WCVK-KBDWARM] notify_post(com.wcvoicekeep.kbd.warmup) -> %u (0=ok)\n", st);
-    fflush(stderr);
-    return st == 0 ? 0 : 1;
-}
-
-// v1.9.37：--kbd-alert 强制走 alert 通道（SpringBoard 用 UIAlertController+textField
-// 弹键盘），用于一次 respring 内对比"自建窗口"和"系统 alert"两条路谁能拉起扩展。
-static int kbdAlertTrigger(void) {
-    uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup.alert");
-    fprintf(stderr, "[WCVK-KBDALERT] notify_post(....alert) -> %u (0=ok)\n", st);
-    fflush(stderr);
-    return st == 0 ? 0 : 1;
-}
-
-// v1.9.40：--kbd-api-probe —— 让 SpringBoard 侧 dump 键盘私有 API 签名
-// 目的：程序化弹键盘全失败后，唯一"真无头"希望是直接命令 keyboard arbiter
-// 预热/分配键盘。先 dump 出真实方法签名再决定调哪个，不猜着写。
-static int kbdApiProbeTrigger(void) {
-    uint32_t st = notify_post("com.wcvoicekeep.kbd.probe");
-    fprintf(stderr, "[WCVK-KBDAPI] notify_post(com.wcvoicekeep.kbd.probe) -> %u (0=ok)\n", st);
-    fprintf(stderr, "[WCVK-KBDAPI] 2s 后看 /var/mobile/wcvk_kbdapi.log\n");
-    fflush(stderr);
-    return st == 0 ? 0 : 1;
-}
-
-// v1.9.41：--kbd-pk-spawn —— 让 SpringBoard 用 PKHost 无头拉起键盘扩展（零 UI）
-static int kbdPkSpawnTrigger(void) {
-    uint32_t st = notify_post("com.wcvoicekeep.kbd.pkspawn");
-    fprintf(stderr, "[WCVK-KBDSPAWN] notify_post(com.wcvoicekeep.kbd.pkspawn) -> %u (0=ok)\n", st);
-    fflush(stderr);
-    return st == 0 ? 0 : 1;
-}
-
-// v1.9.35：--kbd-warm-test —— 一次跑完给出完整结论的实验
-// 目的：老板要的是「键盘扩展被杀后能否被无头拉起并留存」，而无需反复 SSH 采样。
-// 流程：记录基线 -> post 预热通知（SB 侧建 UIKit 文本框触发键盘请求）
-//       -> 每 0.5s 采样 wxkb_plugin 与 kbd 的 pid，共 12s -> 打印时间线。
-// 判据：T+11s 若 wxkb_plugin 有新 pid 且持续存在 => B 路线（真实键盘请求）可用。
-static int kbdWarmTest(void) {
-    #define KBDTEST_MAX 24
-    int baseP = procPid("wxkb_plugin");
-    int baseK = procPid("kbd");
-    fprintf(stderr, "[WCVK-KBDTEST] baseline: wxkb_plugin=%d kbd=%d\n", baseP, baseK);
-    fprintf(stderr, "[WCVK-KBDTEST] posting com.wcvoicekeep.kbd.warmup ...\n");
-    fflush(stderr);
-    uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup");
-    fprintf(stderr, "[WCVK-KBDTEST] notify_post -> %u (0=ok)\n", st);
-
-    int prevP = baseP;
-    for (int i = 1; i <= KBDTEST_MAX; i++) {
-        usleep(500 * 1000);
-        int p = procPid("wxkb_plugin");
-        int k = procPid("kbd");
-        const char *ev = "";
-        if (prevP == 0 && p > 0) ev = "  <== wxkb_plugin APPEARED";
-        else if (prevP > 0 && p == 0) ev = "  <== wxkb_plugin GONE";
-        else if (prevP > 0 && p > 0 && p != prevP) ev = "  <== wxkb_plugin RESTARTED(new pid)";
-        prevP = p;
-        fprintf(stderr, "[WCVK-KBDTEST] t=+%.1fs wxkb_plugin=%d kbd=%d%s\n",
-                i * 0.5, p, k, ev);
-        fflush(stderr);
+// ===== 子命令 =====
+static void WCVKPrintStatus(void) {
+    WCVKReadPrefs();
+    printf("prefs   : %s\n", WCVKPrefsPath().UTF8String);
+    printf("records : %s\n", WCVKRecordsPath().UTF8String);
+    printf("enabled=%d logging=%d record=%d\n", gEnabled, gLogging, gRecord);
+    int kpid = WCVKPidForPathSuffix([NSString stringWithUTF8String:kKbdExtSuffix], nil);
+    printf("  [kbd] wxkb_plugin pid=%d\n", kpid);
+    for (NSString *bid in gAppBIDs) {
+        NSDictionary *m = WCVKAppMeta(bid);
+        int pid = m ? WCVKPidForPathSuffix(m[@"exeSuffix"], nil) : 0;
+        printf("  [app] %-34s %-14s pid=%d\n", bid.UTF8String,
+               [(m[@"display"] ?: @"?") UTF8String], pid);
     }
-    int endP = procPid("wxkb_plugin");
-    fprintf(stderr, "[WCVK-KBDTEST] RESULT final wxkb_plugin=%d (base=%d) kbd=%d\n",
-            endP, baseP, procPid("kbd"));
-    fprintf(stderr, "[WCVK-KBDTEST] VERDICT: %s\n",
-            (endP > 0) ? "ALIVE_AFTER_12S (B 路线可用：真实键盘请求能拉起并常驻)"
-                       : "GONE_AFTER_12S (B 路线不可用：resign 后 launchd 立即回收)");
-    fflush(stderr);
-    return 0;
-}
-
-// v1.9.34：--dlopen-test <dylib 路径>
-// 判定 tweak dylib 本身能否被 dlopen（依赖是否齐全、签名是否可用）。
-// 用途：SB 侧 tweak 无日志时，区分「dylib 有毛病」还是「注入链路没触及 SpringBoard」。
-static int dlopenTest(const char *path) {
-    fprintf(stderr, "[WCVK-DLOPEN] trying %s\n", path);
-    fflush(stderr);
-    void *h = dlopen(path, RTLD_NOW);
-    if (h) {
-        fprintf(stderr, "[WCVK-DLOPEN] OK handle=%p\n", h);
-        fflush(stderr);
-        return 0;
+    NSArray *recs = [NSArray arrayWithContentsOfFile:WCVKRecordsPath()];
+    printf("records count=%lu\n", (unsigned long)recs.count);
+    for (NSUInteger i = 0; i < recs.count && i < 10; i++) {
+        NSDictionary *r = recs[i];
+        printf("  %s  %s  %s  %s\n",
+               [[r[@"t"] description] UTF8String] ?: "-",
+               [r[@"name"] UTF8String] ?: "-",
+               [r[@"ok"] boolValue] ? "OK" : "FAIL",
+               [r[@"detail"] UTF8String] ?: "");
     }
-    const char *err = dlerror();
-    fprintf(stderr, "[WCVK-DLOPEN] FAILED: %s\n", err ? err : "(null)");
-    fflush(stderr);
-    return 1;
-}
-
-// ===== v1.9.37：A 路线探测 --pk-probe（PlugInKit）=====
-// 背景：wxkb_plugin 是 launchd 托管的 Extension（type=Extension，
-// extension point=com.apple.keyboard-service），kickstart 三域全部
-// 102 Operation not supported。唯一正规入口是向 pkd 申领服务连接
-// （PlugInKit：PKHost/PKManager 的 beginUsing*）。连接一建立，
-// launchd 会把扩展拉起来且 active count>=1 让它常驻，全程无 UI。
-//
-// 本探测不猜签名：先把 PlugInKit 的类与 selector 全量 dump 到文件，
-// 再按存在的 selector 尝试调用，把 pid 变化打出来。
-static int pkProbe(void) {
-    const char *logp = "/var/mobile/wcvk_pkprobe.log";
-    FILE *fp = fopen(logp, "w");
-    if (!fp) fp = stderr;
-    #define PKLOG(...) do { fprintf(fp, __VA_ARGS__); fprintf(fp, "\n"); fflush(fp); } while (0)
-
-    PKLOG("=== pkProbe start pid=%d uid=%d ===", getpid(), getuid());
-
-    const char *paths[] = {
-        "/System/Library/PrivateFrameworks/PlugInKit.framework/PlugInKit",
-        "/rootfs/System/Library/PrivateFrameworks/PlugInKit.framework/PlugInKit",
-        "/usr/lib/libpkd.dylib",
-        NULL
-    };
-    void *h = NULL;
-    const char *used = NULL;
-    for (int i = 0; paths[i]; i++) {
-        h = dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL);
-        if (h) { used = paths[i]; break; }
-        PKLOG("dlopen FAILED %s -> %s", paths[i], dlerror() ? dlerror() : "?");
-    }
-    if (!h) { PKLOG("ABORT: PlugInKit 无法加载"); if (fp != stderr) fclose(fp); return 1; }
-    PKLOG("dlopen OK: %s handle=%p", used, h);
-
-    // 枚举该镜像内的类
-    unsigned int ncls = 0;
-    const char **names = objc_copyClassNamesForImage(used, &ncls);
-    PKLOG("classes in image: %u", ncls);
-    if (names) {
-        for (unsigned i = 0; i < ncls; i++) PKLOG("  class %s", names[i]);
-        free(names);
-    }
-
-    // dump 关键类的 selector
-    const char *want[] = {"PKHost", "PKManager", "PKPlugin", "PKPlugInCore",
-                          "PKHostPlugIn", "PKService", "PKDiscoveryDriver", NULL};
-    for (int i = 0; want[i]; i++) {
-        Class cls = objc_getClass(want[i]);
-        if (!cls) { PKLOG("--- class %s NOT FOUND", want[i]); continue; }
-        PKLOG("--- class %s (%p)", want[i], cls);
-        unsigned int n = 0;
-        Method *m = class_copyMethodList(object_getClass(cls), &n);
-        for (unsigned k = 0; k < n; k++)
-            PKLOG("   + %s", sel_getName(method_getName(m[k])));
-        free(m);
-        m = class_copyMethodList(cls, &n);
-        for (unsigned k = 0; k < n; k++)
-            PKLOG("   - %s", sel_getName(method_getName(m[k])));
-        free(m);
-    }
-
-    // 尝试拿到 host 单例（不同 iOS 版本入口不同，全部试一遍）
-    id host = nil;
-    const char *hostSel[] = {"defaultHost", "sharedHost", "defaultManager",
-                             "sharedManager", NULL};
-    Class hostCls = objc_getClass("PKHost");
-    Class mgrCls  = objc_getClass("PKManager");
-    for (int i = 0; hostSel[i]; i++) {
-        SEL s = sel_registerName(hostSel[i]);
-        if (hostCls && [hostCls respondsToSelector:s]) {
-            host = ((id (*)(id, SEL))objc_msgSend)(hostCls, s);
-            PKLOG("[PKHost %s] -> %s", hostSel[i], host ? class_getName(object_getClass(host)) : "nil");
-            if (host) break;
-        }
-        if (mgrCls && [mgrCls respondsToSelector:s]) {
-            host = ((id (*)(id, SEL))objc_msgSend)(mgrCls, s);
-            PKLOG("[PKManager %s] -> %s", hostSel[i], host ? class_getName(object_getClass(host)) : "nil");
-            if (host) break;
-        }
-    }
-    if (!host) { PKLOG("no host singleton found -> A 路线需另行确认入口"); if (fp != stderr) fclose(fp); return 2; }
-
-    // 尝试 beginUsing 各种变体（签名不猜：先用 respondsToSelector 过滤）
-    NSString *bid = @"com.tencent.wetype.keyboard";
-    NSString *extPoint = @"com.apple.keyboard-service";
-    int before = procPid("wxkb_plugin");
-    PKLOG("wxkb_plugin pid before = %d", before);
-
-    SEL cand[] = {
-        sel_registerName("beginUsingPlugIn:error:"),
-        sel_registerName("beginUsingPlugIn:options:error:"),
-        sel_registerName("beginUsingPlugIn:instanceInfo:error:"),
-        sel_registerName("pluginForIdentifier:error:"),
-        sel_registerName("pluginForExtensionPoint:"),
-        sel_registerName("pluginsForExtensionPoint:")
-    };
-    for (unsigned i = 0; i < sizeof(cand)/sizeof(cand[0]); i++) {
-        BOOL r = [host respondsToSelector:cand[i]];
-        PKLOG("host respondsTo %s = %d", sel_getName(cand[i]), r);
-    }
-
-    // 只对 beginUsingPlugIn:error: 做真实尝试（最常见签名）
-    SEL bSel = sel_registerName("beginUsingPlugIn:error:");
-    if ([host respondsToSelector:bSel]) {
-        NSError *err = nil;
-        id res = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(host, bSel, bid, &err);
-        PKLOG("beginUsingPlugIn(%s) -> %s err=%s", [bid UTF8String],
-              res ? class_getName(object_getClass(res)) : "nil",
-              err ? [[err description] UTF8String] : "none");
-        sleep(4);
-        int after = procPid("wxkb_plugin");
-        PKLOG("wxkb_plugin pid after = %d (was %d)", after, before);
-    } else {
-        PKLOG("SKIP beginUsingPlugIn:error: (selector 不存在)");
-        (void)extPoint;
-    }
-
-    PKLOG("=== pkProbe end ===");
-    if (fp != stderr) fclose(fp);
-    return 0;
-    #undef PKLOG
-}
-
-// ===== v1.9.38：A 路线正式实现 --pk-hold =====
-// v1.9.37 的 --pk-probe 已 dump 出 PlugInKit 的真实 API（设备实证）：
-//   PKHost    : defaultHost / activatePlugIn: / readyPlugIns:...  ← 没有 beginUsingPlugIn
-//   PKManager : defaultManager / holdPlugInsInApplication:withError:
-//               forceHoldPlugIn:withError: / holdRequest:extensionPointName:platforms:flags:result:
-//               releaseHold:withError:
-// 也就是说「持有扩展（hold）」才是正规手段：hold 建立后 pkd 会让 launchd
-// 保持扩展活跃（active count>=1），不受 exit timeout=3 回收，且全程无 UI。
-// 本命令依次尝试三种 hold 入口，每种之后采样 wxkb_plugin 的 pid。
-// v1.9.39：重写 hold 探测。
-// v1.9.38 那次崩在 `holdPlugInsInApplication:withError:`——它的入参不是 bundle id 字符串，
-// PlugInKit 内部对入参调了 -path，传 NSString 直接 unrecognized selector 终止进程。
-// 这次先用 method_getTypeEncoding 拿到真实签名，再逐个入口用 @try 兜住，
-// 保证一个入口炸了还能继续试下一个，不会整个进程退出。
-static int pkHold(void) {
-    const char *logp = "/var/mobile/wcvk_pkhold.log";
-    FILE *fp = fopen(logp, "w");
-    if (!fp) fp = stderr;
-    #define HLOG(...) do { fprintf(fp, __VA_ARGS__); fprintf(fp, "\n"); fflush(fp); } while(0)
-
-    HLOG("=== pkHold start pid=%d uid=%d ===", getpid(), getuid());
-    void *h = dlopen("/System/Library/PrivateFrameworks/PlugInKit.framework/PlugInKit",
-                     RTLD_NOW | RTLD_GLOBAL);
-    if (!h) { HLOG("dlopen FAILED: %s", dlerror() ? dlerror() : "?"); if (fp != stderr) fclose(fp); return 1; }
-    HLOG("dlopen OK");
-
-    Class MCls = objc_getClass("PKManager");
-    if (!MCls) { HLOG("PKManager NOT FOUND"); if (fp != stderr) fclose(fp); return 2; }
-
-    id mgr = nil;
-    SEL dmSel = sel_registerName("defaultManager");
-    if ([MCls respondsToSelector:dmSel])
-        mgr = ((id (*)(id, SEL))objc_msgSend)(MCls, dmSel);
-    if (!mgr) {
-        SEL mfuSel = sel_registerName("managerForUser:");
-        if ([MCls respondsToSelector:mfuSel])
-            mgr = ((id (*)(id, SEL, int))objc_msgSend)(MCls, mfuSel, (int)getuid());
-    }
-    HLOG("PKManager instance = %s", mgr ? class_getName(object_getClass(mgr)) : "nil");
-    if (!mgr) { if (fp != stderr) fclose(fp); return 3; }
-
-    // --- 先 dump 真实类型编码，别再靠猜 ---
-    const char *encSel[] = {
-        "holdPlugInsInApplication:withError:",
-        "holdPlugInsWithExtensionPointName:error:",
-        "holdPlugInsWithExtensionPointName:platforms:terminate:error:",
-        "holdPlugInsWithExtensionPointName:platforms:terminate:result:",
-        "forceHoldPlugIn:withError:",
-        "forceHoldPlugIn:result:",
-        "registerPlugInAtURL:result:",
-        "releaseHold:withError:",
-        NULL
-    };
-    HLOG("--- type encodings ---");
-    for (int i = 0; encSel[i]; i++) {
-        Method m = class_getInstanceMethod(MCls, sel_registerName(encSel[i]));
-        if (!m) { HLOG("  %s : NOT FOUND", encSel[i]); continue; }
-        const char *enc = method_getTypeEncoding(m);
-        HLOG("  %s : %s", encSel[i], enc ? enc : "?");
-    }
-
-    int before = procPid("wxkb_plugin");
-    HLOG("wxkb_plugin pid before = %d", before);
-    if (before > 0) { HLOG("already running, nothing to hold"); if (fp != stderr) fclose(fp); return 0; }
-
-    // --- 尝试 1：holdPlugInsWithExtensionPointName:error:（按 extension point 持有，入参是字符串）
-    {
-        SEL s = sel_registerName("holdPlugInsWithExtensionPointName:error:");
-        if ([mgr respondsToSelector:s]) {
-            @try {
-                NSError *err = nil;
-                BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
-                            mgr, s, @"com.apple.keyboard-service", &err);
-                HLOG("[1] holdPlugInsWithExtensionPointName(keyboard-service) -> %d err=%s",
-                     ok, err ? [[err description] UTF8String] : "none");
-            } @catch (NSException *e) {
-                HLOG("[1] EXCEPTION %s: %s", [[e name] UTF8String], [[e reason] UTF8String]);
-            }
-            for (int i = 1; i <= 4; i++) {
-                sleep(1);
-                int p = procPid("wxkb_plugin");
-                HLOG("[1] +%ds wxkb_plugin=%d", i, p);
-                if (p > 0) break;
-            }
-            if (procPid("wxkb_plugin") > 0) {
-                HLOG("SUCCESS via holdPlugInsWithExtensionPointName:error:");
-                if (fp != stderr) fclose(fp);
-                return 0;
-            }
-        } else HLOG("[1] selector 不存在");
-    }
-
-    // --- 尝试 2：holdPlugInsWithExtensionPointName:platforms:terminate:error:
-    {
-        SEL s = sel_registerName("holdPlugInsWithExtensionPointName:platforms:terminate:error:");
-        if ([mgr respondsToSelector:s]) {
-            @try {
-                NSError *err = nil;
-                BOOL ok = ((BOOL (*)(id, SEL, id, id, BOOL, NSError **))objc_msgSend)(
-                            mgr, s, @"com.apple.keyboard-service", nil, (BOOL)NO, &err);
-                HLOG("[2] holdPlugInsWithExtensionPointName:platforms:terminate -> %d err=%s",
-                     ok, err ? [[err description] UTF8String] : "none");
-            } @catch (NSException *e) {
-                HLOG("[2] EXCEPTION %s: %s", [[e name] UTF8String], [[e reason] UTF8String]);
-            }
-            sleep(4);
-            HLOG("[2] after 4s wxkb_plugin=%d", procPid("wxkb_plugin"));
-            if (procPid("wxkb_plugin") > 0) {
-                HLOG("SUCCESS via holdPlugInsWithExtensionPointName:platforms:terminate:error:");
-                if (fp != stderr) fclose(fp);
-                return 0;
-            }
-        } else HLOG("[2] selector 不存在");
-    }
-
-    // --- 尝试 3：forceHoldPlugIn:withError:（入参是 plugin identifier 字符串）
-    {
-        SEL s = sel_registerName("forceHoldPlugIn:withError:");
-        if ([mgr respondsToSelector:s]) {
-            @try {
-                NSError *err = nil;
-                BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
-                            mgr, s, @"com.tencent.wetype.keyboard", &err);
-                HLOG("[3] forceHoldPlugIn(keyboard id) -> %d err=%s",
-                     ok, err ? [[err description] UTF8String] : "none");
-            } @catch (NSException *e) {
-                HLOG("[3] EXCEPTION %s: %s", [[e name] UTF8String], [[e reason] UTF8String]);
-            }
-            sleep(4);
-            HLOG("[3] after 4s wxkb_plugin=%d", procPid("wxkb_plugin"));
-            if (procPid("wxkb_plugin") > 0) {
-                HLOG("SUCCESS via forceHoldPlugIn:withError:");
-                if (fp != stderr) fclose(fp);
-                return 0;
-            }
-        } else HLOG("[3] selector 不存在");
-    }
-
-    // --- 尝试 4：registerPlugInAtURL:result: 拿到 proxy，再用 forceHoldPlugIn:withError: 持有
-    // 这条路最贴近系统真实流程：pkd 需要先发现这个 appex，才谈得上 hold。
-    {
-        SEL sReg = sel_registerName("registerPlugInAtURL:result:");
-        if ([mgr respondsToSelector:sReg]) {
-            __block id proxy = nil;
-            __block BOOL done = NO;
-            @try {
-                // 动态找 appex（路径含随机 UUID，写死会随重装失效）
-                char appexPath[512] = {0};
-                glob_t gt = {0};
-                int grc = glob("/private/var/containers/Bundle/Application/*/wxkb.app/PlugIns/wxkb_plugin.appex",
-                               0, NULL, &gt);
-                if (grc == 0 && gt.gl_pathc > 0)
-                    snprintf(appexPath, sizeof(appexPath), "%s", gt.gl_pathv[0]);
-                if (grc == 0) globfree(&gt);
-                if (!appexPath[0]) {
-                    HLOG("[4] appex 未找到，跳过");
-                } else {
-                NSURL *u = [NSURL fileURLWithPath:[NSString stringWithUTF8String:appexPath]];
-                HLOG("[4] registerPlugInAtURL: %s", appexPath);
-                void (^cb)(id, NSError *) = ^(id result, NSError *err) {
-                    proxy = result;
-                    HLOG("[4] register result=%s err=%s",
-                         result ? [[result description] UTF8String] : "nil",
-                         err ? [[err description] UTF8String] : "none");
-                    done = YES;
-                };
-                id blk = [cb copy];
-                ((void (*)(id, SEL, id, id))objc_msgSend)(mgr, sReg, u, blk);
-                for (int i = 0; i < 10 && !done; i++) sleep(1);
-                HLOG("[4] register wait done=%d proxy=%s", (int)done,
-                     proxy ? class_getName(object_getClass(proxy)) : "nil");
-                [blk release];
-                }   // end else (appexPath found)
-            } @catch (NSException *e) {
-                HLOG("[4] EXCEPTION %s: %s", [[e name] UTF8String], [[e reason] UTF8String]);
-            }
-            if (proxy) {
-                SEL sF = sel_registerName("forceHoldPlugIn:withError:");
-                if ([mgr respondsToSelector:sF]) {
-                    @try {
-                        NSError *err = nil;
-                        BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(mgr, sF, proxy, &err);
-                        HLOG("[4] forceHoldPlugIn(proxy) -> %d err=%s",
-                             ok, err ? [[err description] UTF8String] : "none");
-                    } @catch (NSException *e) {
-                        HLOG("[4] forceHold EXCEPTION %s: %s", [[e name] UTF8String], [[e reason] UTF8String]);
-                    }
-                    sleep(4);
-                    HLOG("[4] after 4s wxkb_plugin=%d", procPid("wxkb_plugin"));
-                    if (procPid("wxkb_plugin") > 0) {
-                        HLOG("SUCCESS via register+forceHoldPlugIn");
-                        if (fp != stderr) fclose(fp);
-                        return 0;
-                    }
-                }
-            }
-        } else HLOG("[4] selector 不存在");
-    }
-
-    HLOG("=== pkHold end (wxkb_plugin=%d) 全部入口失败 ===", procPid("wxkb_plugin"));
-    if (fp != stderr) fclose(fp);
-    return 4;
-    #undef HLOG
 }
 
 int main(int argc, char *argv[]) {
-    // 早期 stderr（不依赖 Foundation/ObjC runtime）——
-    // launchd 任何阶段拒收(进程类型/entitlement/签名/sandbox)都能立刻看到，
-    // 否则后面 LOG 走 NSLog + 文件句柄,启动被秒拒时来不及写任何东西。
-    fprintf(stderr, "[WCVK-DAEMON] main() entered pid=%d uid=%d argv0=%s\n",
-            getpid(), getuid(), (argc > 0 && argv[0]) ? argv[0] : "?");
-    fflush(stderr);
-
-    // v1.9.11：--tfp-check <pid> 测试分支（真实 daemon 环境），测完即退不影响正常功能
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--tfp-check") == 0 && i + 1 < argc) {
-            return tfpCheck(atoi(argv[i + 1]));
-        }
-        // v1.9.33：--kbd-warm 手动触发键盘扩展预热实验
-        if (strcmp(argv[i], "--kbd-warm") == 0) {
-            return kbdWarmTrigger();
-        }
-        // v1.9.36：--kbd-warm-test 一次给出完整结论（发通知 + 12s 采样时间线）
-        if (strcmp(argv[i], "--kbd-warm-test") == 0) {
-            return kbdWarmTest();
-        }
-        // v1.9.37：--kbd-alert 强制走 alert 通道验证宿主能力
-        if (strcmp(argv[i], "--kbd-alert") == 0) {
-            return kbdAlertTrigger();
-        }
-        // v1.9.34：--dlopen-test <path> 验证 tweak dylib 能否被加载
-        if (strcmp(argv[i], "--dlopen-test") == 0 && i + 1 < argc) {
-            return dlopenTest(argv[i + 1]);
-        }
-        // v1.9.37：--pk-probe 探测 PlugInKit（A 路线：建持久服务连接）
-        if (strcmp(argv[i], "--pk-probe") == 0) {
-            return pkProbe();
-        }
-        // v1.9.38：--pk-hold 用 PKManager 的 hold API 正式尝试持有键盘扩展
-        if (strcmp(argv[i], "--pk-hold") == 0) {
-            return pkHold();
-        }
-        // v1.9.40：--kbd-api-probe 让 SpringBoard dump 键盘私有 API 签名
-        if (strcmp(argv[i], "--kbd-api-probe") == 0) {
-            return kbdApiProbeTrigger();
-        }
-        // v1.9.41：--kbd-pk-spawn 走 PKHost 无头拉起键盘扩展
-        if (strcmp(argv[i], "--kbd-pk-spawn") == 0) {
-            return kbdPkSpawnTrigger();
-        }
-    }
-
     @autoreleasepool {
-        LOG(@"==== daemon boot ====");
-        LOG(@"pid=%d uid=%d argv0=%s", getpid(), getuid(), argv[0] ?: "?");
-        LOG(@"target=%@ trigger=%s pipBuilt=%s", kTargetBundleID, kTriggerName, kPipBuiltName);
-        LOG(@"log=%@", kLogPath);
-
-        registerNotifs();
-        LOG(@"sleeping %ds for SpringBoard...", kBootDelaySec);
-        sleep(kBootDelaySec);
-
-        // 注销后立即预热：最多试 ~2 分钟。
-        // v1.9.22：锁屏也拉 wetype（不再跳过）——SB 保活后锁屏拉起不再是僵尸
-        //（进程不挂起 + scene active），解锁时 DidBecomeActive 自动建 PiP，无需等
-        // lockstate 回调。修"注销后拉起快慢不稳定"（原来拉起时机=用户解锁时机）。
-        LOG(@"boot warmup loop until pip.built (max ~2min)...");
-        time_t bootStart = time(NULL);
-        while (!gPipUp && time(NULL) - bootStart < 120) {
-            @autoreleasepool { warmupOnce(); }
-            if (gPipUp) break;
-            // v1.9.38：boot 阶段也要看护键盘扩展。之前只有进入 60s watch 才检查，
-            // 结果 respring 后要等 2 分钟才可能补拉（老板实测：装完杀掉扩展没反应）。
-            // watchKeyboardExtension 内部自带"扩展在跑就 skip"+失败冷却 300s，反复调安全。
-            @autoreleasepool { watchKeyboardExtension(); }
-            // v1.9.20：微信 3s 点尽早拉；maybeWarmWechat 内部节流防重复
-            if (!gWechatWarmed && time(NULL) - bootStart >= 3) maybeWarmWechat();
-            sleep(kFastRetrySec);
-        }
-        LOG(@"boot warmup done (gPipUp=%d) -> entering 60s watch", (int)gPipUp);
-
-        // 兜底：循环结束还没拉过微信就补拉（防 2min 全在锁屏且 30s 点恰好没到）
-        maybeWarmWechat();
-
-        // v1.9.42：进入事件驱动看护 —— 立刻在现有 wxkb_plugin pid 上挂退出事件监视。
-        // 若此刻扩展不在（常见：开机后还没用过键盘），watchKeyboardExtension 会在
-        // 首次自检时补一次预热，拉起后 SB 会发 kbd.up 让我们挂上监视。
-        @autoreleasepool { armKbdProcWatch(); }
-
-        // 守护循环（v1.9.10 老板拍板 + v1.9.13 PiP 失效检测）：
-        //  - wetype：解锁态死了/僵尸 -> kill+重拉；活着但被系统挂起（suspend_count>0，
-        //    微信视频 PiP 顶掉保活凭证）-> PiP 失效 -> 择机重拉（锁屏等解锁/有音频不拉/5min 冷却）
-        //  - 微信：被杀就无头拉（不管锁屏/息屏，无 UI 无打扰），120s 节流
-        while (1) {
-            // v1.9.42：键盘扩展改为**事件驱动**（老板要求，不用轮询）：
-            // 见 armKbdProcWatch() —— 用 DISPATCH_SOURCE_TYPE_PROC +
-            // DISPATCH_PROC_EXIT 直接监听 wxkb_plugin 进程退出事件，内核回调，
-            // 零 sysctl 轮询、零定时器。这里只保留 60s 一次的兜底自检
-            //（正常路径根本走不到，仅防止"漏挂监视"导致永久失联）。
-            sleep(kCheckIntervalSec);
-            @autoreleasepool { watchKeyboardExtension(); }
-            @autoreleasepool {
-                watchWechat(); // 微信看护优先（老板要求：微信也要能拉起来）
-
-                if (isAppRunning(kTargetBundleID)) {
-                    int pid = procPid("wxkb");
-                    int sc = taskSuspendCount(pid); // 权威判定：sc>0=挂起(无PiP)，0=活着，-1=拿不到
-                    if (gPipUp) {
-                        // v1.9.13：sc>0 = 进程被系统挂起 = PiP 已被顶掉（视频 PiP 抢通道）
-                        if (sc > 0) {
-                            LOG(@"%@ SUSPENDED (suspend_count=%d pid=%d) -> PiP lost (video PiP took over?)", kTargetBundleID, sc, pid);
-                            handlePiPLost(sc); // 锁屏/有音频/冷却期都不拉，只有空闲解锁态才重拉
-                        } else {
-                            LOG(@"%@ alive -> only trigger dylib", kTargetBundleID); // 测试版：详细日志
-                            postTrigger();
-                        }
-                    } else if (sc > 0) {
-                        // v1.9.15：只有真挂起（sc>0）才当僵尸杀；解锁态 kill+重拉
-                        if (!gLocked) {
-                            LOG(@"%@ zombie & unlocked (sc=%d) -> kill & re-warm", kTargetBundleID, sc);
-                            killApp();
-                            gPipUp = NO;
-                            reWarm();
-                            if (gPipUp) maybeWarmWechat();
-                        } else {
-                            LOG(@"%@ zombie & LOCKED -> skip (lock-screen pull is dead, no PiP)", kTargetBundleID);
-                        }
-                    } else {
-                        // v1.9.15：进程活着（sc==0 可能带 PiP 只是 pip.built 延迟；sc==-1 拿不到）
-                        // -> 绝不杀，发 trigger 让 dylib 自己建 PiP/上报
-                        LOG(@"%@ running sc=%d, gPipUp=NO -> no kill, trigger dylib (wait pip.built)", kTargetBundleID, sc);
-                        postTrigger();
-                    }
-                    continue;
-                }
-                if (!gLocked) {
-                    LOG(@"%@ NOT running & unlocked -> re-warm", kTargetBundleID);
-                    gPipUp = NO;
-                    reWarm();
-                    if (gPipUp) maybeWarmWechat();
-                } else {
-                    LOG(@"%@ died & LOCKED -> skip wetype (lock-screen pull is dead, no PiP)", kTargetBundleID);
-                }
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--status") == 0) { WCVKPrintStatus(); return 0; }
+            if (strcmp(argv[i], "--kbd-warm") == 0) {
+                uint32_t s = notify_post("com.wcvoicekeep.kbd.warmup");
+                printf("kbd warmup posted -> %u\n", s);
+                return 0;
+            }
+            if (strcmp(argv[i], "--launch") == 0 && i + 1 < argc) {
+                NSString *bid = [NSString stringWithUTF8String:argv[i + 1]];
+                int r = WCVKHeadlessLaunch(bid);
+                WCVKRecord(bid, bid, @"app", r == 0, @"手动测试后台拉起");
+                printf("headless launch %s -> %d (0=ok)\n", argv[i + 1], r);
+                return 0;
+            }
+            if (strcmp(argv[i], "--clear-records") == 0) {
+                [[NSFileManager defaultManager] removeItemAtPath:WCVKRecordsPath() error:nil];
+                printf("records cleared: %s\n", WCVKRecordsPath().UTF8String);
+                return 0;
             }
         }
+
+        // ===== 常驻守护 =====
+        LOG(@"===== daemon start (pid=%d, flavor=%s) =====", getpid(),
+            WCVK_NO_LOG ? "pure" : "log");
+        WCVKReadPrefs();
+        WCVKRebuildTargets();
+        WCVKRegisterKbdUp();
+        WCVKArmPrefsWatch();
+        LOG(@"daemon ready: 事件驱动看护中（零轮询）");
+
+        dispatch_main();
     }
     return 0;
 }

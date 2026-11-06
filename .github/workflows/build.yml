@@ -4,26 +4,51 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# 按 run_id 分组，避免僵尸 run 互相挤掉（wctweak 踩过的坑）
+concurrency:
+  group: build-${{ github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   build:
-    # macos-14 于 2026-11 被 GitHub 下线（报错 "configuration
-    # 'macos-14-arm64-us-default' is not supported"），改用现役 macos-15 镜像。
+    name: build (${{ matrix.variant }}-${{ matrix.flavor }})
+    # macos-14 于 2026-11 被 GitHub 下线，改用现役 macos-15 镜像
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 老板设备 = roothide 隐根，只编 roothide
+        variant: [roothide]
+        # 每次出两份（照 wctweak 流程）：
+        #   log  = 带日志（daemon/SB 全量日志落 /var/mobile/*.log），排障用
+        #   pure = 纯净版（WCVK_NO_LOG=1，所有日志埋点编译期剥离），日常用
+        # 注意：拉起记录是功能不是日志，两个版本都写（受设置里的记录开关控制）
+        flavor: [log, pure]
+
     steps:
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: 'latest-stable'
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      # roothide 必须用 roothide 官方 fork 的 theos（github.com/roothide/theos），
-      # 普通 theos 不认 roothide scheme（watch-both-notify 实测结论）。
+      # roothide 必须用 roothide 官方 fork 的 theos（普通 theos 不认 roothide scheme）
       - name: Setup Theos (roothide)
         run: |
           git clone --recurse-submodules https://github.com/roothide/theos.git ${{ runner.temp }}/theos
-          find ${{ runner.temp }}/theos/bin -name "*.pl" -exec sed -i '' '1s|#!/usr/bin/perl|#!/usr/bin/env perl|' {} \;
+          find ${{ runner.temp }}/theos/bin -name "*.pl" -exec sed -i '' '1s|#!/usr/bin/perl|#!/usr/bin/env perl' {} \;
           echo "THEOS=${{ runner.temp }}/theos" >> $GITHUB_ENV
           echo "THEOS_PACKAGE_SCHEME=roothide" >> $GITHUB_ENV
 
       - name: Install dependencies
-        run: brew install dpkg ldid
+        run: |
+          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
+          brew install dpkg ldid
 
       - name: Install SDK
         run: |
@@ -34,24 +59,38 @@ jobs:
           rm -rf sdks-master master.zip
 
       - name: Build
+        env:
+          # pure 变体：编译期剥掉全部日志（Makefile 里 -DWCVK_NO_LOG=1）
+          WCVK_NO_LOG: ${{ matrix.flavor == 'pure' && '1' || '0' }}
         run: |
+          set -o pipefail
           chmod 755 layout/DEBIAN/postinst
-          make package
+          echo "flavor=${{ matrix.flavor }}  WCVK_NO_LOG=$WCVK_NO_LOG"
+          make package 2>&1 | tee build.log
+
+      - name: Rename deb with flavor
+        run: |
+          set -o pipefail
+          {
+            DEB=$(find packages -name '*.deb' -print -quit)
+            if [ -z "$DEB" ]; then echo "ERROR: no deb produced"; find . -name '*.deb' | head; exit 1; fi
+            OUT="packages/wcvoicekeep-${{ matrix.variant }}-${{ matrix.flavor }}.deb"
+            rm -f "$OUT"
+            dpkg-deb -b .theos/_ "$OUT"
+            echo "=== deb control ==="; dpkg-deb -f "$OUT" | head -10
+            echo "=== contents ==="; dpkg-deb -c "$OUT" | grep -E "PreferenceBundles|PreferenceLoader|usr/bin|TweakInject|LaunchDaemons" | head -20
+          } 2>&1 | tee -a build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.variant }}-${{ matrix.flavor }}
+          path: build.log
 
       - name: Upload deb
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: wcvoicekeep-roothide
-          path: packages/*.deb
-
-      - name: Collect dylib for TrollFools
-        run: |
-          mkdir -p out
-          find . -name "WCVoiceKeep.dylib" -exec cp {} out/ \;
-          ls -l out
-
-      - name: Upload dylib (TrollFools inject)
-        uses: actions/upload-artifact@v4
-        with:
-          name: WCVoiceKeep-dylib
-          path: out/WCVoiceKeep.dylib
+          name: wcvoicekeep-${{ matrix.variant }}-${{ matrix.flavor }}
+          path: packages/wcvoicekeep-${{ matrix.variant }}-${{ matrix.flavor }}.deb
