@@ -9,3 +9,8 @@ packages/
 wcvk_kbdapi.log
 .dl/
 _dl/
+
+# 本地临时目录（CI 产物下载/逆向分析用，不入库）
+_art_*/
+_dl_*/
+_macho/
