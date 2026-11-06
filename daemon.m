@@ -69,6 +69,7 @@ extern uint32_t notify_get_state(int token, uint64_t *state);
 static void armKbdProcWatch(void);
 static void onKbdWarmupOk(void);
 static dispatch_queue_t kbdEventQueue(void);
+static int  gKbdOkToken = 0;    // "拉起成功"回报的 notify token（注册处在前面）
 
 #define SBS_PATH "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices"
 
@@ -615,7 +616,6 @@ static const time_t kKbdFailCooldownSec = 45;   // 失败后仅冷却 45s，20s 
 // v1.9.42：拉起成功由 SpringBoard 主动回报，不再靠"下一次采样是否看到进程"。
 // 设备实测（12:24:12）正是因为采样窗口与真实拉起时刻错位，把成功判成 FAILED
 // 并锁 45s —— 老板看到的现象就是"第三次杀掉很久才拉起"。
-static int gKbdOkToken = 0;
 static void onKbdWarmupOk(void) {
     LOG(@"kbd warmup OK reported by SpringBoard -> 成功, 冷却清零");
     gKbdPendAt = 0;
