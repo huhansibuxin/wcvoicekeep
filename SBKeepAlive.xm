@@ -43,7 +43,7 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #import <stdio.h>
 #import <stdlib.h>   // calloc / free
 
-#define WCVK_BUILD_TAG "v2.0.3-roothide"
+#define WCVK_BUILD_TAG "v2.0.4-roothide"
 
 // 键盘扩展进程的精确特征：可执行文件路径以 /wxkb_plugin.appex/wxkb_plugin 结尾
 static NSString *const kKbdExtPathSuffix = @"/wxkb_plugin.appex/wxkb_plugin";
@@ -203,6 +203,15 @@ static void KbdInstallObservers(void) {
         } else {
             SBLog(@"[KBDWARM] kbd.up 去抖：本次预热已发过，忽略重复 DidShow");
         }
+        // v2.0.4（老板要求）：**键盘一弹出来就立刻收**。
+        // 扩展进程这时已经在内存里了，收键盘不会把它带走（它靠 exit timeout=3 才回收），
+        // 所以没必要让键盘在屏幕上多待。放到下一轮 runloop 再收，避开键盘正在 setup 的瞬间。
+        if (gWarmBusy && gWarmField) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                KbdWarmupFinish(@"DidShow-immediate");
+                SBLog(@"[KBDWARM] DidShow 即刻收键盘 -> wxkb_plugin_running=%d", KbdProcRunning());
+            });
+        }
     }];
     gHideObs = [nc addObserverForName:UIKeyboardDidHideNotification object:nil
                                 queue:[NSOperationQueue mainQueue]
@@ -302,28 +311,17 @@ static void KbdWarmupRun(NSString *reason) {
             }
         });
 
-        // T+0.7s：**无条件**收键盘。
-        // 关键：以前这里写的是 `if (!gDidShow) return;` —— 而 SpringBoard 里
-        // UIKeyboardDidShow 经常收不到，结果"键盘弹出来了却永远不收"，一直挂在桌面上。
-        // 0.7s 足够系统把 wxkb_plugin spawn 出来（实测 <0.6s），收键盘不影响扩展继续存活。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
+        // T+1.2s：**兜底**收键盘（正常路径在 DidShow 那一刻就收掉了）。
+        // 以前这里写的是 `if (!gDidShow) return;` —— 而 SpringBoard 里 UIKeyboardDidShow
+        // 经常收不到，结果"键盘弹出来了却永远不收"，一直挂在桌面上。
+        // 所以无论有没有收到 DidShow，到点都无条件收一遍。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            KbdWarmupFinish(@"T+0.7s");
-            SBLog(@"[KBDWARM] T+0.7s 收键盘完成 wxkb_plugin_running=%d", KbdProcRunning());
+            KbdWarmupFinish(@"T+1.2s-fallback");
+            SBLog(@"[KBDWARM] T+1.2s 兜底收键盘完成 wxkb_plugin_running=%d", KbdProcRunning());
         });
 
-        // T+1.1s：再补一次收（第一次 resign 可能撞在键盘还在弹出的动画里，收不干净）
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.1 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (gWarmField) {
-                @try { [gWarmField resignFirstResponder]; } @catch (NSException *e) {}
-            }
-            if (gWarmWindow) {
-                gWarmWindow.hidden = YES;
-                gWarmWindow = nil;
-            }
-            if (gPrevKeyWindow) { [gPrevKeyWindow makeKeyWindow]; gPrevKeyWindow = nil; }
-        });
+        // T+1.1s 的"补收"已并入上面的 T+1.2s 兜底（KbdWarmupFinish 本身幂等）
 
         // T+3s：最终判定 + 释放 busy（无论成败都要释放，否则下次预热会被 busy 挡住）
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
