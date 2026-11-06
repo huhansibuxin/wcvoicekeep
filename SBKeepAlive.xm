@@ -43,7 +43,7 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #import <stdio.h>
 #import <stdlib.h>   // calloc / free
 
-#define WCVK_BUILD_TAG "v2.0.0-roothide"
+#define WCVK_BUILD_TAG "v2.0.1-roothide"
 
 // 键盘扩展进程的精确特征：可执行文件路径以 /wxkb_plugin.appex/wxkb_plugin 结尾
 static NSString *const kKbdExtPathSuffix = @"/wxkb_plugin.appex/wxkb_plugin";
@@ -177,6 +177,7 @@ static UITextField *gWarmField = nil;
 static UIWindow    *gPrevKeyWindow = nil;
 static BOOL         gWarmBusy = NO;
 static BOOL         gDidShow = NO;
+static BOOL         gUpPosted = NO;   // v2.0.1：本次预热是否已发过 kbd.up（去抖）
 static id           gShowObs = nil;
 static id           gHideObs = nil;
 
@@ -211,8 +212,18 @@ static void KbdInstallObservers(void) {
                            usingBlock:^(NSNotification *n) {
         gDidShow = YES;
         SBLog(@"[KBDWARM] *** UIKeyboardDidShow 收到 = 键盘弹出来了，扩展应已被系统 spawn");
-        // 告诉 daemon：扩展已经起来，去新 pid 上重新挂退出事件（事件驱动，零轮询）
-        WCVKPostDarwin("com.wcvoicekeep.kbd.up");
+        // 告诉 daemon：扩展已经起来，去新 pid 上重新挂退出事件（事件驱动，零轮询）。
+        // v2.0.1：DidShow 在一次预热里会被系统连发很多次（实测 12 次/秒级），
+        // 每次都要 daemon 遍历进程表重挂 —— 纯浪费。这里按「新 pid + 3s 去抖」只发一次。
+        static time_t sLastUpAt = 0;
+        time_t nowT = time(NULL);
+        if (!gUpPosted || nowT - sLastUpAt >= 3) {
+            gUpPosted  = YES;
+            sLastUpAt  = nowT;
+            WCVKPostDarwin("com.wcvoicekeep.kbd.up");
+        } else {
+            SBLog(@"[KBDWARM] kbd.up 去抖：本次预热已发过，忽略重复 DidShow");
+        }
     }];
     gHideObs = [nc addObserverForName:UIKeyboardDidHideNotification object:nil
                                 queue:[NSOperationQueue mainQueue]
@@ -244,6 +255,7 @@ static void KbdWarmupRun(NSString *reason) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gWarmBusy) { SBLog(@"[KBDWARM] skip, busy (%@)", reason); return; }
         gWarmBusy = YES;
+        gUpPosted = NO;              // v2.0.1：新一轮预热，允许发一次 kbd.up
 
         if (KbdProcRunning()) {
             SBLog(@"[KBDWARM] skip: wxkb_plugin 已在运行，无需预热");

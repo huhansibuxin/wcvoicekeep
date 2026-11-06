@@ -163,12 +163,21 @@ static void WCVKReadPrefs(void) {
 }
 
 // ===== 拉起记录（纯净版也写；设置页「拉起记录」读它）=====
+// 读取记录（兼容新格式 dict{rows:[...]} 与 v2.0.0 的旧格式 顶层数组）
+static NSMutableArray *WCVKLoadRecords(NSString *path) {
+    id o = [NSDictionary dictionaryWithContentsOfFile:path];
+    if ([o isKindOfClass:[NSDictionary class]] && [o[@"rows"] isKindOfClass:[NSArray class]])
+        return [o[@"rows"] mutableCopy];
+    o = [NSArray arrayWithContentsOfFile:path];
+    if ([o isKindOfClass:[NSArray class]]) return [o mutableCopy];
+    return [NSMutableArray array];
+}
+
 static void WCVKRecord(NSString *display, NSString *ident, NSString *kind, BOOL ok, NSString *detail) {
     // 记录开关关掉时**直接返回**：不读文件、不写文件，零 syscall、零 CPU
     if (!gRecord) return;
     NSString *path = WCVKRecordsPath();
-    id old = [NSArray arrayWithContentsOfFile:path];
-    NSMutableArray *arr = [old isKindOfClass:[NSArray class]] ? [old mutableCopy] : [NSMutableArray array];
+    NSMutableArray *arr = WCVKLoadRecords(path);
     NSMutableDictionary *row = [NSMutableDictionary dictionary];
     row[@"t"] = [NSDate date];
     row[@"name"] = display ?: ident ?: @"?";
@@ -178,9 +187,12 @@ static void WCVKRecord(NSString *display, NSString *ident, NSString *kind, BOOL 
     if (detail.length) row[@"detail"] = detail;
     [arr insertObject:row atIndex:0];
     while (arr.count > 60) [arr removeLastObject];
-    if (![arr writeToFile:path atomically:YES]) {
+    // v2.0.1：改成 dict{rows:[...]} —— 顶层是 dict，cfprefsd 才能当域读；
+    // 设置页因此可以走 CFPreferences 兜底（沙箱下直读文件可能被拦）
+    NSDictionary *out = @{ @"rows": arr };
+    if (![out writeToFile:path atomically:YES]) {
         NSString *alt = @"/var/mobile/wcvoicekeep.records.plist";
-        [arr writeToFile:alt atomically:YES];
+        [out writeToFile:alt atomically:YES];
         LOG(@"record write fallback -> %@", alt);
     }
 }
@@ -216,34 +228,110 @@ static void WCVKEnsureLSLoaded(void) {
     });
 }
 
-static NSDictionary *WCVKAppMeta(NSString *bid) {
+// App 代理解析：iOS 16 设备实测 `-[LSApplicationWorkspace applicationProxyForIdentifier:]`
+// **不存在**（日志实证：unrecognized selector sent to instance => v2.0.0 里微信被 skip，
+// 用户勾了也永远不挂监视）。真正可用的是类方法 +[LSApplicationProxy applicationProxyForIdentifier:]。
+// 这里按可用性逐个试，最后用 allApplications 全量枚举兜底，任何一个能返回就够。
+static id WCVKLSProxyForBID(NSString *bid) {
     WCVKEnsureLSLoaded();
-    Class WS = NSClassFromString(@"LSApplicationWorkspace");
-    if (!WS) return nil;
-    id ws = nil, proxy = nil;
     @try {
-        ws = ((id (*)(id, SEL))objc_msgSend)((id)WS, sel_registerName("defaultWorkspace"));
-        if (ws) proxy = ((id (*)(id, SEL, id))objc_msgSend)(ws,
-                            sel_registerName("applicationProxyForIdentifier:"), bid);
+        // ① 类方法（iOS 上的正确入口）
+        Class P = NSClassFromString(@"LSApplicationProxy");
+        if (P) {
+            SEL s = sel_registerName("applicationProxyForIdentifier:");
+            if ([(id)P respondsToSelector:s]) {
+                id r = ((id (*)(id, SEL, id))objc_msgSend)((id)P, s, bid);
+                if (r) return r;
+            }
+        }
     } @catch (NSException *e) {}
-    if (!proxy) return nil;
 
-    NSString *exe = nil, *appDir = nil, *name = nil;
-    @try { exe = ((id (*)(id, SEL))objc_msgSend)(proxy, sel_registerName("bundleExecutable")); } @catch (NSException *e) {}
     @try {
-        NSURL *u = ((id (*)(id, SEL))objc_msgSend)(proxy, sel_registerName("bundleURL"));
-        appDir = u.lastPathComponent;
+        // ② workspace 实例方法：不同版本命名不一样，逐个确认后再调（不再盲调）
+        Class WS = NSClassFromString(@"LSApplicationWorkspace");
+        if (WS) {
+            id ws = ((id (*)(id, SEL))objc_msgSend)((id)WS, sel_registerName("defaultWorkspace"));
+            if (ws) {
+                for (NSString *n in @[@"applicationProxyForIdentifier:",
+                                      @"applicationProxyForBundleIdentifier:",
+                                      @"applicationProxyForBundleID:"]) {
+                    SEL s = sel_registerName(n.UTF8String);
+                    if (![ws respondsToSelector:s]) continue;
+                    id r = ((id (*)(id, SEL, id))objc_msgSend)(ws, s, bid);
+                    if (r) return r;
+                }
+                // ③ 全量枚举兜底（慢一点但只在重建目标时跑一次）
+                SEL allSel = sel_registerName("allApplications");
+                if ([ws respondsToSelector:allSel]) {
+                    id list = ((id (*)(id, SEL))objc_msgSend)(ws, allSel);
+                    if ([list isKindOfClass:[NSArray class]]) {
+                        for (id pr in list) {
+                            id ident = nil;
+                            @try {
+                                ident = ((id (*)(id, SEL))objc_msgSend)(pr,
+                                        sel_registerName("applicationIdentifier"));
+                            } @catch (NSException *e) {}
+                            if ([ident isKindOfClass:[NSString class]] && [ident isEqualToString:bid])
+                                return pr;
+                        }
+                    }
+                }
+            }
+        }
     } @catch (NSException *e) {}
-    @try {
-        NSDictionary *d2 = ((id (*)(id, SEL))objc_msgSend)(proxy, sel_registerName("localizedInfoDictionary"));
-        name = d2[@"CFBundleDisplayName"] ?: d2[@"CFBundleName"];
-    } @catch (NSException *e) {}
-    if (!name) {
-        @try { name = ((id (*)(id, SEL))objc_msgSend)(proxy, sel_registerName("localizedName")); } @catch (NSException *e) {}
+    return nil;
+}
+
+// 取代理上的某个字符串属性（selector 名不同版本可能变，所以给候选列表）
+static NSString *WCVKProxyString(id proxy, NSArray<NSString *> *sels) {
+    for (NSString *n in sels) {
+        @try {
+            SEL s = sel_registerName(n.UTF8String);
+            if (![proxy respondsToSelector:s]) continue;
+            id v = ((id (*)(id, SEL))objc_msgSend)(proxy, s);
+            if ([v isKindOfClass:[NSString class]] && [v length]) return v;
+        } @catch (NSException *e) {}
     }
-    if (![exe isKindOfClass:[NSString class]] || ![appDir isKindOfClass:[NSString class]]) return nil;
+    return nil;
+}
+
+static NSDictionary *WCVKAppMeta(NSString *bid) {
+    id proxy = WCVKLSProxyForBID(bid);
+    if (!proxy) {
+        LOG(@"AppMeta(%@) 失败：LaunchServices 未返回代理", bid);
+        return nil;
+    }
+
+    NSString *exe = WCVKProxyString(proxy, @[@"bundleExecutable", @"executableName"]);
+    NSString *appDir = nil;
+    @try {
+        SEL s = sel_registerName("bundleURL");
+        if ([proxy respondsToSelector:s]) {
+            NSURL *u = ((id (*)(id, SEL))objc_msgSend)(proxy, s);
+            if ([u isKindOfClass:[NSURL class]]) appDir = u.lastPathComponent;
+        }
+    } @catch (NSException *e) {}
+
+    NSString *name = WCVKProxyString(proxy, @[@"localizedName", @"itemName"]);
+    if (!name) {
+        @try {
+            SEL s = sel_registerName("localizedInfoDictionary");
+            if ([proxy respondsToSelector:s]) {
+                NSDictionary *d2 = ((id (*)(id, SEL))objc_msgSend)(proxy, s);
+                if ([d2 isKindOfClass:[NSDictionary class]])
+                    name = d2[@"CFBundleDisplayName"] ?: d2[@"CFBundleName"];
+            }
+        } @catch (NSException *e) {}
+    }
+
+    if (![exe isKindOfClass:[NSString class]] || !exe.length ||
+        ![appDir isKindOfClass:[NSString class]] || !appDir.length) {
+        LOG(@"AppMeta(%@) 失败：exe=%@ appDir=%@", bid, exe, appDir);
+        return nil;
+    }
+    LOG(@"AppMeta(%@) = %@ / %@", bid, name ?: @"?", appDir);
     return @{ @"exeSuffix": [NSString stringWithFormat:@"/%@/%@", appDir, exe],
-              @"display": [name isKindOfClass:[NSString class]] ? name : bid };
+              @"display": [name isKindOfClass:[NSString class]] && name.length ? name : bid };
 }
 
 // ===== 无头拉起（完全后台，不切前台）=====
@@ -276,7 +364,8 @@ static int WCVKHeadlessLaunch(NSString *bid) {
 // ===== 目标（事件驱动看护）=====
 static const char *kKbdExtSuffix    = "/wxkb_plugin.appex/wxkb_plugin";
 static const int  kRelaunchDelaySec = 1;     // 事件 -> 拉起前等 1s（尊重系统回收动作）
-static const int  kFailCooldownSec  = 45;    // 拉起失败后冷却，避免死循环
+static const int  kFailCooldownSec  = 45;    // App 拉起失败后冷却，避免死循环
+static const int  kKbdDebounceSec   = 3;     // 键盘扩展只防抖 3s：拉起成功后必须能立刻再拉
 static const int  kArmRetrySecs[]   = {2, 5, 10, 20, 40};  // 拉起后找 pid 挂监视的重试点
 
 @interface WCVKTarget : NSObject
@@ -311,8 +400,13 @@ static int WCVKTargetPid(WCVKTarget *t) {
 
 static void WCVKDoRelaunch(WCVKTarget *t) {
     time_t now = time(NULL);
-    if (t.lastRelaunch && now - t.lastRelaunch < kFailCooldownSec) {
-        LOG(@"%@ 冷却中（%lds 前刚处理过），跳过", t.display, (long)(now - t.lastRelaunch));
+    // 键盘扩展：只做 3 秒防抖（同一次预热可能连着收到多个事件），**绝不能沿用 45s 失败冷却**
+    // —— 老板实测「注销后第一次杀掉能拉，紧接着再杀一次就不拉了」，根因就是 kbd 分支
+    // 只写 lastRelaunch 却永不清零：拉起是成功的，但冷却照样挡掉了第二、三次。
+    int cooldown = [t.kind isEqualToString:@"kbd"] ? kKbdDebounceSec : kFailCooldownSec;
+    if (t.lastRelaunch && now - t.lastRelaunch < cooldown) {
+        LOG(@"%@ 冷却中（%lds 前刚处理过，冷却 %ds），跳过", t.display,
+            (long)(now - t.lastRelaunch), cooldown);
         return;
     }
     t.lastRelaunch = now;
@@ -359,6 +453,8 @@ static void WCVKArmPid(WCVKTarget *t, int pid) {
     });
     t.src = src;
     dispatch_resume(src);
+    // 键盘扩展一旦重新挂上监视，说明上一次拉起已成功 -> 清防抖，下次退出立刻处理
+    if ([t.kind isEqualToString:@"kbd"]) t.lastRelaunch = 0;
     LOG(@"watch ARMED: %@ (pid=%d)", t.display, pid);
 }
 
@@ -489,10 +585,11 @@ static void WCVKPrintStatus(void) {
     for (NSString *bid in gAppBIDs) {
         NSDictionary *m = WCVKAppMeta(bid);
         int pid = m ? WCVKPidForPathSuffix(m[@"exeSuffix"], nil) : 0;
-        printf("  [app] %-34s %-14s pid=%d\n", bid.UTF8String,
-               [(m[@"display"] ?: @"?") UTF8String], pid);
+        printf("  [app] %-34s %-14s pid=%-6d exe=%s\n", bid.UTF8String,
+               [(m[@"display"] ?: @"?") UTF8String], pid,
+               [(m[@"exeSuffix"] ?: @"(解析失败)") UTF8String]);
     }
-    NSArray *recs = [NSArray arrayWithContentsOfFile:WCVKRecordsPath()];
+    NSArray *recs = WCVKLoadRecords(WCVKRecordsPath());
     printf("records count=%lu\n", (unsigned long)recs.count);
     for (NSUInteger i = 0; i < recs.count && i < 10; i++) {
         NSDictionary *r = recs[i];
@@ -518,6 +615,34 @@ int main(int argc, char *argv[]) {
                 int r = WCVKHeadlessLaunch(bid);
                 WCVKRecord(bid, bid, @"app", r == 0, @"手动测试后台拉起");
                 printf("headless launch %s -> %d (0=ok)\n", argv[i + 1], r);
+                return 0;
+            }
+            if (strcmp(argv[i], "--ls-probe") == 0) {
+                // 诊断用：打印 LaunchServices 各入口是否真实存在（v2.0.0 就是盲调了不存在的
+                // 实例方法，导致勾选的 App 全被 skip）
+                WCVKEnsureLSLoaded();
+                Class P = NSClassFromString(@"LSApplicationProxy");
+                Class WS = NSClassFromString(@"LSApplicationWorkspace");
+                printf("LSApplicationProxy=%s LSApplicationWorkspace=%s\n",
+                       P ? "yes" : "no", WS ? "yes" : "no");
+                const char *sels[] = {"applicationProxyForIdentifier:",
+                                      "applicationProxyForBundleIdentifier:",
+                                      "applicationProxyForBundleID:",
+                                      "allApplications", "defaultWorkspace"};
+                for (unsigned k = 0; k < sizeof(sels) / sizeof(sels[0]); k++) {
+                    SEL s2 = sel_registerName(sels[k]);
+                    printf("  +[LSApplicationProxy      %-38s] %d\n", sels[k],
+                           (P && [(id)P respondsToSelector:s2]) ? 1 : 0);
+                    printf("  -[LSApplicationWorkspace  %-38s] %d\n", sels[k],
+                           (WS && [(id)WS instancesRespondToSelector:s2]) ? 1 : 0);
+                }
+                NSArray *probe = gAppBIDs.count ? gAppBIDs : @[@"com.tencent.xin"];
+                for (NSString *bid in probe) {
+                    NSDictionary *m = WCVKAppMeta(bid);
+                    printf("  meta %s -> exe=%s display=%s\n", bid.UTF8String,
+                           [(m[@"exeSuffix"] ?: @"nil") UTF8String],
+                           [(m[@"display"] ?: @"nil") UTF8String]);
+                }
                 return 0;
             }
             if (strcmp(argv[i], "--clear-records") == 0) {
