@@ -604,6 +604,24 @@ static int kbdWarmTrigger(void) {
     return st == 0 ? 0 : 1;
 }
 
+// v1.9.34：--dlopen-test <dylib 路径>
+// 判定 tweak dylib 本身能否被 dlopen（依赖是否齐全、签名是否可用）。
+// 用途：SB 侧 tweak 无日志时，区分「dylib 有毛病」还是「注入链路没触及 SpringBoard」。
+static int dlopenTest(const char *path) {
+    fprintf(stderr, "[WCVK-DLOPEN] trying %s\n", path);
+    fflush(stderr);
+    void *h = dlopen(path, RTLD_NOW);
+    if (h) {
+        fprintf(stderr, "[WCVK-DLOPEN] OK handle=%p\n", h);
+        fflush(stderr);
+        return 0;
+    }
+    const char *err = dlerror();
+    fprintf(stderr, "[WCVK-DLOPEN] FAILED: %s\n", err ? err : "(null)");
+    fflush(stderr);
+    return 1;
+}
+
 int main(int argc, char *argv[]) {
     // 早期 stderr（不依赖 Foundation/ObjC runtime）——
     // launchd 任何阶段拒收(进程类型/entitlement/签名/sandbox)都能立刻看到，
@@ -620,6 +638,10 @@ int main(int argc, char *argv[]) {
         // v1.9.33：--kbd-warm 手动触发键盘扩展预热实验
         if (strcmp(argv[i], "--kbd-warm") == 0) {
             return kbdWarmTrigger();
+        }
+        // v1.9.34：--dlopen-test <path> 验证 tweak dylib 能否被加载
+        if (strcmp(argv[i], "--dlopen-test") == 0 && i + 1 < argc) {
+            return dlopenTest(argv[i + 1]);
         }
     }
 

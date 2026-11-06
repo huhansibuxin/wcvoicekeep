@@ -23,6 +23,10 @@
 #import <UIKit/UIKit.h>
 #import <sys/sysctl.h>
 #import <string.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <time.h>
+#import <stdio.h>
 
 // theos SDK 无 SpringBoard 私有头，声明存根类即可（运行时真实类名匹配）
 @interface FBScene : NSObject
@@ -54,6 +58,33 @@ static void SBLog(NSString *fmt, ...) {
         [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
         [fh closeFile];
     } @catch (NSException *e) {}
+}
+
+// ===== 加载自证 marker（v1.9.34）=====
+// 目的：区分「dylib 根本没被注入」和「注入了但 SBLog 写文件失败」。
+// 用最原始的 open/write，不依赖 Foundation / NSBundle / NSString，
+// 保证在 constructor 的第一条指令就能留下痕迹。
+// 多路径尝试：任一可写即成功。
+#define WCVK_BUILD_TAG "v1.9.34-roothide"
+static void WCVKMarkerRaw(const char *tag) {
+    static const char *paths[] = {
+        "/var/mobile/wcvk_sb_marker.txt",              // 主位置（历史 SBLog 一直可写这里）
+        "/var/mobile/Documents/wcvk_sb_marker.txt",    // 备用：Filza/SSH 都好找
+        "/var/mobile/Library/Logs/wcvk_sb_marker.txt", // 备用：沙盒内 Logs
+        NULL
+    };
+    char buf[320];
+    int n = snprintf(buf, sizeof(buf), "t=%ld pid=%d build=%s tag=%s\n",
+                     (long)time(NULL), getpid(), WCVK_BUILD_TAG, tag);
+    if (n <= 0) return;
+    for (int i = 0; paths[i]; i++) {
+        int fd = open(paths[i], O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            ssize_t wr = write(fd, buf, (size_t)n);
+            (void)wr;
+            close(fd);
+        }
+    }
 }
 
 // wetype 的 settings 标记（FBScene 拦截时打上，setDeactivationReasons 据此只拦 wetype）
@@ -241,8 +272,11 @@ static void KbdWarmNotifyCallback(CFNotificationCenterRef center, void *observer
 }
 
 __attribute__((constructor)) static void SBKeepAliveInit(void) {
+    // 第一件事：留最原始的加载痕迹（不依赖任何 Foundation 设施）
+    WCVKMarkerRaw("ctor-enter");
     @autoreleasepool {
         NSString *proc = [[NSBundle mainBundle] bundleIdentifier] ?: @"?";
+        WCVKMarkerRaw("ctor-bundleid-ok");
         SBLog(@"[wetypekeepalive] CTOR loaded into %@", proc);
 
         // 仅 SpringBoard 内注册键盘预热（其他进程无前台 scene，做了也没用）

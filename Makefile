@@ -6,7 +6,11 @@
 
 export TARGET = iphone:clang:latest:16.0
 export ARCHS = arm64 arm64e
-export THEOS_PACKAGE_SCHEME = rootless
+# v1.9.34：切 roothide scheme（老板设备 = Relaxin 隐根）。
+# 参考 watch-both-notify 的验证做法：必须配合 roothide 官方 fork 的 theos，
+# 普通 theos 不认 roothide scheme。CI 侧已改为 clone github.com/roothide/theos。
+export THEOS_PACKAGE_SCHEME = roothide
+export _THEOS_PLATFORM_DPKG_DEB_COMPRESSION = gzip
 export ERROR_ON_WARNINGS = 0
 export LOGOS_DEFAULT_GENERATOR = internal
 

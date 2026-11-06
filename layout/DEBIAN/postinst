@@ -23,7 +23,10 @@ rm -f /var/mobile/wcvoicekeep.log \
       /var/mobile/wcvoicekeep.daemon.log \
       /var/mobile/wcvoicekeep.daemon.out \
       /var/mobile/wcvoicekeep.daemon.err \
-      /var/mobile/wetypekeepalive.log 2>/dev/null || true
+      /var/mobile/wetypekeepalive.log \
+      /var/mobile/wcvk_sb_marker.txt \
+      /var/mobile/Documents/wcvk_sb_marker.txt \
+      /var/mobile/Library/Logs/wcvk_sb_marker.txt 2>/dev/null || true
 
 # 3) 先卸后载，避免 "already loaded" 报错
 launchctl unload "$PLIST" >/dev/null 2>&1 || true

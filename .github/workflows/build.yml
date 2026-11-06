@@ -13,12 +13,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Theos
+      # roothide 必须用 roothide 官方 fork 的 theos（github.com/roothide/theos），
+      # 普通 theos 不认 roothide scheme（watch-both-notify 实测结论）。
+      - name: Setup Theos (roothide)
         run: |
-          git clone --recurse-submodules https://github.com/theos/theos.git ${{ runner.temp }}/theos
+          git clone --recurse-submodules https://github.com/roothide/theos.git ${{ runner.temp }}/theos
           find ${{ runner.temp }}/theos/bin -name "*.pl" -exec sed -i '' '1s|#!/usr/bin/perl|#!/usr/bin/env perl|' {} \;
           echo "THEOS=${{ runner.temp }}/theos" >> $GITHUB_ENV
-          echo "THEOS_PACKAGE_SCHEME=rootless" >> $GITHUB_ENV
+          echo "THEOS_PACKAGE_SCHEME=roothide" >> $GITHUB_ENV
 
       - name: Install dependencies
         run: brew install dpkg ldid
@@ -39,7 +41,7 @@ jobs:
       - name: Upload deb
         uses: actions/upload-artifact@v4
         with:
-          name: wcvoicekeep-rootless
+          name: wcvoicekeep-roothide
           path: packages/*.deb
 
       - name: Collect dylib for TrollFools
