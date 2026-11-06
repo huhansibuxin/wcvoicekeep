@@ -38,6 +38,7 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #include <dispatch/dispatch.h>
 #include <notify.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <string.h>
 #include <time.h>
 #include <stdlib.h>
@@ -105,9 +106,10 @@ static NSArray<NSString *> *WCVKPrefsDirCandidates(void) {
     return a;
 }
 
+static NSString *gPrefsDirCached = nil;
+
 static NSString *WCVKExistingPrefsDir(void) {
-    static NSString *cached = nil;
-    if (cached) return cached;
+    if (gPrefsDirCached) return gPrefsDirCached;
     NSString *best = nil;
     double bestM = -1;
     for (NSString *dir in WCVKPrefsDirCandidates()) {
@@ -118,8 +120,8 @@ static NSString *WCVKExistingPrefsDir(void) {
         if (m > bestM) { bestM = m; best = dir; }
     }
     if (!best) best = WCVKPrefsDirCandidates().firstObject;
-    cached = best;
-    return cached;
+    gPrefsDirCached = best;
+    return gPrefsDirCached;
 }
 
 static NSString *WCVKPrefsPath(void) {
@@ -137,29 +139,48 @@ static NSArray *gAppBIDs = nil;   // 用户勾选的 App bundle id 数组
 
 static void WCVKReadPrefs(void) {
     NSString *p = WCVKPrefsPath();
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
-    if (!d) {
-        for (NSString *dir in WCVKPrefsDirCandidates()) {
-            NSDictionary *t = [NSDictionary dictionaryWithContentsOfFile:
-                               [dir stringByAppendingFormat:@"/%@.plist", kPrefsDomain]];
-            if (t) { d = t; break; }
+
+    // v2.0.2：**优先走 CFPreferences（cfprefsd）读，而不是直读文件**。
+    // 原因：设置 App 的开关是写到 cfprefsd 的，cfprefsd 有延迟 flush，磁盘上的 plist
+    // 可能还是旧的 —— 这就是老板实测「勾了要注销一次才生效」。CFPreferences 读的是
+    // cfprefsd 里的最新内存值，改完立刻可见。
+    id en = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("enabled"),
+              (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    id lg = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("logging"),
+              (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    id rec = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("record"),
+              (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    id apps = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("enabledApps"),
+              (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+
+    BOOL viaCF = (en || rec || apps);
+    if (!viaCF) {
+        // 兜底：cfprefsd 拿不到（域完全没建）时读文件
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+        if (!d) {
+            for (NSString *dir in WCVKPrefsDirCandidates()) {
+                NSDictionary *t = [NSDictionary dictionaryWithContentsOfFile:
+                                   [dir stringByAppendingFormat:@"/%@.plist", kPrefsDomain]];
+                if (t) { d = t; break; }
+            }
         }
+        en = d[@"enabled"]; lg = d[@"logging"]; rec = d[@"record"]; apps = d[@"enabledApps"];
     }
-    id en = d[@"enabled"];
+
     gEnabled = en ? [en boolValue] : YES;
-    id lg = d[@"logging"];
     gLogging = lg ? [lg boolValue] : NO;
-    id rec = d[@"record"];
     gRecord = rec ? [rec boolValue] : YES;
-    id apps = d[@"enabledApps"];
+
     NSMutableArray *bids = [NSMutableArray array];
     if ([apps isKindOfClass:[NSArray class]]) {
         for (id b in apps) {
-            if ([b isKindOfClass:[NSString class]] && [b length]) [bids addObject:b];
+            if ([b isKindOfClass:[NSString class]] && [b length] && ![bids containsObject:b])
+                [bids addObject:b];
         }
     }
     gAppBIDs = bids;
-    LOG(@"prefs loaded (%@): enabled=%d logging=%d apps=%@", p, gEnabled, gLogging, gAppBIDs);
+    LOG(@"prefs loaded (%s): enabled=%d logging=%d apps=%@",
+        viaCF ? "cfprefs" : "file", gEnabled, gLogging, gAppBIDs);
 }
 
 // ===== 拉起记录（纯净版也写；设置页「拉起记录」读它）=====
@@ -190,10 +211,18 @@ static void WCVKRecord(NSString *display, NSString *ident, NSString *kind, BOOL 
     // v2.0.1：改成 dict{rows:[...]} —— 顶层是 dict，cfprefsd 才能当域读；
     // 设置页因此可以走 CFPreferences 兜底（沙箱下直读文件可能被拦）
     NSDictionary *out = @{ @"rows": arr };
-    if (![out writeToFile:path atomically:YES]) {
+    BOOL wrote = [out writeToFile:path atomically:YES];
+    if (!wrote) {
         NSString *alt = @"/var/mobile/wcvoicekeep.records.plist";
-        [out writeToFile:alt atomically:YES];
-        LOG(@"record write fallback -> %@", alt);
+        wrote = [out writeToFile:alt atomically:YES];
+        LOG(@"record write fallback -> %@ (%d)", alt, wrote);
+    }
+    // v2.0.2：属主改成 mobile —— daemon 是 root，写出来是 root:mobile，
+    // 设置页（mobile 身份）虽然能读，但「清空记录」按钮删不动 root 的文件，
+    // cfprefsd 以 mobile 身份也无法把这份文件当成自己的域。统一交给 mobile。
+    if (wrote) {
+        chown(path.fileSystemRepresentation, 501, 501);
+        chmod(path.fileSystemRepresentation, 0644);
     }
 }
 
@@ -219,6 +248,65 @@ static int WCVKPidForPathSuffix(NSString *suffix, NSString *exactPath) {
     return found;
 }
 
+// v2.0.2：**按 bundle id 精确锁进程**。
+//
+// 为什么不再靠可执行文件路径：设备实测 com.tencent.xin 与 com.tencent.qy.xin（微信 + 企业微信）
+// 解析出来的可执行路径**完全相同**（都是 /WeChat.app/WeChat），`--status` 里两个 target 显示同一
+// 个 pid。路径匹配无法区分这两个 App ⇒ 企业微信的监视会挂在微信进程上（勾了等于没勾，
+// 而微信被杀时会被两个 target 各拉一次）。
+//
+// 可靠做法：每个 App 进程的 launchd 环境变量里都有
+//   XPC_SERVICE_NAME = UIKitApplication:<bundle-id>[xxxx][rb-legacy]
+// 直接从进程的 argv/env 区（KERN_PROCARGS2）里精确匹配 "UIKitApplication:<bid>[" 即可，
+// 与容器 UUID、可执行名、App 目录名全都无关。
+#ifndef KERN_PROCARGS2
+#define KERN_PROCARGS2 49
+#endif
+
+static BOOL WCVKProcHasEnv(pid_t pid, const char *needle, size_t nlen) {
+    int mib[3] = { CTL_KERN, KERN_PROCARGS2, (int)pid };
+    size_t size = 0;
+    if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || size == 0) return NO;
+    if (size > (4u << 20)) return NO;                 // 防异常大块
+    char *buf = (char *)malloc(size);
+    if (!buf) return NO;
+    BOOL found = NO;
+    if (sysctl(mib, 3, buf, &size, NULL, 0) == 0) {
+        if (size > nlen) {
+            for (size_t i = 0; i + nlen <= size; i++) {
+                if (buf[i] != needle[0]) continue;
+                if (memcmp(buf + i, needle, nlen) == 0) { found = YES; break; }
+            }
+        }
+    }
+    free(buf);
+    return found;
+}
+
+// 返回该 bundle id 对应 App 的 pid；不在运行返回 0
+static int WCVKPidForBID(NSString *bid) {
+    if (!bid.length) return 0;
+    char needle[512];
+    int n = snprintf(needle, sizeof(needle), "XPC_SERVICE_NAME=UIKitApplication:%s[",
+                     bid.UTF8String);
+    if (n <= 0 || (size_t)n >= sizeof(needle)) return 0;
+    size_t nlen = (size_t)n;
+
+    int total = proc_listallpids(NULL, 0);
+    if (total <= 0) return 0;
+    pid_t *pids = (pid_t *)calloc((size_t)total + 64, sizeof(pid_t));
+    if (!pids) return 0;
+    int cnt = proc_listallpids(pids, (int)((size_t)(total + 64) * sizeof(pid_t)));
+    int found = 0;
+    for (int i = 0; i < cnt; i++) {
+        pid_t p = pids[i];
+        if (p <= 1) continue;
+        if (WCVKProcHasEnv(p, needle, nlen)) { found = p; break; }
+    }
+    free(pids);
+    return found;
+}
+
 // ===== App 可执行文件 / 显示名解析（LaunchServices）=====
 static void WCVKEnsureLSLoaded(void) {
     static dispatch_once_t once;
@@ -232,16 +320,24 @@ static void WCVKEnsureLSLoaded(void) {
 // **不存在**（日志实证：unrecognized selector sent to instance => v2.0.0 里微信被 skip，
 // 用户勾了也永远不挂监视）。真正可用的是类方法 +[LSApplicationProxy applicationProxyForIdentifier:]。
 // 这里按可用性逐个试，最后用 allApplications 全量枚举兜底，任何一个能返回就够。
+// 取代理上的某个字符串属性（定义在下面，WCVKLSProxyForBID 要用，先声明）
+static NSString *WCVKProxyString(id proxy, NSArray<NSString *> *sels);
+
 static id WCVKLSProxyForBID(NSString *bid) {
     WCVKEnsureLSLoaded();
+    // v2.0.2：类方法可能返回**不属于该 bid** 的代理（企业微信就是这种情况），
+    // 所以拿到之后必须回读它自己的 bundle id 校验，不一致就继续往下找。
     @try {
-        // ① 类方法（iOS 上的正确入口）
         Class P = NSClassFromString(@"LSApplicationProxy");
         if (P) {
             SEL s = sel_registerName("applicationProxyForIdentifier:");
             if ([(id)P respondsToSelector:s]) {
                 id r = ((id (*)(id, SEL, id))objc_msgSend)((id)P, s, bid);
-                if (r) return r;
+                if (r) {
+                    NSString *own = WCVKProxyString(r, @[@"bundleIdentifier", @"applicationIdentifier"]);
+                    if (!own.length || [own isEqualToString:bid]) return r;
+                    LOG(@"LS 类方法返回的代理属于 %@，不是 %@ -> 继续找", own, bid);
+                }
             }
         }
     } @catch (NSException *e) {}
@@ -395,7 +491,46 @@ static void WCVKArmTarget(WCVKTarget *t, int attempt);
 static int WCVKTargetPid(WCVKTarget *t) {
     if ([t.kind isEqualToString:@"kbd"])
         return WCVKPidForPathSuffix([NSString stringWithUTF8String:kKbdExtSuffix], nil);
-    return WCVKPidForPathSuffix(t.exeSuffix, nil);
+    // v2.0.2：App 一律按 bundle id 精确锁（路径匹配会把微信和企业微信认成同一个）
+    return WCVKPidForBID(t.ident);
+}
+
+// v2.0.2：拉起结果一律**以进程真实存在为准**，不再信 API 返回值。
+// SBSLaunchApplicationWithIdentifier 返回 0 只代表"请求已受理"，进程可能几百毫秒后才出现；
+// 反过来偶尔返回非 0 但进程其实起来了。所以统一延后校验 pid，失败再按 5s/15s 重试两次。
+static const int kVerifyDelayMs   = 1500;
+static const int kAppRetryDelay[] = { 5, 15 };
+
+static void WCVKRelaunchAttempt(WCVKTarget *t, int attempt) {
+    NSString *disp = t.display ?: t.ident;
+    NSString *ident = t.ident;
+    NSString *kind = t.kind;
+    int r = WCVKHeadlessLaunch(ident);
+    LOG(@"headless launch %@ rc=%d (attempt %d)", ident, r, attempt);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kVerifyDelayMs * NSEC_PER_MSEC)),
+                   WCVKQueue(), ^{
+        int pid = WCVKPidForBID(ident);
+        if (pid > 0) {
+            t.fails = 0;
+            t.lastRelaunch = 0;                    // 成功立刻清冷却
+            WCVKRecord(disp, ident, kind, YES,
+                       [NSString stringWithFormat:@"后台拉起成功 (pid=%d)", pid]);
+            WCVKArmTarget(t, 0);                   // 立刻在新 pid 上重挂监视
+            return;
+        }
+        int retries = (int)(sizeof(kAppRetryDelay) / sizeof(kAppRetryDelay[0]));
+        if (attempt < retries) {
+            int d = kAppRetryDelay[attempt];
+            LOG(@"%@ 未起来（rc=%d）-> %ds 后重试", disp, r, d);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
+                           WCVKQueue(), ^{ WCVKRelaunchAttempt(t, attempt + 1); });
+            return;
+        }
+        t.fails++;
+        WCVKRecord(disp, ident, kind, NO,
+                   [NSString stringWithFormat:@"后台拉起失败 rc=%d（已重试 %d 次）", r, retries]);
+    });
 }
 
 static void WCVKDoRelaunch(WCVKTarget *t) {
@@ -415,19 +550,21 @@ static void WCVKDoRelaunch(WCVKTarget *t) {
         // 键盘扩展没有别的门路：只能让 SpringBoard 弹一次键盘，系统才会 spawn 它
         uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup");
         LOG(@"kbd warmup notify posted -> %u", st);
-        WCVKRecord(t.display, t.ident, t.kind, st == 0, @"键盘预热请求已发出");
+        // v2.0.2：记录改成"预热发出 -> 1.5s 后按进程是否真的在跑写结果"，
+        // 以前直接写"请求已发出"，看起来像成功，实际可能没起来。
+        NSString *disp = t.display ?: @"键盘";
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kVerifyDelayMs * NSEC_PER_MSEC)),
+                       WCVKQueue(), ^{
+            int pid = WCVKPidForPathSuffix([NSString stringWithUTF8String:kKbdExtSuffix], nil);
+            if (pid > 0)
+                WCVKRecord(disp, @"wxkb_plugin", @"kbd", YES,
+                           [NSString stringWithFormat:@"键盘扩展已拉起 (pid=%d)", pid]);
+            else
+                WCVKRecord(disp, @"wxkb_plugin", @"kbd", NO, @"键盘预热已发出但扩展未起来");
+        });
         return;
     }
-    int r = WCVKHeadlessLaunch(t.ident);
-    BOOL ok = (r == 0);
-    if (ok) {
-        t.fails = 0;
-        t.lastRelaunch = 0;              // 成功立刻清冷却
-    } else {
-        t.fails++;
-    }
-    WCVKRecord(t.display, t.ident, t.kind, ok,
-               ok ? @"后台拉起成功" : [NSString stringWithFormat:@"后台拉起失败 rc=%d", r]);
+    WCVKRelaunchAttempt(t, 0);
 }
 
 // 在 pid 上挂退出事件；进程一死内核回调（零轮询）
@@ -479,6 +616,16 @@ static void WCVKStopTarget(WCVKTarget *t) {
 static void WCVKRebuildTargets(void) {
     if (!gTargets) gTargets = [NSMutableArray array];
 
+    // v2.0.2：总开关关闭时必须真的停手。以前这里没检查 gEnabled，
+    // 用户关掉「后台保活」后其实还在看护 —— 开关等于摆设。
+    if (!gEnabled) {
+        for (WCVKTarget *old in gTargets) WCVKStopTarget(old);
+        if (gTargets.count) LOG(@"总开关已关闭 -> 停止全部看护（%lu 个目标）",
+                                (unsigned long)gTargets.count);
+        [gTargets removeAllObjects];
+        return;
+    }
+
     NSMutableArray *want = [NSMutableArray array];
     WCVKTarget *kbd = [WCVKTarget new];
     kbd.ident = @"wxkb_plugin";
@@ -490,10 +637,12 @@ static void WCVKRebuildTargets(void) {
         NSDictionary *meta = WCVKAppMeta(bid);
         WCVKTarget *t = [WCVKTarget new];
         t.ident = bid;
+        // v2.0.2：解析不到显示名也**不再 skip**。保活完全依赖 bundle id（见 WCVKPidForBID），
+        // 跟可执行路径无关 —— 以前 skip 掉就等于"用户勾了但永远不保活"，太脆弱。
         t.display = meta[@"display"] ?: bid;
         t.kind = @"app";
-        t.exeSuffix = meta[@"exeSuffix"];
-        if (!t.exeSuffix) { LOG(@"skip %@：解析不到可执行路径", bid); continue; }
+        t.exeSuffix = meta[@"exeSuffix"];      // 仅用于 --status 显示，不再参与匹配
+        if (!meta) LOG(@"%@：LaunchServices 解析失败，仍按 bundle id 保活", bid);
         [want addObject:t];
     }
 
@@ -563,6 +712,39 @@ static void WCVKArmPrefsWatch(void) {
     LOG(@"prefs watch armed on %d 个目录", armed);
 }
 
+// v2.0.2：设置"实时生效"通道。
+//
+// 只靠 VNODE 监听 Preferences 目录不可靠：设置 App 的开关是经 cfprefsd 写的，cfprefsd 有
+// 延迟 flush（几秒到十几秒，甚至等设置进程离开才落盘），所以老板实测"勾了要注销一次才生效"。
+// 这里加两路更及时的通知：
+//   ① 我们自己的设置页在保存时 notify_post("com.wcvoicekeep.prefs.changed") —— 立刻；
+//   ② 系统 cfprefsd 的 com.apple.preferences-changed —— 兜底（其它入口改了设置也能收到）。
+// 收到后 0.6s 去抖再重读，避免连续开关触发多次重建。
+static int  gPrefsNotifySelf = 0;
+static int  gPrefsNotifySys  = 0;
+static BOOL gPrefsReloadPending = NO;
+
+static void WCVKSchedulePrefsReload(const char *why) {
+    if (gPrefsReloadPending) return;
+    gPrefsReloadPending = YES;
+    LOG(@"prefs 通知(%s) -> 0.6s 后重读", why);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   WCVKQueue(), ^{
+        gPrefsReloadPending = NO;
+        gPrefsDirCached = nil;      // 让 WCVKExistingPrefsDir 重新挑最新那份
+        WCVKHandlePrefsChanged();
+    });
+}
+
+static void WCVKRegisterPrefsNotify(void) {
+    notify_register_dispatch("com.wcvoicekeep.prefs.changed", &gPrefsNotifySelf,
+                             WCVKQueue(), ^(int t) { WCVKSchedulePrefsReload("self"); });
+    // 系统偏好变更（cfprefsd 广播），任何写入方式都会走这里
+    notify_register_dispatch("com.apple.preferences-changed", &gPrefsNotifySys,
+                             WCVKQueue(), ^(int t) { WCVKSchedulePrefsReload("system"); });
+    LOG(@"prefs notify registered (self + system)");
+}
+
 // ===== 键盘扩展拉起成功后，SpringBoard 会发 kbd.up -> 在新 pid 上重挂 =====
 static int gKbdUpToken = 0;
 static void WCVKRegisterKbdUp(void) {
@@ -584,20 +766,24 @@ static void WCVKPrintStatus(void) {
     printf("  [kbd] wxkb_plugin pid=%d\n", kpid);
     for (NSString *bid in gAppBIDs) {
         NSDictionary *m = WCVKAppMeta(bid);
-        int pid = m ? WCVKPidForPathSuffix(m[@"exeSuffix"], nil) : 0;
+        // v2.0.2：按 bundle id 查 pid（以前用 exe 路径，微信和企业微信会显示同一个 pid）
+        int pid = WCVKPidForBID(bid);
         printf("  [app] %-34s %-14s pid=%-6d exe=%s\n", bid.UTF8String,
-               [(m[@"display"] ?: @"?") UTF8String], pid,
-               [(m[@"exeSuffix"] ?: @"(解析失败)") UTF8String]);
+               [(m[@"display"] ?: bid) UTF8String], pid,
+               [(m[@"exeSuffix"] ?: @"(解析失败, 仍按 bid 保活)") UTF8String]);
     }
     NSArray *recs = WCVKLoadRecords(WCVKRecordsPath());
     printf("records count=%lu\n", (unsigned long)recs.count);
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"yyyy-MM-dd HH:mm:ss";
     for (NSUInteger i = 0; i < recs.count && i < 10; i++) {
         NSDictionary *r = recs[i];
-        printf("  %s  %s  %s  %s\n",
-               [[r[@"t"] description] UTF8String] ?: "-",
-               [r[@"name"] UTF8String] ?: "-",
+        NSDate *t = [r[@"t"] isKindOfClass:[NSDate class]] ? r[@"t"] : nil;
+        printf("  %s  %-18s %-4s %s\n",
+               (t ? [df stringFromDate:t] : @"--").UTF8String,
+               [(r[@"name"] ?: @"?") UTF8String],
                [r[@"ok"] boolValue] ? "OK" : "FAIL",
-               [r[@"detail"] UTF8String] ?: "");
+               [(r[@"detail"] ?: @"") UTF8String]);
     }
 }
 
@@ -658,6 +844,7 @@ int main(int argc, char *argv[]) {
         WCVKReadPrefs();
         WCVKRebuildTargets();
         WCVKRegisterKbdUp();
+        WCVKRegisterPrefsNotify();   // v2.0.2：设置实时生效（自通知 + 系统偏好通知）
         WCVKArmPrefsWatch();
         LOG(@"daemon ready: 事件驱动看护中（零轮询）");
 

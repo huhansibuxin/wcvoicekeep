@@ -1,5 +1,15 @@
 #import "BKRootListController.h"
+#import <Preferences/PSSpecifier.h>
 #import <dlfcn.h>
+
+// v2.0.2：设置「实时生效」。
+// 设置 App 的开关是经 cfprefsd 写的，落盘有延迟（老板实测「勾了要注销一次才生效」）。
+// 所以每次改动都直接给 daemon 发一个 Darwin 通知，daemon 收到 0.6s 后重读并重建目标，
+// 不用等磁盘、也不用注销。
+extern uint32_t notify_post(const char *name);
+static void BKPostPrefsChanged(void) {
+    notify_post("com.wcvoicekeep.prefs.changed");
+}
 
 // 主列表控制器：页面 specifier 全部由 Resources/Root.plist 静态声明
 // （开关走 defaults 域 + 官方机制；App 多选子页由 ATLApplicationListMultiSelectionController 提供；
@@ -46,6 +56,19 @@ static void BKEnsureAltListLoaded(void) {
         if (s.count) [self setValue:s forKey:@"specifiers"];
     }
     return s;
+}
+
+// 任何开关改动立刻通知 daemon（不用注销）
+- (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
+    [super setPreferenceValue:value specifier:specifier];
+    BKPostPrefsChanged();
+}
+
+// App 多选子页（AltList 的 ATLApplicationListMultiSelectionController）保存时不走上面的
+// setPreferenceValue，所以离开本页时再补发一次，保证勾选立刻生效。
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    BKPostPrefsChanged();
 }
 
 @end
