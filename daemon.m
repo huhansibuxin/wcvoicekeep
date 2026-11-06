@@ -594,6 +594,16 @@ static void handlePiPLost(int sc) {
     if (gPipUp) maybeWarmWechat();
 }
 
+// v1.9.33：--kbd-warm 手动触发 SpringBoard 侧键盘扩展预热。
+// 设备上没有 notifyutil，用它从 SSH 反复触发实验（等价 notifyutil -p）。
+// 预热逻辑在 wetypekeepalive（注入 com.apple.springboard）里，本函数只发 Darwin 通知。
+static int kbdWarmTrigger(void) {
+    uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup");
+    fprintf(stderr, "[WCVK-KBDWARM] notify_post(com.wcvoicekeep.kbd.warmup) -> %u (0=ok)\n", st);
+    fflush(stderr);
+    return st == 0 ? 0 : 1;
+}
+
 int main(int argc, char *argv[]) {
     // 早期 stderr（不依赖 Foundation/ObjC runtime）——
     // launchd 任何阶段拒收(进程类型/entitlement/签名/sandbox)都能立刻看到，
@@ -606,6 +616,10 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--tfp-check") == 0 && i + 1 < argc) {
             return tfpCheck(atoi(argv[i + 1]));
+        }
+        // v1.9.33：--kbd-warm 手动触发键盘扩展预热实验
+        if (strcmp(argv[i], "--kbd-warm") == 0) {
+            return kbdWarmTrigger();
         }
     }
 

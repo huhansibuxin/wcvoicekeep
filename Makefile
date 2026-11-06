@@ -26,6 +26,8 @@ WCVoiceKeep_CFLAGS = -fobjc-arc -fno-modules -w
 # （scene 保持 active）-> 微信视频 PiP 顶掉后 PiP 可自动恢复/后台重建。
 # v1.9.18 融合进本 deb（老板要求：不要单独插件避免冲突）。
 wetypekeepalive_FILES = SBKeepAlive.xm
+# UIKit：v1.9.33 键盘扩展预热实验需要 UIWindow/UITextField/UIWindowLevelNormal
+wetypekeepalive_FRAMEWORKS = UIKit Foundation
 wetypekeepalive_LDFLAGS = -Wl,-no_warn_inits -F$(THEOS_PROJECT_DIR)/Frameworks -framework CydiaSubstrate
 wetypekeepalive_CFLAGS = -fobjc-arc -fno-modules -w
 
