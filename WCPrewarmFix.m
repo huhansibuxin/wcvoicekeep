@@ -38,7 +38,7 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.26-roothide"
+#define WCVK_BUILD_TAG "v2.0.27-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC_EXIT 里 kRelaunchDelaySec
                                              // 秒后就会主动再拉，形成「杀-拉-黑」死循环。
@@ -665,22 +665,21 @@ static void WPFRaiseMainWindow(UIWindow *main) {
     } @catch (NSException *e) { WPFLog(@"L2b 异常: %@", e.reason); }
 }
 
-// L2-c：把主窗口搬到前台 scene（窗口层唯一能让它重新被渲染的办法）
-static BOOL WPFMoveMainWindowToFrontScene(UIWindow *main) {
-    if (!main) return NO;
-    UIWindowScene *front = WPFActiveScene();
-    UIWindowScene *owned = main.windowScene;
-    if (!front) { WPFLog(@"L2c: 跳过（没有前台 scene）"); return NO; }
-    if (front == owned) { WPFLog(@"L2c: 跳过（主窗口已经在前台 scene 上）"); return NO; }
-    WPFLog(@"L2c: 搬家 —— 主窗口 %p 从 scene %p(state=%ld) 搬到前台 scene %p(state=%ld)",
+// ===== v2.0.27 通用搬家：把主窗口搬到指定 scene（不做任何 scene 状态判断，由调用方决定）=====
+// 抽出来是为了让「scene:willConnectToSession:」提前搬家复用同一套布局补偿，
+// 避免两条路径行为不一致。
+static BOOL WPFMoveMainWindowToScene(UIWindow *main, UIWindowScene *target) {
+    if (!main || !target) return NO;
+    WPFLog(@"搬家: 主窗口 %p 从 scene %p(state=%ld) 搬到目标 scene %p(state=%ld)",
            (__bridge void *)main,
-           (__bridge void *)owned, owned ? (long)owned.activationState : (long)-1,
-           (__bridge void *)front, (long)front.activationState);
-    gWPFSavedMainScene = owned;
+           (__bridge void *)main.windowScene,
+           main.windowScene ? (long)main.windowScene.activationState : (long)-1,
+           (__bridge void *)target, (long)target.activationState);
+    gWPFSavedMainScene = main.windowScene;
     @try {
-        main.windowScene = front;
+        main.windowScene = target;
     } @catch (NSException *e) {
-        WPFLog(@"L2c 搬家异常: %@", e.reason);
+        WPFLog(@"搬家异常: %@", e.reason);
         gWPFSavedMainScene = nil;
         return NO;
     }
@@ -704,12 +703,26 @@ static BOOL WPFMoveMainWindowToFrontScene(UIWindow *main) {
             [vc.view setNeedsDisplay];
         }
         if (appeared) [vc endAppearanceTransition];
-        WPFLog(@"L2c: 搬家完成，主窗口 scene=%p(state=%ld) 可用窗口=%lu",
+        WPFLog(@"搬家完成: 主窗口 scene=%p(state=%ld) 可用窗口=%lu",
                (__bridge void *)main.windowScene,
                main.windowScene ? (long)main.windowScene.activationState : (long)-1,
                (unsigned long)WPFUsableWindowCount(main.windowScene));
-    } @catch (NSException *e) { WPFLog(@"L2c 布局异常: %@", e.reason); }
+    } @catch (NSException *e) { WPFLog(@"搬家布局异常: %@", e.reason); }
     return YES;
+}
+
+// L2-c：把主窗口搬到前台 scene（窗口层唯一能让它重新被渲染的办法）
+static BOOL WPFMoveMainWindowToFrontScene(UIWindow *main) {
+    if (!main) return NO;
+    UIWindowScene *front = WPFActiveScene();
+    UIWindowScene *owned = main.windowScene;
+    if (!front) { WPFLog(@"L2c: 跳过（没有前台 scene）"); return NO; }
+    if (front == owned) { WPFLog(@"L2c: 跳过（主窗口已经在前台 scene 上）"); return NO; }
+    WPFLog(@"L2c: 搬家中 —— 主窗口 %p 从 scene %p(state=%ld) 搬到前台 scene %p(state=%ld)",
+           (__bridge void *)main,
+           (__bridge void *)owned, owned ? (long)owned.activationState : (long)-1,
+           (__bridge void *)front, (long)front.activationState);
+    return WPFMoveMainWindowToScene(main, front);
 }
 
 // L2-d：搬家后仍黑 -> 回滚到原 scene，避免把微信内部状态搞乱
@@ -1209,6 +1222,104 @@ static void WPFForceMainScene(void) {
            NSStringFromClass(owner));
 }
 
+// ============================================================
+// ★★★ v2.0.27：在系统激活空场景**之前**就把主窗口搬过去 —— 目标 0 秒黑屏
+// ------------------------------------------------------------
+// v2.0.26 实测：快速路径生效后黑屏仍有一小段时间，因为整条链是
+//   didBecomeActive → 0.4s 检查 → 搬家
+// 也就是说「系统已经把空 scene 激活成前台、铺了黑底」之后我们才动手。
+//
+// 要彻底 0 秒，唯一更早的时机是 scene 连接阶段：
+//   系统分配 config（我们已 hook，日志「scene-config: → 进入分配」）
+//     → UIKit 创建 UIScene
+//     → 调 delegate 的  scene:willConnectToSession:options:   ← ★ 就是这里，scene 还没激活
+//     → scene 被激活成前台
+//   在 willConnect 里把主窗口 `windowScene` 指到新 scene，等它被激活时窗口已经在上面，
+//   系统没有「空场景」这一帧，用户就看不到黑。
+//
+// 判断条件（保守，只处理"多余场景"这一种情况）：
+//   主窗口**已存在**（说明不是首次启动建窗口那一轮）且它当前不在这个新 scene 上
+//   ⇒ 这个新 scene 就是系统恢复出来的那个空的，把主窗口搬过去。
+//   首次启动时主窗口还不存在（由微信在第一轮 willConnect 里创建），这里自然什么都不做。
+static IMP gWPFOrigWillConnect = NULL;
+static NSMutableSet *gWPFHookedWillConnect = nil;
+
+static void WPFSceneWillConnectHook(id self, SEL _cmd, UIScene *scene, UISceneSession *session, id options) {
+    @try {
+        if (scene && [scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            UIApplication *app = [UIApplication sharedApplication];
+            UIWindow *main = WPFMainWindow(app);
+            if (main && main.windowScene != ws) {
+                WPFLog(@"scene-willConnect: 新场景 %p(session=%@ state=%ld) 即将连接，"
+                        "主窗口在 %p → 抢先搬家（赶在系统激活它之前）",
+                       (__bridge void *)ws,
+                       session.persistentIdentifier ?: @"(nil)",
+                       (long)ws.activationState,
+                       (__bridge void *)main.windowScene);
+                WPFMoveMainWindowToScene(main, ws);
+            } else if (!main) {
+                WPFLog(@"scene-willConnect: 新场景 %p 连接，主窗口还没建（首次启动），交给微信自己建",
+                       (__bridge void *)ws);
+            }
+        }
+    } @catch (NSException *e) { WPFLog(@"scene-willConnect 抢先搬家异常: %@", e.reason); }
+
+    if (gWPFOrigWillConnect)
+        ((void (*)(id, SEL, id, id, id))gWPFOrigWillConnect)(self, _cmd, scene, session, options);
+
+    // 微信自己的实现可能又改窗口归属（它内部也有窗口管理），所以 orig 之后再校准一次
+    @try {
+        if (scene && [scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            UIWindow *main2 = WPFMainWindow([UIApplication sharedApplication]);
+            if (main2 && main2.windowScene != ws && ws.activationState != UISceneActivationStateBackground) {
+                WPFLog(@"scene-willConnect: 微信 orig 之后主窗口又不在这个场景上了 → 再搬一次");
+                WPFMoveMainWindowToScene(main2, ws);
+            }
+        }
+    } @catch (NSException *e) { WPFLog(@"scene-willConnect 复查异常: %@", e.reason); }
+}
+
+static void WPFHookSceneWillConnect(void) {
+    SEL sel = sel_registerName("scene:willConnectToSession:options:");
+    NSArray *candidates = @[@"MMMainSceneDelegate", @"MMSceneDelegate", @"MMSubSceneDelegate",
+                            @"MMProxySceneDelegate"];
+    if (!gWPFHookedWillConnect) gWPFHookedWillConnect = [NSMutableSet set];
+    NSMutableString *log = [NSMutableString string];
+    for (NSString *n in candidates) {
+        Class c = NSClassFromString(n);
+        if (!c) { [log appendFormat:@"%@(无),", n]; continue; }
+        // 沿继承链找真正拥有该方法的类，避免 method_setImplementation 改到父类/系统类
+        Class owner = Nil; Method m = NULL;
+        for (Class k = c; k && k != [NSObject class]; k = class_getSuperclass(k)) {
+            Method om = WPFMethodOwnedByClass(k, sel);
+            if (om) { owner = k; m = om; break; }
+        }
+        if (!m) { [log appendFormat:@"%@(无人实现),", n]; continue; }
+        if ([gWPFHookedWillConnect containsObject:NSStringFromClass(owner)]) continue;
+        const char *te = method_getTypeEncoding(m);
+        if (!te || te[0] != 'v') {
+            [log appendFormat:@"%@(返回类型%s),", NSStringFromClass(owner), te ?: "?"];
+            continue;
+        }
+        IMP cur = method_getImplementation(m);
+        if (cur == (IMP)WPFSceneWillConnectHook) continue;
+        IMP orig = method_setImplementation(m, (IMP)WPFSceneWillConnectHook);
+        if (!gWPFOrigWillConnect) gWPFOrigWillConnect = orig;
+        else if (orig != gWPFOrigWillConnect) {
+            // 多个类各自实现时，orig 不能共用同一个 —— 否则又是 v2.0.22 那个崩法。
+            // 这里直接还原，只保留第一个（微信实际只会用到主 scene delegate 那一个）。
+            method_setImplementation(m, orig);
+            [log appendFormat:@"%@(多实现已还原),", NSStringFromClass(owner)];
+            continue;
+        }
+        [gWPFHookedWillConnect addObject:NSStringFromClass(owner)];
+        [log appendFormat:@"%@(已接管),", NSStringFromClass(owner)];
+    }
+    WPFLog(@"scene-willConnect: hook 结果 [%@]", log);
+}
+
 // ⚠️ 这里必须用 `__attribute__((constructor))`，**不能用 Logos 的 %ctor**（v2.0.15 根因）：
 //   本文件历史上是 .xm + %ctor，编出来的 dylib 是**空壳** —— 实测该产物
 //   __TEXT 段只剩 Mach-O 头（16384B）、__LINKEDIT 仅 1104B、全文件只有 18 个字符串
@@ -1241,6 +1352,9 @@ static void WCVKPFInit(void) {
         WPFSanitizeKnownSceneSessions();
         WPFUnlockMultiScene();
         WPFForceMainScene();
+        // ★★ v2.0.27：再接管 scene delegate 的 scene:willConnectToSession:options:，
+        //   在系统把新 scene 激活成前台**之前**把主窗口搬过去 —— 目标 0 秒黑屏。
+        WPFHookSceneWillConnect();
 
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
