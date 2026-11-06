@@ -128,7 +128,7 @@ static NSString *BKRecordsFooterText(void) {
         [out appendFormat:@"%@  %@  %@\n", when, [r[@"ok"] boolValue] ? @"✔" : @"✘", nm];
         if (det.length) [out appendFormat:@"              %@\n", det];
     }
-    if (rows.count > n) [out appendFormat:@"…… 还有 %lu 条（文件内保留最近 60 条）\n",
+    if (rows.count > n) [out appendFormat:@"…… 还有 %lu 条（文件内保留最近 20 条）\n",
                          (unsigned long)(rows.count - n)];
     [out appendFormat:@"\n读取自 %@", from ?: @"?"];
     return out;
@@ -161,6 +161,25 @@ static void BKEnsureAltListLoaded(void) {
 - (instancetype)init {
     BKEnsureAltListLoaded(); // ATL 类须在本页（及其多选子页）实例化前注册进进程
     return [super init];
+}
+
+// v2.0.6：老板实测「记录要划掉设置、再后台打开才更新」。
+// 那就是 UIApplicationDidBecomeActive —— 设置 App 回到前台时立刻重读 + 重画，
+// 不用再划掉。页面开着的时候也可以看到刚发生的拉起。
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(bkAppBecameActive)
+                                                 name:@"UIApplicationDidBecomeActiveNotification"
+                                               object:nil];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)bkAppBecameActive {
+    @try { [self bkRefreshRecordFooterIn:[self specifiers] reload:YES]; } @catch (NSException *e) {}
 }
 
 // Choicy 同款显式加载：默认 specifiers 加载链在 iOS 16 设置进程里可能不落 plist（页面全空），

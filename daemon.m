@@ -216,7 +216,9 @@ static void WCVKRecord(NSString *display, NSString *ident, NSString *kind, BOOL 
     row[@"ok"] = @(ok);
     if (detail.length) row[@"detail"] = detail;
     [arr insertObject:row atIndex:0];
-    while (arr.count > 60) [arr removeLastObject];
+    // v2.0.6：上层数从 60 收到 20（老板要求）。每次记录都要把整份文件读出来再整份写回去，
+    // 条数直接决定单次写盘的大小 —— 20 条大约 2KB，比原来 19KB 少 9 倍。
+    while (arr.count > 20) [arr removeLastObject];
     // v2.0.1：改成 dict{rows:[...]} —— 顶层是 dict，cfprefsd 才能当域读；
     // 设置页因此可以走 CFPreferences 兜底（沙箱下直读文件可能被拦）
     NSDictionary *out = @{ @"rows": arr };
@@ -234,8 +236,13 @@ static void WCVKRecord(NSString *display, NSString *ident, NSString *kind, BOOL 
     if (wrote) {
         // v2.0.5：fallback 路径也要 chown/chmod，以前只 chown 了 path（fallback 那份属主不对，
         // 设置页读得到但删不掉）
-        chown(writtenPath.fileSystemRepresentation, 501, 501);
-        chmod(writtenPath.fileSystemRepresentation, 0644);
+        // v2.0.6：先 stat 看一眼，属主/权限已经对就不再 syscall（每次记录省 2 个调用）
+        struct stat sb;
+        if (stat(writtenPath.fileSystemRepresentation, &sb) != 0 ||
+            sb.st_uid != 501 || (sb.st_mode & 07777) != 0644) {
+            chown(writtenPath.fileSystemRepresentation, 501, 501);
+            chmod(writtenPath.fileSystemRepresentation, 0644);
+        }
     }
 }
 
@@ -485,6 +492,8 @@ static const int  kRelaunchDelaySec = 1;     // 事件 -> 拉起前等 1s（尊�
 static const int  kFailCooldownSec  = 45;    // App 拉起失败后冷却，避免死循环
 static const int  kKbdDebounceSec   = 3;     // 键盘扩展只防抖 3s：拉起成功后必须能立刻再拉
 static const int  kArmRetrySecs[]   = {2, 5, 10, 20, 40};  // 拉起后找 pid 挂监视的重试点
+// v2.0.6：连续失败熔断上限（改设置即恢复）
+static const int  kFuseFailLimit    = 3;
 
 @interface WCVKTarget : NSObject
 @property (nonatomic, copy)   NSString *ident;      // bundle id 或 "wxkb_plugin"
@@ -494,6 +503,7 @@ static const int  kArmRetrySecs[]   = {2, 5, 10, 20, 40};  // 拉起后找 pid �
 @property (nonatomic, assign) int pid;
 @property (nonatomic, assign) time_t lastRelaunch;
 @property (nonatomic, assign) int fails;
+@property (nonatomic, assign) BOOL disabled;     // v2.0.6：连续失败熔断，摘掉不再看护
 @property (nonatomic, strong) dispatch_source_t src;
 @end
 
@@ -509,6 +519,7 @@ static dispatch_queue_t WCVKQueue(void) {
 }
 
 static void WCVKArmTarget(WCVKTarget *t, int attempt);
+static void WCVKStopTarget(WCVKTarget *t);
 
 static int WCVKTargetPid(WCVKTarget *t) {
     if ([t.kind isEqualToString:@"kbd"])
@@ -550,6 +561,16 @@ static void WCVKRelaunchAttempt(WCVKTarget *t, int attempt) {
             return;
         }
         t.fails++;
+        // v2.0.6：连续失败熔断 —— 某个勾选的 App 卸了/再也拉不起来时，别无限 45s 冷却重试。
+        // 摘掉看护，等用户改设置（rebuild 会清零 fails/disabled）再恢复。
+        if (t.fails >= kFuseFailLimit) {
+            t.disabled = YES;
+            LOG(@"%@ 连续失败 %d 次 -> 熔断，停止看护（改设置后恢复）", disp, t.fails);
+            WCVKRecord(disp, ident, kind, NO,
+                       [NSString stringWithFormat:@"连续失败 %d 次，已暂停保活（改设置后恢复）", t.fails]);
+            WCVKStopTarget(t);
+            return;
+        }
         WCVKRecord(disp, ident, kind, NO,
                    [NSString stringWithFormat:@"后台拉起失败 rc=%d（已重试 %d 次）", r, retries]);
     });
@@ -618,8 +639,14 @@ static void WCVKArmPid(WCVKTarget *t, int pid) {
 }
 
 static void WCVKArmTarget(WCVKTarget *t, int attempt) {
+    if (t.disabled) { LOG(@"%@ 已熔断，跳过看护", t.display); return; }
     int pid = WCVKTargetPid(t);
     if (pid > 0) { WCVKArmPid(t, pid); return; }
+
+    // ⚠️ v2.0.6 回退记录：老板明确要求**不要**在这里加"pid=0 就主动预热拉起"。
+    // 实测注销后键盘扩展 pid=0 本来就能被正常拉起（退出事件 + kbd.up + 重试挂监视这条链是好的），
+    // 在这条路径上再插主动预热反而会打乱它，导致"注销后反而不拉起了"。保持原样。
+
     if (attempt >= (int)(sizeof(kArmRetrySecs) / sizeof(kArmRetrySecs[0]))) {
         LOG(@"%@ 重试结束仍未在运行（等下次退出事件/设置变更）", t.display);
         return;
@@ -677,7 +704,16 @@ static void WCVKRebuildTargets(void) {
     for (WCVKTarget *n in want) {
         WCVKTarget *exist = nil;
         for (WCVKTarget *old in gTargets) if ([old.ident isEqualToString:n.ident]) { exist = old; break; }
-        if (exist) { exist.display = n.display; exist.exeSuffix = n.exeSuffix; [merged addObject:exist]; }
+        if (exist) {
+            exist.display = n.display; exist.exeSuffix = n.exeSuffix;
+            // v2.0.6：重建只在「启动」或「设置真的变了」时发生 —— 这两种情况都要清零熔断，
+            // 即老板要的「连续 3 次失败摘掉，改了设置就恢复」。
+            if (exist.disabled || exist.fails)
+                LOG(@"%@ 熔断/失败计数清零（设置变更或重启）", exist.display);
+            exist.disabled = NO;
+            exist.fails = 0;
+            [merged addObject:exist];
+        }
         else       { [merged addObject:n]; }
     }
     gTargets = merged;
