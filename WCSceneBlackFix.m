@@ -8,11 +8,30 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <sys/time.h>
 
 // ============================================================
 //  日志
+// ------------------------------------------------------------
+// 纯净版（编译期 -DWCF_NO_LOG=1 或 -DWCVK_NO_LOG=1）整体剥掉：
+// 不只是不输出，连 [[NSString alloc] initWithFormat:] 的格式化和字符串常量都不生成。
+// 这一点很重要 —— 之前 wcvoicekeep 的 pure 版其实一行都没剥，两个 dylib 代码完全一样。
 // ============================================================
 static void (^gWCFLogHandler)(NSString *) = nil;
+
+#ifndef WCF_NO_LOG
+#ifdef WCVK_NO_LOG
+#define WCF_NO_LOG WCVK_NO_LOG
+#else
+#define WCF_NO_LOG 0
+#endif
+#endif
+
+#if WCF_NO_LOG
+
+#define WCFLog(...) do {} while (0)
+
+#else
 
 static void WCFLog(NSString *fmt, ...) {
     va_list ap;
@@ -22,6 +41,8 @@ static void WCFLog(NSString *fmt, ...) {
     if (gWCFLogHandler) gWCFLogHandler(s);
     else NSLog(@"[SceneBlackFix] %@", s);
 }
+
+#endif
 
 void WCSceneBlackFixSetLog(void (^handler)(NSString *line)) {
     gWCFLogHandler = [handler copy];
@@ -372,11 +393,17 @@ static void WCFInstallConfigHook(void) {
 // ============================================================
 static double const kWCFCheckDelay  = 0.4;    // 首次前台激活后多久检查
 static double const kWCFVerifyDelay = 0.35;   // 搬完多久复查
+static double const kWCFCheckThrottle = 1.0;  // 两次检查之间的最小间隔（防叠加）
 static int    const kWCFMaxFix      = 6;      // 同一进程最多修几次（用户反复点开每次都要能修）
 
-static int gWCFFixCount = 0;
+static int    gWCFFixCount     = 0;
+static BOOL   gWCFWasHeadless  = NO;    // 本次进程是「后台无头拉起」的
+static BOOL   gWCFCheckedOnce  = NO;    // 已经做过第一次检查
+static double gWCFLastCheckAt  = 0;     // 上次检查时间（节流）
 
 static void WCFCheck(void) {
+    gWCFCheckedOnce = YES;
+
     UIApplication *app = [UIApplication sharedApplication];
     UIWindow *main = WCFMainWindow();
     if (!main) { WCFLog(@"兜底检查: 没有主窗口，跳过"); return; }
@@ -385,11 +412,11 @@ static void WCFCheck(void) {
     NSUInteger frontUsable = WCFUsableWindowCount(front);
     BOOL onStage = WCFSceneOnStage(main);
 
-    WCFLog(@"兜底检查: mainWindow=%@ onStage=%d 前台scene=%p(state=%ld) 前台可用窗口=%lu 全部窗口=%lu",
+    WCFLog(@"兜底检查: mainWindow=%@ onStage=%d 前台scene=%p(state=%ld) 前台可用窗口=%lu 全部窗口=%lu headless=%d",
            NSStringFromClass([main class]), onStage ? 1 : 0,
            (__bridge void *)front, front ? (long)front.activationState : (long)-1,
            (unsigned long)frontUsable,
-           (unsigned long)app.windows.count);
+           (unsigned long)app.windows.count, gWCFWasHeadless ? 1 : 0);
 
     if (WCFHealthy(main)) { WCFLog(@"兜底检查: 界面正常，不动"); return; }
 
@@ -414,6 +441,7 @@ static void WCFCheck(void) {
                    dispatch_get_main_queue(), ^{
         UIWindow *mw = WCFMainWindow();
         if (WCFHealthy(mw)) {
+            gWCFSavedMainScene = nil;   // 成功就别再强持旧 scene 了
             WCFLog(@"兜底搬家成功：%.2fs 内界面恢复", kWCFVerifyDelay);
             return;
         }
@@ -423,6 +451,12 @@ static void WCFCheck(void) {
 }
 
 static void WCFOnDidBecomeActive(void) {
+    // 节流：短时间内连续 didBecomeActive（微信切前后台很频繁）不叠加检查
+    struct timeval tv; gettimeofday(&tv, NULL);
+    double now = tv.tv_sec + tv.tv_usec / 1e6;
+    if (gWCFLastCheckAt > 0 && now - gWCFLastCheckAt < kWCFCheckThrottle) return;
+    gWCFLastCheckAt = now;
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kWCFCheckDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ WCFCheck(); });
 }
@@ -437,11 +471,25 @@ void WCSceneBlackFixInstall(void) {
     WCFInstallConfigHook();       // ② 可选：掰回主场景配置
     WCFInstallWillConnectHook();  // ① 核心：抢在激活前搬窗口
 
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(NSNotification *note) {
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+
+    // 记录本进程是不是「后台无头拉起」。只有这种进程才会出现黑屏；
+    // 用户自己点图标冷启动的进程只需要第一次确认，之后不必再扫。
+    [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
+                    object:nil queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+        gWCFWasHeadless = ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground);
+        WCFLog(@"didFinishLaunching: %@",
+               gWCFWasHeadless ? @"后台无头拉起（会检查并修复）" : @"正常启动（只做首次确认）");
+    }];
+
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+        // 非 headless 进程不会黑屏，做完第一次确认就不再介入
+        if (!gWCFWasHeadless && gWCFCheckedOnce) return;
         WCFOnDidBecomeActive();   // ③ 兜底
     }];
+
     WCFLog(@"已安装（willConnect 抢先搬家 + 0.4s 兜底）");
 }

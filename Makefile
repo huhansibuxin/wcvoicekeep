@@ -67,7 +67,7 @@ wcvoicekeep_CFLAGS = -fobjc-arc -fno-modules -w -DWCVK_NO_LOG=$(WCVK_NO_LOG)
 wcprewarmfix_FILES = WCPrewarmFix.m WCSceneBlackFix.m
 wcprewarmfix_FRAMEWORKS = UIKit Foundation
 wcprewarmfix_LDFLAGS = -Wl,-no_warn_inits
-wcprewarmfix_CFLAGS = -fobjc-arc -fno-modules -w
+wcprewarmfix_CFLAGS = -fobjc-arc -fno-modules -w -DWCVK_NO_LOG=$(WCVK_NO_LOG)
 TWEAK_NAME = wetypekeepalive wcprewarmfix
 
 include $(THEOS_MAKE_PATH)/tweak.mk

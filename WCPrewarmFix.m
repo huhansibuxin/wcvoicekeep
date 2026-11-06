@@ -41,7 +41,7 @@
 #import "WCSceneBlackFix.h"
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.28-roothide"
+#define WCVK_BUILD_TAG "v2.0.29-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC_EXIT 里 kRelaunchDelaySec
                                              // 秒后就会主动再拉，形成「杀-拉-黑」死循环。
@@ -95,6 +95,16 @@ static int  gL3Attempts = 0;       // L3（拆子场景）实际执行次数，�
 // 万一哪条都写不进去，这行会先落进 CFPreferences，照样能查到失败原因。
 static char gLogPath[PATH_MAX] = {0};   // 空 = 还没找到可写路径
 static char gProbeReport[1024] = {0};   // 首次路径探测结论（写进 prefs 备查）
+
+#ifndef WCVK_NO_LOG
+#define WCVK_NO_LOG 0
+#endif
+
+// 纯净版（-DWCVK_NO_LOG=1）编译期整体剥离：连 [[NSString alloc] initWithFormat:]
+// 和字符串常量都不生成。之前这里没有这个宏 → pure 版和 log 版编出来的 dylib 代码完全一样，
+// 纯净版照样每进程写文件 + 写 CFPreferences + NSLog，等于白出一份。
+// 下面整个「文件/prefs 日志通道」在纯净版里连函数都不参与编译。
+#if !WCVK_NO_LOG
 
 static void WPFMkdirParents(const char *path) {
     char dir[PATH_MAX];
@@ -218,6 +228,16 @@ static void WPFWriteFile(const char *line, size_t len) {
     }
 }
 
+#endif   // !WCVK_NO_LOG —— 文件/prefs 日志通道到此结束（纯净版不参与编译）
+
+// ===== 统一的日志入口 =====
+// 纯净版直接编成空语句：不格式化、不拼接、连字符串常量都不生成。
+#if WCVK_NO_LOG
+
+#define WPFLog(...) do {} while (0)
+
+#else
+
 static void WPFLog(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -251,6 +271,8 @@ static void WPFLog(NSString *fmt, ...) {
     // 通道 B：CFPreferences（文件全失败也有一条命）
     WPFStoreAppend(line);
 }
+
+#endif   // WCVK_NO_LOG
 
 // ===== 工具 =====
 static NSString *WPFClassChain(id obj) {
