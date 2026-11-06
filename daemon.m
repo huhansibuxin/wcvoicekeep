@@ -54,6 +54,7 @@
 #include <signal.h>         // SIGKILL
 #include <fcntl.h>          // v1.9.23：日志 3M 上限（open O_TRUNC）
 #include <sys/stat.h>       // v1.9.23：stat 日志大小
+#include <glob.h>           // v1.9.39：动态定位 wxkb_plugin.appex（UUID 路径）
 
 // notify.h 在 theos iOS SDK 16.5 路径里默认找不全 - 手动声明 Darwin 通知 API
 // 而不依赖 <notify.h>。这是私有 API 但 iOS 13+ 名/签名都稳定。
@@ -580,13 +581,24 @@ static time_t gKbdCooldownUntil = 0;
 static BOOL   gKbdEverSeen = NO;      // 曾经见过它活着（区分"被内存杀掉"与"开机后还没用过键盘"）
 static BOOL   gKbdLastRunning = NO;
 static BOOL   gKbdStartupLogged = NO;
+// v1.9.39：区分"预热成功"与"预热失败"，冷却只惩罚失败。
+// 实测（2026-11-06 19:30:04 那次成功）：预热后 5s 扩展就 UP 了，
+// 但旧代码无论成败都锁死 300s，导致老板"第一次能重启、后面杀掉再也不重启"。
+static time_t gKbdPendAt = 0;         // 已发预热请求、等待结果的时刻（0=无待定）
+static time_t gKbdLastSkipLog = 0;
+static const time_t kKbdFailCooldownSec = 45;   // 失败后仅冷却 45s，15s tick 内很快会再试
 
 static void watchKeyboardExtension(void) {
     BOOL running = procExists("wxkb_plugin");
     if (running) {
         if (!gKbdLastRunning) LOG(@"kbd ext (wxkb_plugin) UP");
+        if (gKbdPendAt) {
+            LOG(@"kbd warmup SUCCESS in %lds (cooldown cleared)", (long)(time(NULL) - gKbdPendAt));
+            gKbdPendAt = 0;
+        }
         gKbdLastRunning = YES;
         gKbdEverSeen = YES;
+        gKbdCooldownUntil = 0;   // v1.9.39：成功即清零，下次被杀可立刻再拉
         return;
     }
     if (gKbdLastRunning) {
@@ -613,15 +625,34 @@ static void watchKeyboardExtension(void) {
             return;
         }
     }
-    if (gLocked) {                                 // 锁屏不弹
+    // v1.9.39：待定超时判定。预热请求发出后 12s 内还没起来就算失败，
+    // 只锁 45s；15s tick 下最多 1 分钟内会再试，不会像旧版那样锁死 5 分钟。
+    time_t now = time(NULL);
+    if (gKbdPendAt) {
+        if (now - gKbdPendAt < 12) return;             // 还在等结果
+        LOG(@"kbd warmup FAILED (12s 内未拉起) -> cooldown %lds", (long)kKbdFailCooldownSec);
+        gKbdPendAt = 0;
+        gKbdCooldownUntil = now + kKbdFailCooldownSec;
         return;
     }
-    time_t now = time(NULL);
-    if (now < gKbdCooldownUntil) return;           // 冷却中
+    if (gLocked) {                                 // 锁屏不弹
+        if (now - gKbdLastSkipLog > 60) {
+            gKbdLastSkipLog = now;
+            LOG(@"kbd ext absent but LOCKED -> 不弹键盘等解锁");
+        }
+        return;
+    }
+    if (now < gKbdCooldownUntil) {                 // 冷却中（只在失败后进入）
+        if (now - gKbdLastSkipLog > 60) {
+            gKbdLastSkipLog = now;
+            LOG(@"kbd ext absent but cooldown %lds left -> 等待重试", (long)(gKbdCooldownUntil - now));
+        }
+        return;
+    }
     LOG(@"kbd ext MISSING -> ask SpringBoard to issue a real keyboard request");
     uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup");
     LOG(@"kbd warmup notify posted -> %u (0=ok)", st);
-    gKbdCooldownUntil = now + 300;
+    gKbdPendAt = now;                              // 待定，结果由上面的 UP/失败判定收尾
 }
 
 // ===== v1.9.13 核心：读 wetype 的 Mach Task suspend_count 判定是否被系统挂起 =====
@@ -876,6 +907,11 @@ static int pkProbe(void) {
 // 也就是说「持有扩展（hold）」才是正规手段：hold 建立后 pkd 会让 launchd
 // 保持扩展活跃（active count>=1），不受 exit timeout=3 回收，且全程无 UI。
 // 本命令依次尝试三种 hold 入口，每种之后采样 wxkb_plugin 的 pid。
+// v1.9.39：重写 hold 探测。
+// v1.9.38 那次崩在 `holdPlugInsInApplication:withError:`——它的入参不是 bundle id 字符串，
+// PlugInKit 内部对入参调了 -path，传 NSString 直接 unrecognized selector 终止进程。
+// 这次先用 method_getTypeEncoding 拿到真实签名，再逐个入口用 @try 兜住，
+// 保证一个入口炸了还能继续试下一个，不会整个进程退出。
 static int pkHold(void) {
     const char *logp = "/var/mobile/wcvk_pkhold.log";
     FILE *fp = fopen(logp, "w");
@@ -903,70 +939,167 @@ static int pkHold(void) {
     HLOG("PKManager instance = %s", mgr ? class_getName(object_getClass(mgr)) : "nil");
     if (!mgr) { if (fp != stderr) fclose(fp); return 3; }
 
+    // --- 先 dump 真实类型编码，别再靠猜 ---
+    const char *encSel[] = {
+        "holdPlugInsInApplication:withError:",
+        "holdPlugInsWithExtensionPointName:error:",
+        "holdPlugInsWithExtensionPointName:platforms:terminate:error:",
+        "holdPlugInsWithExtensionPointName:platforms:terminate:result:",
+        "forceHoldPlugIn:withError:",
+        "forceHoldPlugIn:result:",
+        "registerPlugInAtURL:result:",
+        "releaseHold:withError:",
+        NULL
+    };
+    HLOG("--- type encodings ---");
+    for (int i = 0; encSel[i]; i++) {
+        Method m = class_getInstanceMethod(MCls, sel_registerName(encSel[i]));
+        if (!m) { HLOG("  %s : NOT FOUND", encSel[i]); continue; }
+        const char *enc = method_getTypeEncoding(m);
+        HLOG("  %s : %s", encSel[i], enc ? enc : "?");
+    }
+
     int before = procPid("wxkb_plugin");
     HLOG("wxkb_plugin pid before = %d", before);
+    if (before > 0) { HLOG("already running, nothing to hold"); if (fp != stderr) fclose(fp); return 0; }
 
-    // --- 尝试 1：holdPlugInsInApplication:withError:（按主 App bundle id 持有其全部扩展）
-    SEL s1 = sel_registerName("holdPlugInsInApplication:withError:");
-    if ([mgr respondsToSelector:s1]) {
-        NSError *err = nil;
-        BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(mgr, s1,
-                       @"com.tencent.wetype", &err);
-        HLOG("[1] holdPlugInsInApplication(com.tencent.wetype) -> %d err=%s",
-             ok, err ? [[err description] UTF8String] : "none");
-        sleep(4);
-        HLOG("[1] after 4s wxkb_plugin=%d", procPid("wxkb_plugin"));
-    } else HLOG("[1] selector 不存在");
-
-    // 若已起来就不用再试
-    if (procPid("wxkb_plugin") > 0) {
-        HLOG("SUCCESS via holdPlugInsInApplication");
-        if (fp != stderr) fclose(fp);
-        return 0;
+    // --- 尝试 1：holdPlugInsWithExtensionPointName:error:（按 extension point 持有，入参是字符串）
+    {
+        SEL s = sel_registerName("holdPlugInsWithExtensionPointName:error:");
+        if ([mgr respondsToSelector:s]) {
+            @try {
+                NSError *err = nil;
+                BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
+                            mgr, s, @"com.apple.keyboard-service", &err);
+                HLOG("[1] holdPlugInsWithExtensionPointName(keyboard-service) -> %d err=%s",
+                     ok, err ? [[err description] UTF8String] : "none");
+            } @catch (NSException *e) {
+                HLOG("[1] EXCEPTION %s: %s", [[e name] UTF8String], [[e reason] UTF8String]);
+            }
+            for (int i = 1; i <= 4; i++) {
+                sleep(1);
+                int p = procPid("wxkb_plugin");
+                HLOG("[1] +%ds wxkb_plugin=%d", i, p);
+                if (p > 0) break;
+            }
+            if (procPid("wxkb_plugin") > 0) {
+                HLOG("SUCCESS via holdPlugInsWithExtensionPointName:error:");
+                if (fp != stderr) fclose(fp);
+                return 0;
+            }
+        } else HLOG("[1] selector 不存在");
     }
 
-    // --- 尝试 2：forceHoldPlugIn:withError:（直接给 identifier 字符串）
-    SEL s2 = sel_registerName("forceHoldPlugIn:withError:");
-    if ([mgr respondsToSelector:s2]) {
-        NSError *err = nil;
-        BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(mgr, s2,
-                       @"com.tencent.wetype.keyboard", &err);
-        HLOG("[2] forceHoldPlugIn(str) -> %d err=%s",
-             ok, err ? [[err description] UTF8String] : "none");
-        sleep(4);
-        HLOG("[2] after 4s wxkb_plugin=%d", procPid("wxkb_plugin"));
-    } else HLOG("[2] selector 不存在");
-
-    if (procPid("wxkb_plugin") > 0) {
-        HLOG("SUCCESS via forceHoldPlugIn(str)");
-        if (fp != stderr) fclose(fp);
-        return 0;
+    // --- 尝试 2：holdPlugInsWithExtensionPointName:platforms:terminate:error:
+    {
+        SEL s = sel_registerName("holdPlugInsWithExtensionPointName:platforms:terminate:error:");
+        if ([mgr respondsToSelector:s]) {
+            @try {
+                NSError *err = nil;
+                BOOL ok = ((BOOL (*)(id, SEL, id, id, BOOL, NSError **))objc_msgSend)(
+                            mgr, s, @"com.apple.keyboard-service", nil, (BOOL)NO, &err);
+                HLOG("[2] holdPlugInsWithExtensionPointName:platforms:terminate -> %d err=%s",
+                     ok, err ? [[err description] UTF8String] : "none");
+            } @catch (NSException *e) {
+                HLOG("[2] EXCEPTION %s: %s", [[e name] UTF8String], [[e reason] UTF8String]);
+            }
+            sleep(4);
+            HLOG("[2] after 4s wxkb_plugin=%d", procPid("wxkb_plugin"));
+            if (procPid("wxkb_plugin") > 0) {
+                HLOG("SUCCESS via holdPlugInsWithExtensionPointName:platforms:terminate:error:");
+                if (fp != stderr) fclose(fp);
+                return 0;
+            }
+        } else HLOG("[2] selector 不存在");
     }
 
-    // --- 尝试 3：holdRequest:extensionPointName:platforms:flags:result:（异步 block）
-    SEL s3 = sel_registerName("holdRequest:extensionPointName:platforms:flags:result:");
-    if ([mgr respondsToSelector:s3]) {
-        HLOG("[3] holdRequest 存在，尝试异步调用");
-        // 用 CFRetain 保证 block 存活到回调
-        __block BOOL cbDone = NO;
-        void (^cb)(id, NSError *) = ^(id result, NSError *err) {
-            HLOG("[3] result callback: %s err=%s",
-                 result ? [[result description] UTF8String] : "nil",
-                 err ? [[err description] UTF8String] : "none");
-            cbDone = YES;
-        };
-        id blk = [cb copy];
-        ((void (*)(id, SEL, id, id, id, unsigned long long, id))objc_msgSend)(
-            mgr, s3, @"com.wcvoicekeep.kbdhold", @"com.apple.keyboard-service",
-            nil, 0ULL, blk);
-        for (int i = 0; i < 20 && !cbDone; i++) sleep(1);
-        HLOG("[3] after wait %ds wxkb_plugin=%d", 20, procPid("wxkb_plugin"));
-        [blk release];
-    } else HLOG("[3] selector 不存在");
+    // --- 尝试 3：forceHoldPlugIn:withError:（入参是 plugin identifier 字符串）
+    {
+        SEL s = sel_registerName("forceHoldPlugIn:withError:");
+        if ([mgr respondsToSelector:s]) {
+            @try {
+                NSError *err = nil;
+                BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
+                            mgr, s, @"com.tencent.wetype.keyboard", &err);
+                HLOG("[3] forceHoldPlugIn(keyboard id) -> %d err=%s",
+                     ok, err ? [[err description] UTF8String] : "none");
+            } @catch (NSException *e) {
+                HLOG("[3] EXCEPTION %s: %s", [[e name] UTF8String], [[e reason] UTF8String]);
+            }
+            sleep(4);
+            HLOG("[3] after 4s wxkb_plugin=%d", procPid("wxkb_plugin"));
+            if (procPid("wxkb_plugin") > 0) {
+                HLOG("SUCCESS via forceHoldPlugIn:withError:");
+                if (fp != stderr) fclose(fp);
+                return 0;
+            }
+        } else HLOG("[3] selector 不存在");
+    }
 
-    HLOG("=== pkHold end (wxkb_plugin=%d) ===", procPid("wxkb_plugin"));
+    // --- 尝试 4：registerPlugInAtURL:result: 拿到 proxy，再用 forceHoldPlugIn:withError: 持有
+    // 这条路最贴近系统真实流程：pkd 需要先发现这个 appex，才谈得上 hold。
+    {
+        SEL sReg = sel_registerName("registerPlugInAtURL:result:");
+        if ([mgr respondsToSelector:sReg]) {
+            __block id proxy = nil;
+            __block BOOL done = NO;
+            @try {
+                // 动态找 appex（路径含随机 UUID，写死会随重装失效）
+                char appexPath[512] = {0};
+                glob_t gt = {0};
+                int grc = glob("/private/var/containers/Bundle/Application/*/wxkb.app/PlugIns/wxkb_plugin.appex",
+                               0, NULL, &gt);
+                if (grc == 0 && gt.gl_pathc > 0)
+                    snprintf(appexPath, sizeof(appexPath), "%s", gt.gl_pathv[0]);
+                if (grc == 0) globfree(&gt);
+                if (!appexPath[0]) {
+                    HLOG("[4] appex 未找到，跳过");
+                } else {
+                NSURL *u = [NSURL fileURLWithPath:[NSString stringWithUTF8String:appexPath]];
+                HLOG("[4] registerPlugInAtURL: %s", appexPath);
+                void (^cb)(id, NSError *) = ^(id result, NSError *err) {
+                    proxy = result;
+                    HLOG("[4] register result=%s err=%s",
+                         result ? [[result description] UTF8String] : "nil",
+                         err ? [[err description] UTF8String] : "none");
+                    done = YES;
+                };
+                id blk = [cb copy];
+                ((void (*)(id, SEL, id, id))objc_msgSend)(mgr, sReg, u, blk);
+                for (int i = 0; i < 10 && !done; i++) sleep(1);
+                HLOG("[4] register wait done=%d proxy=%s", (int)done,
+                     proxy ? class_getName(object_getClass(proxy)) : "nil");
+                [blk release];
+                }   // end else (appexPath found)
+            } @catch (NSException *e) {
+                HLOG("[4] EXCEPTION %s: %s", [[e name] UTF8String], [[e reason] UTF8String]);
+            }
+            if (proxy) {
+                SEL sF = sel_registerName("forceHoldPlugIn:withError:");
+                if ([mgr respondsToSelector:sF]) {
+                    @try {
+                        NSError *err = nil;
+                        BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(mgr, sF, proxy, &err);
+                        HLOG("[4] forceHoldPlugIn(proxy) -> %d err=%s",
+                             ok, err ? [[err description] UTF8String] : "none");
+                    } @catch (NSException *e) {
+                        HLOG("[4] forceHold EXCEPTION %s: %s", [[e name] UTF8String], [[e reason] UTF8String]);
+                    }
+                    sleep(4);
+                    HLOG("[4] after 4s wxkb_plugin=%d", procPid("wxkb_plugin"));
+                    if (procPid("wxkb_plugin") > 0) {
+                        HLOG("SUCCESS via register+forceHoldPlugIn");
+                        if (fp != stderr) fclose(fp);
+                        return 0;
+                    }
+                }
+            }
+        } else HLOG("[4] selector 不存在");
+    }
+
+    HLOG("=== pkHold end (wxkb_plugin=%d) 全部入口失败 ===", procPid("wxkb_plugin"));
     if (fp != stderr) fclose(fp);
-    return procPid("wxkb_plugin") > 0 ? 0 : 4;
+    return 4;
     #undef HLOG
 }
 

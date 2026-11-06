@@ -73,7 +73,7 @@ static void SBLog(NSString *fmt, ...) {
 //   通道 1  open/write  —— 原始文件（保留，若沙盒放行最直观）
 //   通道 2  CFPreferences —— SB 必然有权写自己的 prefs domain
 //   通道 3  Darwin 通知 —— 由 root 的 wcvoicekeep daemon 收到后落盘（必定成功）
-#define WCVK_BUILD_TAG "v1.9.38-roothide"
+#define WCVK_BUILD_TAG "v1.9.39-roothide"
 
 // 通道 3：Darwin 通知（名字区分阶段，daemon 侧监听后写自己的日志）
 static void WCVKPostNotify(const char *name) {
@@ -251,6 +251,51 @@ static void KbdStartKbWatch(void) {
     SBLog(@"[KBDWARM] keyboard show/hide observers installed");
 }
 
+// ===== v1.9.39：环境诊断 + 键盘重试 =====
+// 设备实测（2026-11-06）：同一份代码 19:30:04 那次 keyboardShown=1 且成功拉起
+// wxkb_plugin，19:35:04 那次 keyboardShown=0 完全弹不出来。说明"程序化弹键盘"
+// 在 SpringBoard 里本身就不稳定，必须重试 + 记录当时环境才能定位规律。
+static void KbdLogEnv(NSString *tag) {
+    UIApplication *app = [UIApplication sharedApplication];
+    NSArray *scenes = app.connectedScenes.allObjects;
+    NSMutableString *sb = [NSMutableString string];
+    for (UIScene *s in scenes) {
+        [sb appendFormat:@"[%s act=%ld]", NSStringFromClass([s class]).UTF8String,
+                        (long)s.activationState];
+    }
+    UIWindow *kw = app.keyWindow;
+    SBLog(@"[KBDWARM][ENV] %@ appState=%ld keyWindow=%s windows=%lu scenes=%lu %s",
+          tag, (long)app.applicationState,
+          kw ? NSStringFromClass([kw class]).UTF8String : "nil",
+          (unsigned long)app.windows.count, (unsigned long)scenes.count,
+          sb.UTF8String ?: "");
+}
+
+// 键盘第一次常常不弹：resign -> 再 becomeFirstResponder，最多 3 次
+static void KbdWarmRetryTick(int attempt) {
+    if (gKbdDidShow || !gKbdWarmField) return;
+    if (attempt > 3) {
+        SBLog(@"[KBDWARM] retry 用尽 3 次，键盘仍未弹出");
+        return;
+    }
+    @try {
+        [gKbdWarmField resignFirstResponder];
+    } @catch (NSException *e) {}
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!gKbdWarmField || gKbdDidShow) return;
+        BOOL b = [gKbdWarmField becomeFirstResponder];
+        KbdLogEnv([NSString stringWithFormat:@"retry#%d", attempt]);
+        SBLog(@"[KBDWARM] retry#%d becomeFirstResponder=%d", attempt, b);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        SBLog(@"[KBDWARM] retry#%d keyboardShown=%d wxkb_plugin_running=%d",
+              attempt, gKbdDidShow, KbdProcRunning());
+        if (!gKbdDidShow) KbdWarmRetryTick(attempt + 1);
+    });
+}
+
 static void KbdWarmupFinish(NSString *tag) {
     if (gKbdWarmField) {
         BOOL ok = [gKbdWarmField resignFirstResponder];
@@ -375,39 +420,43 @@ static void KbdWarmupRun(NSString *reason) {
 
         gKbdWarmWindow = w;
         gKbdWarmField = tf;
+        KbdLogEnv(reason);
 
         // 600ms：够系统走完键盘显示流程，用通知判据确认键盘到底弹没弹
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             SBLog(@"[KBDWARM] T+0.6s keyboardShown=%d wxkb_plugin_running=%d",
                   gKbdDidShow, KbdProcRunning());
+            if (!gKbdDidShow) KbdWarmRetryTick(1);   // v1.9.39：不弹就重试
         });
 
-        // 收键盘（对应"用户收起键盘"），之后扩展应靠已有连接常驻
+        // 收键盘：只有确实弹出来了才在 1.0s 收；没弹的交给重试链
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
+            if (!gKbdDidShow) return;               // 交给 retry / fallback
             KbdWarmupFinish(@"T+1.0s");
             SBLog(@"[KBDWARM] T+1.0s after resign keyboardShown=%d wxkb_plugin_running=%d",
                   gKbdDidShow, KbdProcRunning());
             gKbdWarmBusy = NO;   // 先放开，下面 fallback 需要
         });
 
-        // 窗口法没弹键盘 -> 说明这个宿主不认自建窗口，换 alert 通道再验一次
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+        // 窗口法没弹键盘 -> 换 alert 通道再验一次（重试链走完才判失败）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.6 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             BOOL running = KbdProcRunning();
-            SBLog(@"[KBDWARM] T+2.5s keyboardShown=%d wxkb_plugin_running=%d",
+            SBLog(@"[KBDWARM] T+4.6s keyboardShown=%d wxkb_plugin_running=%d",
                   gKbdDidShow, running);
             if (!gKbdDidShow && !running) {
-                SBLog(@"[KBDWARM] window 法未弹键盘 -> 切 alert 通道验证 SpringBoard 宿主能力");
+                SBLog(@"[KBDWARM] window+retry 都未弹键盘 -> 切 alert 通道");
+                KbdWarmupFinish(@"T+4.6s");
                 if (!gKbdWarmBusy) { gKbdWarmBusy = YES; KbdWarmupRunAlert(); }
             }
         });
 
-        // 8s 最终判定
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+        // 最终判定
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(9.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            SBLog(@"[KBDWARM] T+8s FINAL keyboardShown=%d wxkb_plugin_running=%d",
+            SBLog(@"[KBDWARM] T+9.5s FINAL keyboardShown=%d wxkb_plugin_running=%d",
                   gKbdDidShow, KbdProcRunning());
             gKbdWarmBusy = NO;
             SBLog(@"[KBDWARM] ===== end =====");
