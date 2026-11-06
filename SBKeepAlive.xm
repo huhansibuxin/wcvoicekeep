@@ -44,7 +44,7 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #import <stdlib.h>   // calloc / free
 #import <dlfcn.h>    // dlopen/dlsym：v2.0.18 原生前台激活用
 
-#define WCVK_BUILD_TAG "v2.0.20-roothide"
+#define WCVK_BUILD_TAG "v2.0.21-roothide"
 
 // 键盘扩展进程的精确特征：可执行文件路径以 /wxkb_plugin.appex/wxkb_plugin 结尾
 static NSString *const kKbdExtPathSuffix = @"/wxkb_plugin.appex/wxkb_plugin";

@@ -38,7 +38,7 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.20-roothide"
+#define WCVK_BUILD_TAG "v2.0.21-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC_EXIT 里 kRelaunchDelaySec
                                              // 秒后就会主动再拉，形成「杀-拉-黑」死循环。
@@ -540,43 +540,47 @@ static BOOL WPFRepairLevel3(UIWindow *w) {
            mainScene.session.persistentIdentifier ?: @"(nil)", (unsigned long)mainN,
            mainScene.windows.count ? NSStringFromClass([mainScene.windows.firstObject class]) : @"(空)");
 
+    // ⭐ v2.0.21：顺序反过来 —— 先「请系统把 main session 请上台」，
+    //   这才是「让系统别再激活 sub、改激活 main」的原生做法（v2.0.20 先销毁，而销毁在
+    //   单场景 App 上被同一道门槛挡掉，所以什么都没发生）。
+    //   销毁退到最后：只有当 main 请不上台时才拆 sub。
     UIApplication *app = [UIApplication sharedApplication];
+    UISceneSession *ms = mainScene.session;
+    WPFLog(@"L3(%d)①: 请系统激活 main session %@（= 让系统不再把 sub 当前台）",
+           gL3Attempts, ms.persistentIdentifier ?: @"(nil)");
     @try {
-        // 公开 API：请系统销毁这个 session。不传 options（不需要任何转场/快照行为）。
-        [app requestSceneSessionDestruction:bad.session options:nil errorHandler:^(NSError *e) {
-            WPFLog(@"L3: requestSceneSessionDestruction 失败: %@ (%@)", e.localizedDescription, e.domain);
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [app requestSceneSessionActivation:ms userActivity:nil options:nil errorHandler:^(NSError *e) {
+            WPFLog(@"L3① 被系统拒绝: %@ (%@)", e.localizedDescription, e.domain);
         }];
-        WPFLog(@"L3: 已请系统销毁该子场景 session");
-    } @catch (NSException *e) {
-        WPFLog(@"L3 异常: %@", e.reason);
-        return NO;
-    }
+        #pragma clang diagnostic pop
+    } @catch (NSException *e) { WPFLog(@"L3① 异常: %@", e.reason); }
 
-    // 销毁是异步的：0.9s 后若界面还没回来，再请系统激活 main session 一次
-    // （此时只剩它一个 session，"不支持多场景"的拒绝条件已经不成立）
-    NSString *mainSessionID = mainScene.session.persistentIdentifier;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         UIApplication *a = [UIApplication sharedApplication];
         UIWindow *mw = WPFMainWindow(a);
-        if (WPFHealthy(mw, YES)) { WPFLog(@"L3: 拆完子场景后界面已恢复"); return; }
-        UISceneSession *ms = mainScene.session;
-        if (!ms) {
-            for (UIScene *s in a.connectedScenes) {
-                if (![s isKindOfClass:[UIWindowScene class]]) continue;
-                if (WPFUsableWindowCount((UIWindowScene *)s) > 0) { ms = s.session; break; }
-            }
-        }
-        if (!ms) { WPFLog(@"L3: 兜底激活跳过（找不到可用的 main session）"); return; }
-        WPFLog(@"L3: 兜底——请系统激活 main session %@", ms.persistentIdentifier ?: mainSessionID ?: @"(nil)");
+        if (WPFHealthy(mw, YES)) { WPFLog(@"L3① 成功：main session 上台，界面已恢复（sceneOnStage=1）"); return; }
+
+        // ② main 请不上台 → 退一步请系统销毁那个空子场景，逼系统重新激活唯一剩下的 main
+        UISceneSession *bs = bad.session;
+        if (!bs) { WPFLog(@"L3: 子场景 session 已不存在，结束"); return; }
+        WPFLog(@"L3(%d)②: main 仍未上台，改为请系统销毁 sub session %@",
+               gL3Attempts, bs.persistentIdentifier ?: @"(nil)");
         @try {
-            #pragma clang diagnostic push
-            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            [a requestSceneSessionActivation:ms userActivity:nil options:nil errorHandler:^(NSError *e) {
-                WPFLog(@"L3 兜底激活失败: %@", e.localizedDescription);
+            [a requestSceneSessionDestruction:bs options:nil errorHandler:^(NSError *e) {
+                WPFLog(@"L3② requestSceneSessionDestruction 被拒绝: %@ (%@)", e.localizedDescription, e.domain);
             }];
-            #pragma clang diagnostic pop
-        } @catch (NSException *e) { WPFLog(@"L3 兜底激活异常: %@", e.reason); }
+        } @catch (NSException *e) { WPFLog(@"L3② 异常: %@", e.reason); }
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIApplication *a2 = [UIApplication sharedApplication];
+            if (WPFHealthy(WPFMainWindow(a2), YES)) { WPFLog(@"L3② 成功：拆掉 sub 后界面恢复"); return; }
+            WPFLog(@"L3: ①② 都没让 main 上台（scene API 仍未生效或系统不理），放弃本进程");
+            WPFDumpState(@"L3 放弃");
+        });
     });
 
     return YES;
@@ -767,6 +771,117 @@ static void WPFOnEnterBackground(void) {
     WPFLog(@"didEnterBackground: appState=%ld", (long)[UIApplication sharedApplication].applicationState);
 }
 
+// ============================================================
+// v2.0.21 ①：从源头掐掉「SubScene」这个持久化场景会话
+// ------------------------------------------------------------
+// 2026-11-07 03:37 设备取证（决定性证据）：
+//   <容器>/Library/Saved Application State/com.tencent.xin.savedState/
+//        KnownSceneSessions/data.data   （741 字节 bplist）
+//   → 里面只有一个 key：5FCC1B2B-BAF9-4EFC-8A78-14A86E333179
+//   → 值是 UISceneSession 的 NSKeyedArchiver，明确写着：
+//        _UISceneConfigurationName = "SubScene"
+//        _UISceneSessionRole       = UIWindowSceneSessionRoleApplication
+//   也就是说这个 session 的**配置名是 SubScene** → 微信
+//   application:configurationForConnectingSceneSession:options: 按配置名返回
+//   MMSubSceneDelegate（它天然不建主界面，只有一个 hidden 的 MMSubSceneWindow）。
+//   系统每次启动都把这个 session 恢复出来、并且**激活成前台** → 前台是个空场景 → 黑屏。
+//   而 scenes=1 的那 13 次正常，就是这次没恢复它。
+//   ⚠️ 这也解释了为什么它永远固定是同一个 UUID（其他 main session 每次都是新的）。
+//
+// 修法：本 dylib 的 constructor 在 UIApplicationMain **之前**执行（dyld 阶段），
+//   此时 UIKit 还没读这个文件。把带 "SubScene" 的条目删掉再写回，系统就没有可恢复的
+//   子场景，只能新建默认 session → MMMainSceneDelegate → 界面正常。
+//   原文备份 data.data.wcvk.bak（只备份一次，便于回滚）。
+static void WPFSanitizeKnownSceneSessions(void) {
+    @try {
+        NSString *home = NSHomeDirectory();
+        NSString *bid  = [NSBundle mainBundle].bundleIdentifier;
+        if (!home.length || !bid.length) { WPFLog(@"scene-session: HOME/bid 取不到，跳过"); return; }
+        NSString *dir  = [home stringByAppendingPathComponent:
+                          [NSString stringWithFormat:
+                           @"Library/Saved Application State/%@.savedState/KnownSceneSessions", bid]];
+        NSString *path = [dir stringByAppendingPathComponent:@"data.data"];
+        NSData *raw = [NSData dataWithContentsOfFile:path];
+        if (!raw.length) { WPFLog(@"scene-session: 没有 KnownSceneSessions/data.data，跳过"); return; }
+
+        NSString *bak = [path stringByAppendingString:@".wcvk.bak"];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:bak]) [raw writeToFile:bak atomically:NO];
+
+        NSError *err = nil;
+        NSPropertyListFormat fmt = 0;
+        id pl = [NSPropertyListSerialization propertyListWithData:raw
+                                                          options:NSPropertyListMutableContainersAndLeaves
+                                                           format:&fmt error:&err];
+        if (![pl isKindOfClass:[NSMutableDictionary class]]) {
+            WPFLog(@"scene-session: plist 解析失败(%@)，直接删文件让系统重建", err.localizedDescription);
+            [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+            return;
+        }
+        NSMutableDictionary *d = (NSMutableDictionary *)pl;
+        NSMutableArray *kill = [NSMutableArray array];
+        NSData *needle = [@"SubScene" dataUsingEncoding:NSUTF8StringEncoding];
+        for (NSString *k in d.allKeys) {
+            id v = d[k];
+            BOOL isSub = NO;
+            if ([v isKindOfClass:[NSData class]] && [(NSData *)v length]) {
+                NSData *vd = (NSData *)v;
+                isSub = [vd rangeOfData:needle options:0 range:NSMakeRange(0, vd.length)].location != NSNotFound;
+            }
+            WPFLog(@"scene-session: 已存在 session %@ → %@", k, isSub ? @"SubScene（删除）" : @"非 SubScene（保留）");
+            if (isSub) [kill addObject:k];
+        }
+        if (!kill.count) { WPFLog(@"scene-session: 没有 SubScene 条目，无需处理"); return; }
+        [d removeObjectsForKeys:kill];
+        NSData *out = [NSPropertyListSerialization dataWithPropertyList:d
+                                                                 format:NSPropertyListBinaryFormat_v1_0
+                                                                options:0 error:&err];
+        if (!out) { WPFLog(@"scene-session: 序列化失败(%@)", err.localizedDescription); return; }
+        if ([out writeToFile:path atomically:YES]) {
+            WPFLog(@"scene-session: 已删除 %lu 个 SubScene 会话（原 %lu 字节 → 新 %lu 字节），本次只能新建默认 session",
+                   (unsigned long)kill.count, (unsigned long)raw.length, (unsigned long)out.length);
+        } else {
+            WPFLog(@"scene-session: 写回失败（路径 %@）", path);
+        }
+    } @catch (NSException *e) { WPFLog(@"scene-session 异常: %@", e.reason); }
+}
+
+// ============================================================
+// v2.0.21 ②：绕开「当前设备不支持多个场景」这道门槛
+// ------------------------------------------------------------
+// 微信 Info.plist 里**没有** UIApplicationSceneManifest（已用 plutil 核过，grep 零命中），
+// 所以 UIKit 认为 UIApplicationSupportsMultipleScenes = NO，
+// 于是 requestSceneSessionActivation: / requestSceneSessionDestruction: 一律**同步**回调
+//   "当前设备不支持多个场景。" (UISceneErrorDomain)  ← v2.0.19 / v2.0.20 实测都是它。
+// 这就是 L3 三级全灭的原因：API 根本没执行，只在门口被拒。
+// 做法：把 UIApplication / UISceneSession / UISceneConfiguration /
+//       UIApplicationSceneManifest 上所有名字含 "MultipleScenes" 的 BOOL getter 改成返回 YES。
+//       这几个 API 才有机会真正下到系统层。
+static BOOL WPFYesIMP(id self, SEL _cmd) { return YES; }
+
+static void WPFUnlockMultiScene(void) {
+    const char *names[] = { "UIApplication", "UISceneSession",
+                            "UISceneConfiguration", "UIApplicationSceneManifest" };
+    int hacked = 0, seen = 0;
+    for (int i = 0; i < 4; i++) {
+        Class c = objc_getClass(names[i]);
+        if (!c) { WPFLog(@"multi-scene: 设备上没有类 %s", names[i]); continue; }
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(c, &n);
+        for (unsigned int j = 0; j < n; j++) {
+            NSString *sel = NSStringFromSelector(method_getName(ms[j]));
+            if ([sel rangeOfString:@"MultipleScenes" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+            seen++;
+            const char *rt = method_getTypeEncoding(ms[j]);
+            BOOL isBool = (rt && (rt[0] == 'c' || rt[0] == 'B'));
+            WPFLog(@"multi-scene: 命中 -[%s %@] 返回类型=%s%s", names[i], sel, rt ? rt : "?",
+                   isBool ? " → 改写成 YES" : "（非 BOOL，跳过）");
+            if (isBool) { method_setImplementation(ms[j], (IMP)WPFYesIMP); hacked++; }
+        }
+        free(ms);
+    }
+    WPFLog(@"multi-scene: 共命中 %d 个、改写 %d 个（改写 0 个 = 找不到门槛，scene API 仍会被拒）", seen, hacked);
+}
+
 // ⚠️ 这里必须用 `__attribute__((constructor))`，**不能用 Logos 的 %ctor**（v2.0.15 根因）：
 //   本文件历史上是 .xm + %ctor，编出来的 dylib 是**空壳** —— 实测该产物
 //   __TEXT 段只剩 Mach-O 头（16384B）、__LINKEDIT 仅 1104B、全文件只有 18 个字符串
@@ -790,6 +905,13 @@ static void WCVKPFInit(void) {
                getenv("ActivePrewarm") ?: "(null)",
                getenv("XPC_SERVICE_NAME") ?: "(null)");
         // log channel / probe 两行由 WPFWriteFile 在首次成功写入时自动补上（含每个候选的 errno）
+
+        // ★★ v2.0.21 两件必须在这里做的事（ctor 早于 UIApplicationMain）：
+        //   ① 把持久化的 SubScene 场景会话从磁盘删掉 —— UIKit 还没读，删了就不会被恢复/激活
+        //   ② 绕开「不支持多个场景」门槛 —— 否则后面的 scene API 全在门口被拒
+        WPFSanitizeKnownSceneSessions();
+        WPFUnlockMultiScene();
+
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
                         object:nil queue:[NSOperationQueue mainQueue]
