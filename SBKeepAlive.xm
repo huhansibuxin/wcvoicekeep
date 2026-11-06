@@ -73,7 +73,7 @@ static void SBLog(NSString *fmt, ...) {
 //   通道 1  open/write  —— 原始文件（保留，若沙盒放行最直观）
 //   通道 2  CFPreferences —— SB 必然有权写自己的 prefs domain
 //   通道 3  Darwin 通知 —— 由 root 的 wcvoicekeep daemon 收到后落盘（必定成功）
-#define WCVK_BUILD_TAG "v1.9.37-roothide"
+#define WCVK_BUILD_TAG "v1.9.38-roothide"
 
 // 通道 3：Darwin 通知（名字区分阶段，daemon 侧监听后写自己的日志）
 static void WCVKPostNotify(const char *name) {

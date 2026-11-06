@@ -867,6 +867,109 @@ static int pkProbe(void) {
     #undef PKLOG
 }
 
+// ===== v1.9.38：A 路线正式实现 --pk-hold =====
+// v1.9.37 的 --pk-probe 已 dump 出 PlugInKit 的真实 API（设备实证）：
+//   PKHost    : defaultHost / activatePlugIn: / readyPlugIns:...  ← 没有 beginUsingPlugIn
+//   PKManager : defaultManager / holdPlugInsInApplication:withError:
+//               forceHoldPlugIn:withError: / holdRequest:extensionPointName:platforms:flags:result:
+//               releaseHold:withError:
+// 也就是说「持有扩展（hold）」才是正规手段：hold 建立后 pkd 会让 launchd
+// 保持扩展活跃（active count>=1），不受 exit timeout=3 回收，且全程无 UI。
+// 本命令依次尝试三种 hold 入口，每种之后采样 wxkb_plugin 的 pid。
+static int pkHold(void) {
+    const char *logp = "/var/mobile/wcvk_pkhold.log";
+    FILE *fp = fopen(logp, "w");
+    if (!fp) fp = stderr;
+    #define HLOG(...) do { fprintf(fp, __VA_ARGS__); fprintf(fp, "\n"); fflush(fp); } while(0)
+
+    HLOG("=== pkHold start pid=%d uid=%d ===", getpid(), getuid());
+    void *h = dlopen("/System/Library/PrivateFrameworks/PlugInKit.framework/PlugInKit",
+                     RTLD_NOW | RTLD_GLOBAL);
+    if (!h) { HLOG("dlopen FAILED: %s", dlerror() ? dlerror() : "?"); if (fp != stderr) fclose(fp); return 1; }
+    HLOG("dlopen OK");
+
+    Class MCls = objc_getClass("PKManager");
+    if (!MCls) { HLOG("PKManager NOT FOUND"); if (fp != stderr) fclose(fp); return 2; }
+
+    id mgr = nil;
+    SEL dmSel = sel_registerName("defaultManager");
+    if ([MCls respondsToSelector:dmSel])
+        mgr = ((id (*)(id, SEL))objc_msgSend)(MCls, dmSel);
+    if (!mgr) {
+        SEL mfuSel = sel_registerName("managerForUser:");
+        if ([MCls respondsToSelector:mfuSel])
+            mgr = ((id (*)(id, SEL, int))objc_msgSend)(MCls, mfuSel, (int)getuid());
+    }
+    HLOG("PKManager instance = %s", mgr ? class_getName(object_getClass(mgr)) : "nil");
+    if (!mgr) { if (fp != stderr) fclose(fp); return 3; }
+
+    int before = procPid("wxkb_plugin");
+    HLOG("wxkb_plugin pid before = %d", before);
+
+    // --- 尝试 1：holdPlugInsInApplication:withError:（按主 App bundle id 持有其全部扩展）
+    SEL s1 = sel_registerName("holdPlugInsInApplication:withError:");
+    if ([mgr respondsToSelector:s1]) {
+        NSError *err = nil;
+        BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(mgr, s1,
+                       @"com.tencent.wetype", &err);
+        HLOG("[1] holdPlugInsInApplication(com.tencent.wetype) -> %d err=%s",
+             ok, err ? [[err description] UTF8String] : "none");
+        sleep(4);
+        HLOG("[1] after 4s wxkb_plugin=%d", procPid("wxkb_plugin"));
+    } else HLOG("[1] selector 不存在");
+
+    // 若已起来就不用再试
+    if (procPid("wxkb_plugin") > 0) {
+        HLOG("SUCCESS via holdPlugInsInApplication");
+        if (fp != stderr) fclose(fp);
+        return 0;
+    }
+
+    // --- 尝试 2：forceHoldPlugIn:withError:（直接给 identifier 字符串）
+    SEL s2 = sel_registerName("forceHoldPlugIn:withError:");
+    if ([mgr respondsToSelector:s2]) {
+        NSError *err = nil;
+        BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(mgr, s2,
+                       @"com.tencent.wetype.keyboard", &err);
+        HLOG("[2] forceHoldPlugIn(str) -> %d err=%s",
+             ok, err ? [[err description] UTF8String] : "none");
+        sleep(4);
+        HLOG("[2] after 4s wxkb_plugin=%d", procPid("wxkb_plugin"));
+    } else HLOG("[2] selector 不存在");
+
+    if (procPid("wxkb_plugin") > 0) {
+        HLOG("SUCCESS via forceHoldPlugIn(str)");
+        if (fp != stderr) fclose(fp);
+        return 0;
+    }
+
+    // --- 尝试 3：holdRequest:extensionPointName:platforms:flags:result:（异步 block）
+    SEL s3 = sel_registerName("holdRequest:extensionPointName:platforms:flags:result:");
+    if ([mgr respondsToSelector:s3]) {
+        HLOG("[3] holdRequest 存在，尝试异步调用");
+        // 用 CFRetain 保证 block 存活到回调
+        __block BOOL cbDone = NO;
+        void (^cb)(id, NSError *) = ^(id result, NSError *err) {
+            HLOG("[3] result callback: %s err=%s",
+                 result ? [[result description] UTF8String] : "nil",
+                 err ? [[err description] UTF8String] : "none");
+            cbDone = YES;
+        };
+        id blk = [cb copy];
+        ((void (*)(id, SEL, id, id, id, unsigned long long, id))objc_msgSend)(
+            mgr, s3, @"com.wcvoicekeep.kbdhold", @"com.apple.keyboard-service",
+            nil, 0ULL, blk);
+        for (int i = 0; i < 20 && !cbDone; i++) sleep(1);
+        HLOG("[3] after wait %ds wxkb_plugin=%d", 20, procPid("wxkb_plugin"));
+        [blk release];
+    } else HLOG("[3] selector 不存在");
+
+    HLOG("=== pkHold end (wxkb_plugin=%d) ===", procPid("wxkb_plugin"));
+    if (fp != stderr) fclose(fp);
+    return procPid("wxkb_plugin") > 0 ? 0 : 4;
+    #undef HLOG
+}
+
 int main(int argc, char *argv[]) {
     // 早期 stderr（不依赖 Foundation/ObjC runtime）——
     // launchd 任何阶段拒收(进程类型/entitlement/签名/sandbox)都能立刻看到，
@@ -900,6 +1003,10 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--pk-probe") == 0) {
             return pkProbe();
         }
+        // v1.9.38：--pk-hold 用 PKManager 的 hold API 正式尝试持有键盘扩展
+        if (strcmp(argv[i], "--pk-hold") == 0) {
+            return pkHold();
+        }
     }
 
     @autoreleasepool {
@@ -921,6 +1028,10 @@ int main(int argc, char *argv[]) {
         while (!gPipUp && time(NULL) - bootStart < 120) {
             @autoreleasepool { warmupOnce(); }
             if (gPipUp) break;
+            // v1.9.38：boot 阶段也要看护键盘扩展。之前只有进入 60s watch 才检查，
+            // 结果 respring 后要等 2 分钟才可能补拉（老板实测：装完杀掉扩展没反应）。
+            // watchKeyboardExtension 内部自带"扩展在跑就 skip"+失败冷却 300s，反复调安全。
+            @autoreleasepool { watchKeyboardExtension(); }
             // v1.9.20：微信 3s 点尽早拉；maybeWarmWechat 内部节流防重复
             if (!gWechatWarmed && time(NULL) - bootStart >= 3) maybeWarmWechat();
             sleep(kFastRetrySec);
