@@ -38,7 +38,7 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.22-roothide"
+#define WCVK_BUILD_TAG "v2.0.23-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC_EXIT 里 kRelaunchDelaySec
                                              // 秒后就会主动再拉，形成「杀-拉-黑」死循环。
@@ -921,23 +921,28 @@ static Class gWPFFallbackMainSceneClass = Nil;
 static IMP   gWPFOrigConfigForConnecting = NULL;
 
 static id WPFConfigForConnecting(id self, SEL _cmd, id app, id session, id options) {
+    // ⚠️ 先写一条「进入」日志再调原始实现：万一后面崩，至少能证明方法确实被调用了
+    @autoreleasepool {
+        NSString *pid = @"?";
+        @try { pid = [NSString stringWithFormat:@"%@", [session valueForKey:@"persistentIdentifier"]]; }
+        @catch (NSException *e) {}
+        WPFLog(@"scene-config: → 进入分配（session=%@）", pid);
+    }
     id cfg = nil;
     if (gWPFOrigConfigForConnecting) {
         cfg = ((id (*)(id, SEL, id, id, id))gWPFOrigConfigForConnecting)(self, _cmd, app, session, options);
     }
     @try {
-        if (!cfg) return cfg;
+        if (!cfg) { WPFLog(@"scene-config: 原始实现返回 nil"); return cfg; }
         NSString *cname = nil;
         Class dc = Nil;
         @try { cname = (NSString *)[cfg valueForKey:@"name"]; } @catch (NSException *e) {}
         @try { dc = (Class)[cfg valueForKey:@"delegateClass"]; } @catch (NSException *e) {}
         NSString *dcn = dc ? NSStringFromClass(dc) : @"(nil)";
-        NSString *pid = @"?";
-        @try { pid = (NSString *)[session valueForKey:@"persistentIdentifier"]; } @catch (NSException *e) {}
         BOOL isSub = ([dcn rangeOfString:@"SubScene" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
                      (cname && [cname rangeOfString:@"SubScene" options:NSCaseInsensitiveSearch].location != NSNotFound);
-        WPFLog(@"scene-config: 分配 session=%@ name=%@ delegate=%@ → %@",
-               pid, cname ?: @"(nil)", dcn, isSub ? @"子场景(要掰回)" : @"主场景(不动)");
+        WPFLog(@"scene-config: 分配结果 name=%@ delegate=%@ → %@",
+               cname ?: @"(nil)", dcn, isSub ? @"子场景(要掰回)" : @"主场景(不动)");
         if (isSub && gWPFFallbackMainSceneClass) {
             SEL setDC = NSSelectorFromString(@"setDelegateClass:");
             if ([cfg respondsToSelector:setDC]) {
@@ -953,34 +958,60 @@ static id WPFConfigForConnecting(id self, SEL _cmd, id app, id session, id optio
     return cfg;
 }
 
+// ⚠️⚠️ v2.0.22 首版事故复盘（2026-11-07 04:01~04:04 实机）：
+//   首版是「全类扫描 + 批量接管」——扫到 11 个类实现了该方法，把其中 9 个的 IMP 全换成
+//   同一个 WPFConfigForConnecting，但 gWPFOrigConfigForConnecting **只存了第一个类的原始实现**。
+//   于是 UIKit 真去调 MicroMessengerAppDelegate 的那个方法时，跳进去执行的是**别的类**的实现，
+//   参数语义完全对不上 → EXC_BAD_ACCESS。后果：微信启动后 1~3 秒必死，
+//   日志里从 04:01:48 起连一次 willEnterForeground 都没有（v2.0.21 时期每进程都能进前台）。
+//   ⇒ 现在只认准 MicroMessengerAppDelegate 一个类，其余（WCColorProxy / FakeTarget /
+//     MMHookUIAlertView / SwiftUI.* 等别家插件或系统类）**一律不碰**，也算顺手避免破坏别人。
+// 只取「这个类**自己**实现的方法」，绝不沿继承链拿父类的 Method。
+// ⚠️ 这是 v2.0.22 崩溃的直接教训：class_getInstanceMethod 会沿继承链返回父类的 Method，
+//   对它做 method_setImplementation 等于**改父类**，所有子类跟着遭殃。
+static Method WPFMethodOwnedByClass(Class c, SEL sel) {
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(c, &n);
+    Method found = NULL;
+    for (unsigned int i = 0; i < n; i++) {
+        if (method_getName(ms[i]) == sel) { found = ms[i]; break; }
+    }
+    if (ms) free(ms);
+    return found;
+}
+
 static void WPFForceMainScene(void) {
     Class mainCls = NSClassFromString(@"MMMainSceneDelegate");
     if (!mainCls) { WPFLog(@"scene-config: 找不到 MMMainSceneDelegate 类，跳过"); return; }
     gWPFFallbackMainSceneClass = mainCls;
 
+    Class appDel = NSClassFromString(@"MicroMessengerAppDelegate");
+    if (!appDel) { WPFLog(@"scene-config: 找不到 MicroMessengerAppDelegate，跳过"); return; }
+
     SEL sel = sel_registerName("application:configurationForConnectingSceneSession:options:");
-    int total = objc_getClassList(NULL, 0);
-    if (total <= 0) { WPFLog(@"scene-config: objc_getClassList 失败"); return; }
-    Class *all = (Class *)malloc(sizeof(Class) * (size_t)total);
-    if (!all) return;
-    total = objc_getClassList(all, (int)total);
-    NSMutableString *hits = [NSMutableString string];
-    int hooked = 0;
-    for (int i = 0; i < total; i++) {
-        Class c = all[i];
-        Method m = class_getInstanceMethod(c, sel);
-        if (!m) continue;
-        if (method_getImplementation(m) == (IMP)WPFConfigForConnecting) continue;  // 已被我们自己接管
-        NSString *cn = NSStringFromClass(c);
-        [hits appendFormat:@"%@,", cn];
-        // 只接管 App 自己的实现，UIKit/系统类不碰
-        if ([cn hasPrefix:@"UI"] || [cn hasPrefix:@"_UI"] || [cn hasPrefix:@"NS"]) continue;
-        IMP orig = method_setImplementation(m, (IMP)WPFConfigForConnecting);
-        if (!gWPFOrigConfigForConnecting) gWPFOrigConfigForConnecting = orig;
-        hooked++;
+    // 沿继承链找**真正自己拥有**这个方法的那一层（AppDelegate 通常自己实现，
+    // 若它只是继承，就动父类那一个 Method —— 而那个父类就是 UIKit 实际调用的目标）
+    Class owner = Nil;
+    Method m = NULL;
+    for (Class c = appDel; c && c != [NSObject class]; c = class_getSuperclass(c)) {
+        Method om = WPFMethodOwnedByClass(c, sel);
+        if (om) { owner = c; m = om; break; }
     }
-    free(all);
-    WPFLog(@"scene-config: 命中实现类 [%@] 已接管 %d 个", hits, hooked);
+    if (!m) {
+        WPFLog(@"scene-config: AppDelegate 继承链上没人实现 %@，跳过", NSStringFromSelector(sel));
+        return;
+    }
+    const char *te = method_getTypeEncoding(m);
+    if (!te || te[0] != '@') {
+        WPFLog(@"scene-config: %@ 的返回类型不是对象(%s)，放弃 hook 以免崩",
+               NSStringFromClass(owner), te ?: "(null)");
+        return;
+    }
+    IMP cur = method_getImplementation(m);
+    if (cur == (IMP)WPFConfigForConnecting) { WPFLog(@"scene-config: 已接管过，跳过"); return; }
+    gWPFOrigConfigForConnecting = method_setImplementation(m, (IMP)WPFConfigForConnecting);
+    WPFLog(@"scene-config: 已接管 %@ 的 scene 配置方法（orig 就是它自己的实现）",
+           NSStringFromClass(owner));
 }
 
 // ⚠️ 这里必须用 `__attribute__((constructor))`，**不能用 Logos 的 %ctor**（v2.0.15 根因）：

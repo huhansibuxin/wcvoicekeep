@@ -496,7 +496,9 @@ static const int  kRelaunchDelaySec = 1;     // 事件 -> 拉起前等 1s（尊�
 //   而且用户此刻点开微信，撞上的是刚被拉起、还没稳定的半死进程 → 「直接进微信动不了」。
 //   ⇒ 存活 < kShortLifeSec 的退出算「短命」，连击按指数退避，彻底断掉这个风暴。
 static const int  kShortLifeSec     = 60;
-static const int  kShortLifeDelay[] = {1, 5, 15, 60, 300};   // 索引 = shortLives-1，超出取末位
+static const int  kShortLifeDelay[] = {1, 5, 15, 60, 120};  // 索引 = shortLives-1，超出取末位
+// v2.0.23：上限从 300s 收到 120s —— 300s 太长，老板实测感受是「daemon 根本不拉了」。
+// 崩溃根因修掉之后短命本来就该很少，120s 足够压住风暴，又不至于长时间不出手。
 static const int  kFailCooldownSec  = 45;    // App 拉起失败后冷却，避免死循环
 static const int  kKbdDebounceSec   = 3;     // 键盘扩展只防抖 3s：拉起成功后必须能立刻再拉
 static const int  kArmRetrySecs[]   = {2, 5, 10, 20, 40};  // 拉起后找 pid 挂监视的重试点
