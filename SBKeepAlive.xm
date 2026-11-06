@@ -44,7 +44,7 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #import <stdlib.h>   // calloc / free
 #import <dlfcn.h>    // dlopen/dlsym：v2.0.18 原生前台激活用
 
-#define WCVK_BUILD_TAG "v2.0.18-roothide"
+#define WCVK_BUILD_TAG "v2.0.19-roothide"
 
 // 键盘扩展进程的精确特征：可执行文件路径以 /wxkb_plugin.appex/wxkb_plugin 结尾
 static NSString *const kKbdExtPathSuffix = @"/wxkb_plugin.appex/wxkb_plugin";
@@ -355,40 +355,35 @@ static void WCVKPrewarmNotifyCallback(CFNotificationCenterRef center, void *obse
     WCVKMarker("prewarm-ctor");
 }
 
-// ===== v2.0.18：原生「黑屏转显示」通道 =====
-// 老板 2026-11-07 02:40 定调：黑屏必须走微信原生恢复，不许我们自己在进程内硬搬窗口/
-// 硬改 windowScene（那样微信内部状态不一致，界面出来了但通讯录读不出来）。
-// 这里做的是「原生」那一步：从 SpringBoard 用 SBSLaunchApplicationWithIdentifier(bid, false)
-// 发起一次**前台激活** —— 和用户手指点图标完全同一条系统路径：
-//   SpringBoard -> 前台 scene 激活 -> app 收到 willEnterForeground/didBecomeActive
-//   -> 微信自己的生命周期代码把界面显示出来。
-// 微信侧检测到黑屏时发 com.wcvoicekeep.prewarm.reveal，这里收到就执行；同一 App 2 秒内去重。
-typedef int (*WCVKSBSLaunchFn)(CFStringRef, Boolean);
-static WCVKSBSLaunchFn gWCVKSBSLaunch = NULL;
+// ===== reveal 通道（v2.0.19 起降级为「只记录」）=====
+// v2.0.18 曾在这里用 SBSLaunchApplicationWithIdentifier(bid, false) 做前台激活，
+// 想让微信走「用户点图标」的原生路径自愈。实测判死（原因见 WCVKRevealRun 里注释）：
+// 该私有 API 在 SpringBoard 主线程同步阻塞 11 秒、rc=11 未被受理、且导致全系统卡死。
+// 现在保留通道本身（方便将来换成非阻塞方案时复用），但绝不调用任何启动 API。
 static CFAbsoluteTime gWCVKLastReveal = 0;
 
 static void WCVKRevealRun(const char *bid) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - gWCVKLastReveal < 2.0) {
-        SBLog(@"[REVEAL] 去重：2s 内已激活过，忽略");
+        SBLog(@"[REVEAL] 去重：2s 内已收到过，忽略");
         return;
     }
     gWCVKLastReveal = now;
     if (!bid || !bid[0]) bid = "com.tencent.xin";
-    if (!gWCVKSBSLaunch) {
-        void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
-                         RTLD_LAZY);
-        if (h) gWCVKSBSLaunch = (WCVKSBSLaunchFn)dlsym(h, "SBSLaunchApplicationWithIdentifier");
-        if (!gWCVKSBSLaunch) {
-            SBLog(@"[REVEAL] 取不到 SBSLaunchApplicationWithIdentifier，放弃");
-            return;
-        }
-    }
-    CFStringRef cf = CFStringCreateWithCString(NULL, bid, kCFStringEncodingUTF8);
-    // 第二个参数 false = 前台启动（原生，等同点图标）；true 才是我们后台拉起用的挂起启动
-    int rc = gWCVKSBSLaunch(cf, false);
-    SBLog(@"[REVEAL] 原生前台激活 %s rc=%d（0=已受理）", bid, rc);
-    CFRelease(cf);
+
+    // ⛔⛔ v2.0.19：**这里绝对不能调 SBSLaunchApplicationWithIdentifier**。
+    // 2026-11-07 02:58 老板实测：直接进微信后整个系统卡死，切后台都切不了，很久才闪退重启。
+    // 本机日志铁证（/var/mobile/wetypekeepalive.log）：
+    //   [18:56:46] [REVEAL] 收到原生激活请求
+    //   [18:56:56] [REVEAL] 原生前台激活 com.tencent.xin rc=11（0=已受理）
+    //   —— 中间整整 11 秒，这个私有 API 在 SpringBoard 主线程**同步阻塞**，
+    //      SpringBoard 主线程一卡，全系统就跟着卡（Home/切后台全部无响应）；
+    //      而且 rc=11 说明这次启动根本没被受理，等于白卡。
+    //      微信侧同一时刻的复查也被从 1.5s 拖到 10s（02:57:43.364 → 02:57:53.675），
+    //      两边互锁：SB 等微信响应，微信主线程在等 SB。
+    // 现在这条通道只留「收到即记录」，不做任何系统调用、不阻塞任何线程。
+    // 微信侧 v2.0.19 起也不再发这个 notify（见 WCPrewarmFix.m 的 kWPFSafeMode）。
+    SBLog(@"[REVEAL] 收到请求 %s —— v2.0.19 只记录，不调用任何启动 API（避免阻塞 SpringBoard）", bid);
 }
 
 // userInfo 里带 bundleId 就用它，不带默认微信

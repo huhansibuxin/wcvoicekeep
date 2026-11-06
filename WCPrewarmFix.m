@@ -38,11 +38,19 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.18-roothide"
+#define WCVK_BUILD_TAG "v2.0.19-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
-static BOOL const kWPFExitFallback  = NO;    // v2.0.17：不再 exit(0)。杀了微信用户更难受，
-                                             // 而且实测 L1~L4 全失败时 exit 会让 daemon 立刻再拉一次，
-                                             // 形成「杀-拉-黑-杀」死循环（v2.0.16 日志里 pid 几秒一换）。
+static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC_EXIT 里 kRelaunchDelaySec
+                                             // 秒后就会主动再拉，形成「杀-拉-黑」死循环。
+// ⛔ v2.0.19 止血开关（老板 02:58 实测「直接进微信根本动不了、切后台都切不了、卡死后闪退重启」）：
+//    v2.0.18 的两处原生尝试被我实测判死，全部关掉：
+//      ① requestSceneSessionActivation: —— 系统直接回「当前设备不支持多个场景」（微信没有
+//         Scene Manifest，是单场景 App），一次都没生效过；
+//      ② notify → SpringBoard 侧 SBSLaunchApplicationWithIdentifier —— 该私有 API 在
+//         SpringBoard 主线程同步阻塞 **11 秒**（SB 日志：收到请求 18:56:46 → rc=11 18:56:56），
+//         期间整个系统卡死、切不了后台；而 rc=11 说明这次启动根本没被受理。
+//    所以这两级在 v2.0.19 里彻底删除，微信侧不再发 notify、SpringBoard 侧不再调该 API。
+static BOOL const kWPFSafeMode      = YES;   // YES = 只做无害动作（refresh），绝不做任何可能阻塞/搬窗口的事
 static double const kWPFCheckDelay  = 1.0;   // 首次前台激活后多久检查
 static double const kWPFRetryDelay  = 1.0;   // 非 Active 态复查间隔
 static int    const kWPFRetryMax    = 6;     // 非 Active 态最多复查次数（原来的 3 次太短，
@@ -381,6 +389,30 @@ static void WPFDumpState(NSString *tag) {
     }
     WPFLog(@"scenes(%lu): %@", (unsigned long)app.connectedScenes.count, sc.length ? sc : @"(none)");
 
+    // v2.0.19：单个 scene 的细节 —— 下一步不管走哪条路，都要先知道
+    // 「两个 scene 各自的 session / 角色 / 上面有几个能显示的窗口」。
+    for (UIScene *s in app.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) {
+            WPFLog(@"  scene %p class=%@ state=%ld（非 UIWindowScene）",
+                   (__bridge void *)s, NSStringFromClass([s class]), (long)s.activationState);
+            continue;
+        }
+        UIWindowScene *ws = (UIWindowScene *)s;
+        UISceneSession *ss = ws.session;
+        unsigned long showable = 0, total = ws.windows.count;
+        NSMutableString *wn = [NSMutableString string];
+        for (UIWindow *x in ws.windows) {
+            if (!x.isHidden && x.rootViewController) showable++;
+            [wn appendFormat:@"%@%@,", NSStringFromClass([x class]), x.isHidden ? @"(hidden)" : @""];
+        }
+        WPFLog(@"  scene %p state=%ld session=%@ role=%@ delegate=%@ windows=%lu 可用=%lu [%@]",
+               (__bridge void *)ws, (long)ws.activationState,
+               ss.persistentIdentifier ?: @"(nil)",
+               ss.role ?: @"(nil)",
+               WPFClassChain(ws.delegate), total, showable,
+               wn.length ? wn : @"(空)");
+    }
+
     NSArray<UIWindow *> *wins = app.windows;
     WPFLog(@"windows(%lu):", (unsigned long)wins.count);
     for (UIWindow *w in wins) {
@@ -427,74 +459,43 @@ static BOOL WPFRepairLevel1(UIWindow *w) {
     return YES;
 }
 
-// ⭐ v2.0.18 L2：**只走原生**。
-// 老板 2026-11-07 02:40 定调：「必须调用微信原生的黑屏转显示才行」。
-// 背景：v2.0.17 用 setWindowScene: 把 iConsoleWindow 从后台 scene 硬搬到前台 scene，
-// 黑屏确实亮了（日志 healthy=1 / 非黑像素 100%），但微信内部状态不一致 ——
-// 通讯录下拉刷新后弹「系统环境可能存在异常」且好友列表变空。
-// 所以硬搬窗口这条路整个删掉，改为让**系统/微信自己**走原生激活路径，三级：
-//   ① requestSceneSessionActivation: 请求系统激活「主窗口所在的那个 UISceneSession」
-//      —— 这是 UIKit 公开 API，系统会按原生流程把该 scene 提到前台，微信照常收生命周期回调。
-//   ② requestSceneSessionRefresh:   让系统刷新该 scene，UI 由微信自己重建。
-//   ③ 发 darwin notify 给 SpringBoard 侧（com.wcvoicekeep.prewarm.reveal），
-//      由 SpringBoard 用 SBSLaunchApplicationWithIdentifier(bid, false) 做原生前台激活，
-//      等同用户用手指点图标 —— 最彻底的原生路径。
-static void WPFRevealViaSpringBoard(void) {
-    // 只发 darwin notify（不带 payload，SB 侧默认操作 com.tencent.xin）。
-    // 之所以不在这里直接调 SBSLaunchApplicationWithIdentifier：那个私有函数在沙盒 App 进程里
-    // 没有权限，必须在 SpringBoard 进程里调才合法 —— 这就是 wetypekeepalive 的职责。
-    int rc = notify_post("com.wcvoicekeep.prewarm.reveal");
-    WPFLog(@"L2③ 已请求 SpringBoard 原生前台激活 notify rc=%d", rc);
-}
-
+// ⭐ v2.0.19 L2：**只保留真正无害的那一步**。
+// v2.0.18 的两级实测判死（老板 02:58 实测：直接进微信动不了、切后台都切不了、卡死很久才闪退重启）：
+//   ① requestSceneSessionActivation: → 系统回「当前设备不支持多个场景」
+//      （微信没有 UIApplicationSceneManifest，是单场景 App），errorHandler 同步就返回，从未生效；
+//   ③ notify → SpringBoard → SBSLaunchApplicationWithIdentifier(bid, false)
+//      → SB 日志铁证：收到请求 18:56:46，rc=11 在 18:56:56 —— **主线程同步阻塞整 11 秒**，
+//        期间 SpringBoard 完全无响应（这就是「切后台都切不了」），而且 rc=11 表示启动没被受理。
+//        微信侧同一时刻的「L2 之后复查」也被从 1.5s 拖到 10s（02:57:43.364 → 02:57:53.675），
+//        说明两边互锁：SB 等微信响应，微信主线程在等 SB。
+// 所以 ①③ 整段删除，只留 ②（requestSceneSessionRefresh：纯异步、无返回值、不改任何状态）。
 static BOOL WPFRepairLevel2(UIWindow *w) {
     if (!w) { WPFLog(@"L2: 跳过（没有主窗口）"); return NO; }
-    if (gL2Attempts >= 2) { WPFLog(@"L2: 已执行 %d 次仍无效，本次跳过（防抖动）", gL2Attempts); return NO; }
+    if (gL2Attempts >= 1) { WPFLog(@"L2: 本进程已试过 %d 次，不再重复（防抖动）", gL2Attempts); return NO; }
     gL2Attempts++;
 
-    UIApplication *app = [UIApplication sharedApplication];
     UIWindowScene *owned = w.windowScene;          // 主窗口自己那个 scene（现在是后台态）
     UIWindowScene *front = WPFActiveScene();       // 系统当前认的前台 scene
-    WPFLog(@"L2(%d): 主窗口 scene=%p(state=%ld) 前台 scene=%p(state=%ld) — 只走原生，不搬窗口",
+    WPFLog(@"L2(%d): 主窗口 scene=%p(state=%ld) 前台 scene=%p(state=%ld)",
            gL2Attempts,
            (__bridge void *)owned, (long)owned.activationState,
            (__bridge void *)front, (long)front.activationState);
 
-    // ① 请系统原生激活「主窗口所属的 session」
+    // ② 让系统刷新该 scene（异步，UI 由微信自己重建）
     if (owned.session) {
         @try {
             #pragma clang diagnostic push
             #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            [app requestSceneSessionActivation:owned.session
-                                  userActivity:nil
-                                     options:nil
-                                  errorHandler:^(NSError *e) {
-                WPFLog(@"L2① requestSceneSessionActivation 失败: %@", e.localizedDescription);
-            }];
+            [([UIApplication sharedApplication]) requestSceneSessionRefresh:owned.session];
             #pragma clang diagnostic pop
-            WPFLog(@"L2① 已请求系统原生激活主窗口 session (%@)",
-                   owned.session.persistentIdentifier ?: @"(no id)");
-        } @catch (NSException *e) { WPFLog(@"L2① 异常: %@", e.reason); }
-    } else {
-        WPFLog(@"L2① 跳过（主窗口没有 session）");
-    }
-
-    // ② 让系统刷新该 scene，UI 由微信自己重建
-    if (owned) {
-        @try {
-            #pragma clang diagnostic push
-            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            [app requestSceneSessionRefresh:owned.session];
-            #pragma clang diagnostic pop
-            WPFLog(@"L2② 已请求系统刷新主窗口 scene");
+            WPFLog(@"L2② 已请求系统刷新主窗口 scene（唯一保留的安全动作）");
         } @catch (NSException *e) { WPFLog(@"L2② 异常: %@", e.reason); }
+    } else {
+        WPFLog(@"L2② 跳过（主窗口没有 session）");
     }
-
-    // ③ SpringBoard 原生前台激活（等同点图标）
-    @try { WPFRevealViaSpringBoard(); } @catch (NSException *e) { WPFLog(@"L2③ 异常: %@", e.reason); }
-
     return YES;
 }
+
 
 
 // v2.0.18：L3（重挂 rootVC + 手补 viewWillAppear/viewDidAppear）和
