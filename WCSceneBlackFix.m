@@ -8,6 +8,9 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dispatch/dispatch.h>
+#import <string.h>
+#import <stdlib.h>
 #import <sys/time.h>
 
 // ============================================================
@@ -33,13 +36,35 @@ static void (^gWCFLogHandler)(NSString *) = nil;
 
 #else
 
+/// 日志专用串行队列：所有回调（写文件 / CFPreferences / NSLog）一律离开主线程执行。
+/// 串行保证日志顺序与产生顺序一致；主线程这边只留一次很轻的字符串格式化。
+static dispatch_queue_t WCFLogQueue(void) {
+    static dispatch_queue_t q = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.wcvoicekeep.sceneblackfix.log", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
 static void WCFLog(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    if (gWCFLogHandler) gWCFLogHandler(s);
-    else NSLog(@"[SceneBlackFix] %@", s);
+    void (^h)(NSString *) = gWCFLogHandler;
+    // 调用方（比如写盘日志）抛异常绝不能顺着我们的调用栈往上炸，
+    // 我们的日志点位于 willConnect / didBecomeActive 这类主线程关键路径上。
+    dispatch_async(WCFLogQueue(), ^{
+        @autoreleasepool {
+            @try {
+                if (h) h(s);
+                else NSLog(@"[SceneBlackFix] %@", s);
+            } @catch (NSException *e) {
+                NSLog(@"[SceneBlackFix] 日志回调异常(%@)，原日志: %@", e.reason, s);
+            }
+        }
+    });
 }
 
 #endif
@@ -53,8 +78,29 @@ void WCSceneBlackFixSetRewriteConfig(BOOL on) { gWCFRewriteConfig = on; }
 
 static BOOL gWCFInstalled = NO;
 
-// 搬家前主窗口所在的 scene，兜底路径失败时回滚用
-static UIWindowScene *gWCFSavedMainScene = nil;
+// 搬家前主窗口所在的 scene，兜底路径失败时回滚用。
+// 必须是 __weak：以前是强引用，若「搬家成功但复查窗口没走到」（进程被挂起、检查被节流吞掉），
+// 这个强引用会一直攥着一个已经销毁的 UIScene，拖住它的内存。
+static __weak UIWindowScene *gWCFSavedMainScene = nil;
+
+// 搬家前主窗口自身的 hidden / alpha，回滚时一并还原 ——
+// 强制 hidden=NO alpha=1 是我们为了让窗口上屏做的，回滚就要还回去，
+// 不能把 App 自己的隐藏状态永久改掉。
+static BOOL    gWCFSavedHidden = NO;
+static CGFloat gWCFSavedAlpha  = 1.0;
+
+// 重入闸门：给 windowScene 赋值时 UIKit 可能同步回调 scene 相关方法，
+// 万一绕回 willConnect，没有闸门就会「搬家 → 回调 → 再搬家」递归。
+static BOOL gWCFInMove = NO;
+
+// 主窗口：一次精准捕获，之后全程只读缓存，零查找。
+// 以前的实现每调一次 WCFMainWindow 就遍历 app.windows + 多次 NSStringFromClass，
+// 而 willConnect / 兜底检查一个进程里会调好几次，纯属白烧 CPU。
+// 现在改成事件驱动：UIWindowDidBecomeVisibleNotification 里用强特征锁定，
+// 命中即注销观察者，此后连通知都不再收到。
+static __weak UIWindow *gWCFCachedMain = nil;
+static BOOL gWCFMainLocked = NO;          // 强特征已锁定（不再接受弱候选覆盖）
+static id   gWCFWindowObserver = nil;     // 一次性观察者 token
 
 // ============================================================
 //  窗口 / 场景工具
@@ -72,32 +118,80 @@ static UIWindowScene *WCFActiveScene(void) {
     return fallback;
 }
 
-/// 找 App 的主窗口：delegate.window → keyWindow → 扫全量挑「最像主界面」的那个。
-/// 「最像」的判据：rootVC 名含 MainFrame / TabBar 优先，否则取 Normal 层里面积最大的。
-static UIWindow *WCFMainWindow(void) {
-    UIApplication *app = [UIApplication sharedApplication];
-    id d = app.delegate;
-    if ([d respondsToSelector:@selector(window)]) {
-        UIWindow *w = nil;
-        @try { w = [d window]; } @catch (NSException *e) {}
-        if ([w isKindOfClass:[UIWindow class]]) return w;
-    }
-    UIWindow *kw = nil;
-    @try { kw = app.keyWindow; } @catch (NSException *e) {}
-    if ([kw isKindOfClass:[UIWindow class]] && kw.rootViewController) return kw;
+/// 基础门槛：是个能真正铺满屏幕的主界面窗口，不是 HUD / 键盘 / 弹窗。
+static BOOL WCFLooksLikeMainWindow(UIWindow *w) {
+    if (![w isKindOfClass:[UIWindow class]]) return NO;
+    if (!w.rootViewController) return NO;
+    if (w.windowLevel != UIWindowLevelNormal) return NO;
+    CGSize b = w.bounds.size;
+    CGSize s = [UIScreen mainScreen].bounds.size;
+    return (b.width >= s.width * 0.5 && b.height >= s.height * 0.5);
+}
 
-    UIWindow *best = nil;
-    CGFloat bestArea = 0;
-    for (UIWindow *w in app.windows) {
-        if (w.windowLevel != UIWindowLevelNormal) continue;
-        NSString *rc = w.rootViewController ? NSStringFromClass([w.rootViewController class]) : @"";
-        BOOL looksMain = [rc rangeOfString:@"MainFrame" options:NSCaseInsensitiveSearch].location != NSNotFound
-                      || [rc rangeOfString:@"TabBar" options:NSCaseInsensitiveSearch].location != NSNotFound;
-        CGFloat area = w.bounds.size.width * w.bounds.size.height;
-        if (looksMain) return w;
-        if (area > bestArea) { bestArea = area; best = w; }
+/// 强特征：rootVC 名字直接说明这是主界面（微信是 MainTabBarViewController）。
+/// 命中就永久锁定，不再让其它窗口覆盖，也不用再观察通知。
+static BOOL WCFIsStrongMainWindow(UIWindow *w) {
+    UIViewController *vc = w.rootViewController;
+    if (!vc) return NO;
+    NSString *rc = NSStringFromClass([vc class]);
+    return [rc rangeOfString:@"MainFrame" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+           [rc rangeOfString:@"TabBar"    options:NSCaseInsensitiveSearch].location != NSNotFound ||
+           [rc rangeOfString:@"Console"   options:NSCaseInsensitiveSearch].location != NSNotFound ||
+           [rc rangeOfString:@"Main"      options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+/// 捕获候选窗口。强特征命中即锁定 + 注销一次性观察者（之后零通知、零查找）。
+static void WCFCaptureWindow(UIWindow *w) {
+    if (!w || !WCFLooksLikeMainWindow(w)) return;
+    // 缓存还在就别让别的窗口覆盖；缓存已被销毁（主窗口重建）时允许重新锁定。
+    if (gWCFMainLocked && gWCFCachedMain) return;
+    BOOL strong = WCFIsStrongMainWindow(w);
+    gWCFCachedMain = w;
+    if (!strong) return;                     // 弱候选先记着，等强特征出现
+
+    gWCFMainLocked = YES;
+    if (gWCFWindowObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:gWCFWindowObserver];
+        gWCFWindowObserver = nil;
     }
-    return best;
+    WCFLog(@"主窗口已精准锁定: %@ / rootVC=%@（后续零查找、零通知）",
+           NSStringFromClass([w class]), NSStringFromClass([w.rootViewController class]));
+}
+
+/// 取主窗口。**快路径只有一次弱引用读取**，不做任何遍历、不造任何字符串。
+/// 只有缓存还没建立时才走一次 O(1) 的 delegate.window / keyWindow 直取。
+/// 注意：只允许主线程调用（UIKit 约束），本模块所有调用点都在主线程。
+static UIWindow *WCFMainWindow(void) {
+    UIWindow *cached = gWCFCachedMain;
+    if (cached && cached.rootViewController) return cached;
+
+    UIApplication *app = [UIApplication sharedApplication];
+    UIWindow *w = nil;
+    @try {
+        id d = app.delegate;
+        if ([d respondsToSelector:@selector(window)]) w = [d window];
+    } @catch (NSException *e) {}
+    if (!w) { @try { w = app.keyWindow; } @catch (NSException *e) {} }
+
+    if (w) WCFCaptureWindow(w);
+    if (gWCFCachedMain) return gWCFCachedMain;
+
+    // 只在「缓存还没建立」时走的最后一环：后台无头拉起时主窗口可能是 hidden，
+    // 不会发 UIWindowDidBecomeVisibleNotification，delegate.window / keyWindow
+    // 也可能都取不到。补一次 O(n) 遍历（微信通常只有 1~2 个窗口），命中即刻缓存，
+    // 之后仍走上面的零遍历快路径 —— 保住 v2.0.29「一定能找到主窗口」的行为。
+    @try {
+        UIWindow *fallback = nil;
+        CGFloat bestArea = 0;
+        for (UIWindow *cand in app.windows) {
+            if (!WCFLooksLikeMainWindow(cand)) continue;
+            if (WCFIsStrongMainWindow(cand)) { WCFCaptureWindow(cand); return gWCFCachedMain; }
+            CGFloat area = cand.bounds.size.width * cand.bounds.size.height;
+            if (area > bestArea) { bestArea = area; fallback = cand; }
+        }
+        if (fallback) WCFCaptureWindow(fallback);
+    } @catch (NSException *e) {}
+    return gWCFCachedMain;
 }
 
 /// 这个 scene 上有几个「真的能在屏幕上显示」的窗口 = 黑屏与否的硬判据。
@@ -153,6 +247,19 @@ static Method WCFMethodOwnedByClass(Class c, SEL sel) {
     return found;
 }
 
+/// 系统类前缀过滤，纯 C 字符串比较（全类扫描时每类都会走一次，不能有对象分配）
+static BOOL WCFNameHasSkipPrefix(const char *n) {
+    static const char *kSkip[] = {
+        "UI", "_UI", "NS", "_NS", "CA", "_CA", "Swift",
+        "Foundation", "CoreFoundation", "CF", "_CF", "OS_", "WK", "SK", "AV", NULL
+    };
+    for (int i = 0; kSkip[i]; i++) {
+        size_t len = strlen(kSkip[i]);
+        if (strncmp(n, kSkip[i], len) == 0) return YES;
+    }
+    return NO;
+}
+
 // ============================================================
 //  核心：把主窗口搬到指定 scene（纯窗口层操作）
 // ============================================================
@@ -160,62 +267,91 @@ static BOOL WCFMoveMainWindowToScene(UIWindow *main, UIWindowScene *target, BOOL
     if (!main || !target) return NO;
     UIWindowScene *from = main.windowScene;
     if (from == target) return NO;
+    if (gWCFInMove) { WCFLog(@"搬家: 重入保护，跳过（上一次搬家还没结束）"); return NO; }
 
-    WCFLog(@"搬家: 主窗口 %p 从 scene %p(state=%ld) -> 目标 scene %p(state=%ld)",
-           (__bridge void *)main,
-           (__bridge void *)from, from ? (long)from.activationState : (long)-1,
-           (__bridge void *)target, (long)target.activationState);
-    if (saveForRollback) gWCFSavedMainScene = from;
-
+    gWCFInMove = YES;
     @try {
-        main.windowScene = target;
-    } @catch (NSException *e) {
-        WCFLog(@"搬家异常: %@", e.reason);
-        if (saveForRollback) gWCFSavedMainScene = nil;
-        return NO;
-    }
+        WCFLog(@"搬家: 主窗口 %p 从 scene %p(state=%ld) -> 目标 scene %p(state=%ld)",
+               (__bridge void *)main,
+               (__bridge void *)from, from ? (long)from.activationState : (long)-1,
+               (__bridge void *)target, (long)target.activationState);
 
-    @try {
-        UIViewController *vc = main.rootViewController;
-        BOOL appeared = NO;
-        if (vc) {
-            // 官方容器转场 API：只让 VC 重走一遍「出现」流程。
-            // 少了这一步，窗口会亮但内容不重建（微信表现为通讯录空白 —— 曾经踩过）。
-            // 不是伪造 UIApplication 通知，也不是手调 viewWillAppear。
-            [vc beginAppearanceTransition:YES animated:NO];
-            appeared = YES;
+        // 记下原始状态，回滚时还原（别把 App 自己的 hidden/alpha 永久改掉）
+        gWCFSavedHidden = main.isHidden;
+        gWCFSavedAlpha  = main.alpha;
+        if (saveForRollback) gWCFSavedMainScene = from;
+
+        @try {
+            main.windowScene = target;
+        } @catch (NSException *e) {
+            WCFLog(@"搬家异常: %@", e.reason);
+            if (saveForRollback) gWCFSavedMainScene = nil;
+            return NO;
         }
-        main.hidden = NO;
-        main.alpha = 1.0;
-        [main makeKeyAndVisible];
-        [main setNeedsLayout];
-        [main layoutIfNeeded];
-        if (vc.view) {
-            vc.view.frame = main.bounds;
-            [vc.view setNeedsLayout];
-            [vc.view layoutIfNeeded];
-            [vc.view setNeedsDisplay];
+
+        @try {
+            UIViewController *vc = main.rootViewController;
+            BOOL appeared = NO;
+            if (vc) {
+                // 官方容器转场 API：只让 VC 重走一遍「出现」流程。
+                // 少了这一步，窗口会亮但内容不重建（微信表现为通讯录空白 —— 曾经踩过）。
+                // 不是伪造 UIApplication 通知，也不是手调 viewWillAppear。
+                [vc beginAppearanceTransition:YES animated:NO];
+                appeared = YES;
+            }
+            main.hidden = NO;
+            main.alpha = 1.0;
+            [main makeKeyAndVisible];
+
+            // 主窗口 layoutIfNeeded 是必须的（落地首帧）。
+            // vc.view.frame 对齐 + setNeedsDisplay 是 v2.0.29 就有的「上屏重绘」触发，
+            // 必须原样保留（少了会亮屏但内容不刷新）；只把最贵的「整棵视图树
+            // layoutIfNeeded」改成尺寸真的不一致时才做，省掉无谓的重排。
+            BOOL needResize = vc.view &&
+                !CGSizeEqualToSize(vc.view.frame.size, main.bounds.size);
+            [main setNeedsLayout];
+            [main layoutIfNeeded];
+            if (vc.view) {
+                vc.view.frame = main.bounds;
+                [vc.view setNeedsDisplay];
+                if (needResize) {
+                    [vc.view setNeedsLayout];
+                    [vc.view layoutIfNeeded];
+                }
+            }
+            if (appeared) [vc endAppearanceTransition];
+            WCFLog(@"搬家完成: 主窗口 scene=%p(state=%ld) 可用窗口=%lu",
+                   (__bridge void *)main.windowScene,
+                   main.windowScene ? (long)main.windowScene.activationState : (long)-1,
+                   (unsigned long)WCFUsableWindowCount(main.windowScene));
+        } @catch (NSException *e) {
+            WCFLog(@"搬家布局异常: %@", e.reason);
         }
-        if (appeared) [vc endAppearanceTransition];
-        WCFLog(@"搬家完成: 主窗口 scene=%p(state=%ld) 可用窗口=%lu",
-               (__bridge void *)main.windowScene,
-               main.windowScene ? (long)main.windowScene.activationState : (long)-1,
-               (unsigned long)WCFUsableWindowCount(main.windowScene));
-    } @catch (NSException *e) {
-        WCFLog(@"搬家布局异常: %@", e.reason);
+        return YES;
+    } @finally {
+        gWCFInMove = NO;
     }
-    return YES;
 }
 
 static void WCFRollbackMainScene(UIWindow *main) {
     if (!main || !gWCFSavedMainScene) return;
     WCFLog(@"搬家后仍黑，回滚主窗口到原 scene %p", (__bridge void *)gWCFSavedMainScene);
+    BOOL prevInMove = gWCFInMove;   // 保存/恢复闸门，别把外层搬家的状态踩掉
+    gWCFInMove = YES;
     @try {
         main.windowScene = gWCFSavedMainScene;
+        // 把搬家时强改的 hidden/alpha 还回去
+        main.hidden = gWCFSavedHidden;
+        main.alpha  = gWCFSavedAlpha;
+        // 回滚是失败路径，不做同步全树 layout，交给下一个 runloop
         [main setNeedsLayout];
-        [main layoutIfNeeded];
-    } @catch (NSException *e) { WCFLog(@"回滚异常: %@", e.reason); }
-    gWCFSavedMainScene = nil;
+    } @catch (NSException *e) {
+        WCFLog(@"回滚异常: %@", e.reason);
+    } @finally {
+        // 无论成功/异常都要放闸门，否则一次异常就会让后续搬家永远被重入保护挡掉
+        gWCFSavedMainScene = nil;
+        gWCFInMove = prevInMove;
+    }
 }
 
 // ============================================================
@@ -289,11 +425,12 @@ static void WCFInstallWillConnectHook(void) {
                 for (int i = 0; i < total; i++) {
                     Class c = all[i];
                     if (!c) continue;
-                    NSString *cn = NSStringFromClass(c);
-                    if (!cn.length) continue;
-                    if ([cn hasPrefix:@"UI"] || [cn hasPrefix:@"_UI"] ||
-                        [cn hasPrefix:@"NS"] || [cn hasPrefix:@"_NS"] ||
-                        [cn hasPrefix:@"CA"] || [cn hasPrefix:@"Swift"]) continue;
+                    // 用 class_getName 的 C 字符串比较，不走 NSStringFromClass：
+                    // 全类几万个，每类造一个 NSString 再 hasPrefix 会白烧几十 ms 和一堆临时对象，
+                    // 而这段代码是在 ctor 里、主线程启动路径上。
+                    const char *cn = class_getName(c);
+                    if (!cn || !cn[0]) continue;
+                    if (WCFNameHasSkipPrefix(cn)) continue;
                     [pool addObject:c];
                 }
                 free(all);
@@ -316,8 +453,24 @@ static void WCFInstallWillConnectHook(void) {
             WCFLog(@"willConnect: %@ 返回类型不是 void(%s)，跳过", NSStringFromClass(owner), te ?: "?");
             continue;
         }
-        if (method_getImplementation(m) == (IMP)WCFWillConnectHook) return;   // 已装过
-        gWCFOrigWillConnect = method_setImplementation(m, (IMP)WCFWillConnectHook);
+        // self/_cmd/scene/session/options = 5 个参数。个数不对说明不是我们以为的那个方法，
+        // 强行接管会拿到语义完全不同的参数（v2.0.22 的崩法就是这么来的）。
+        if (method_getNumberOfArguments(m) != 5) {
+            WCFLog(@"willConnect: %@ 参数个数=%u 不是 5，跳过",
+                   NSStringFromClass(owner), method_getNumberOfArguments(m));
+            continue;
+        }
+        IMP cur = method_getImplementation(m);
+        if (cur == (IMP)WCFWillConnectHook) return;   // 已装过
+        if (!cur) { WCFLog(@"willConnect: %@ 原实现为空，放弃接管", NSStringFromClass(owner)); continue; }
+        IMP orig = method_setImplementation(m, (IMP)WCFWillConnectHook);
+        if (!orig) {
+            // 装上了却拿不到 orig，立刻还原，绝不留下一个「不调原实现」的 hook
+            method_setImplementation(m, cur);
+            WCFLog(@"willConnect: %@ 取 orig 失败，已还原", NSStringFromClass(owner));
+            continue;
+        }
+        gWCFOrigWillConnect = orig;
         WCFLog(@"willConnect: 已接管 %@（orig 就是它自己的实现）", NSStringFromClass(owner));
         return;   // 只接管一个
     }
@@ -383,31 +536,61 @@ static void WCFInstallConfigHook(void) {
         WCFLog(@"scene-config: 返回类型不是对象(%s)，放弃以免崩", te ?: "(null)");
         return;
     }
-    if (method_getImplementation(m) == (IMP)WCFConfigForConnecting) return;
-    gWCFOrigConfigForConnecting = method_setImplementation(m, (IMP)WCFConfigForConnecting);
+    if (method_getNumberOfArguments(m) != 5) {
+        WCFLog(@"scene-config: 参数个数=%u 不是 5，放弃以免崩", method_getNumberOfArguments(m));
+        return;
+    }
+    IMP cur = method_getImplementation(m);
+    if (cur == (IMP)WCFConfigForConnecting) return;
+    if (!cur) { WCFLog(@"scene-config: 原实现为空，放弃接管"); return; }
+    IMP orig = method_setImplementation(m, (IMP)WCFConfigForConnecting);
+    if (!orig) {
+        method_setImplementation(m, cur);   // 同上，拿不到 orig 就还原
+        WCFLog(@"scene-config: 取 orig 失败，已还原");
+        return;
+    }
+    gWCFOrigConfigForConnecting = orig;
     WCFLog(@"scene-config: 已接管 %@ 的 scene 配置方法", NSStringFromClass(owner));
 }
 
 // ============================================================
 //  ③ 兜底：didBecomeActive 后 0.4s 结构检查
 // ============================================================
-static double const kWCFCheckDelay  = 0.4;    // 首次前台激活后多久检查
-static double const kWCFVerifyDelay = 0.35;   // 搬完多久复查
-static double const kWCFCheckThrottle = 1.0;  // 两次检查之间的最小间隔（防叠加）
-static int    const kWCFMaxFix      = 6;      // 同一进程最多修几次（用户反复点开每次都要能修）
+static double const kWCFCheckDelay     = 0.4;    // 首次前台激活后多久检查
+static double const kWCFVerifyDelay    = 0.35;   // 搬完多久复查
+static double const kWCFCheckThrottle  = 1.0;    // 两次检查之间的最小间隔（防叠加）
+static double const kWCFMainRetryDelay = 0.25;   // 主窗口还没建好时的重试间隔
+static int    const kWCFMaxFix         = 6;      // 同一进程最多修几次（用户反复点开每次都要能修）
+static int    const kWCFMainRetryMax   = 3;      // 慢启动时最多等主窗口 3 次
 
-static int    gWCFFixCount     = 0;
-static BOOL   gWCFWasHeadless  = NO;    // 本次进程是「后台无头拉起」的
-static BOOL   gWCFCheckedOnce  = NO;    // 已经做过第一次检查
-static double gWCFLastCheckAt  = 0;     // 上次检查时间（节流）
+static int    gWCFFixCount      = 0;
+static int    gWCFMainRetry     = 0;
+static BOOL   gWCFWasHeadless   = NO;    // 本次进程是「后台无头拉起」的
+static BOOL   gWCFCheckedOnce   = NO;    // 已经做过第一次检查
+static BOOL   gWCFVerifyPending = NO;    // 上一次搬家的复查还没落地，别叠加第二次
+static double gWCFLastCheckAt   = 0;     // 上次检查时间（节流）
 
 static void WCFCheck(void) {
     gWCFCheckedOnce = YES;
 
     UIApplication *app = [UIApplication sharedApplication];
     UIWindow *main = WCFMainWindow();
-    if (!main) { WCFLog(@"兜底检查: 没有主窗口，跳过"); return; }
-
+    if (!main) {
+        // 慢启动时 0.4s 那一瞬间主窗口可能还没建好。以前直接「跳过，不动」，
+        // 而 didBecomeActive 不会再来了 → 这一轮彻底漏修。改成短重试，且重试
+        // 只做一次弱引用读取，不遍历窗口。
+        if (gWCFMainRetry < kWCFMainRetryMax) {
+            gWCFMainRetry++;
+            WCFLog(@"兜底检查: 主窗口还没建好，%.2fs 后重试（%d/%d）",
+                   kWCFMainRetryDelay, gWCFMainRetry, kWCFMainRetryMax);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kWCFMainRetryDelay * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ WCFCheck(); });
+        } else {
+            WCFLog(@"兜底检查: 重试 %d 次仍没有主窗口，放弃本轮（不遍历窗口）", kWCFMainRetryMax);
+        }
+        return;
+    }
+    gWCFMainRetry = 0;
     UIWindowScene *front = WCFActiveScene();
     NSUInteger frontUsable = WCFUsableWindowCount(front);
     BOOL onStage = WCFSceneOnStage(main);
@@ -430,6 +613,10 @@ static void WCFCheck(void) {
         WCFLog(@"兜底检查: 本进程已修 %d 次，不再重复（防抖动）", gWCFFixCount);
         return;
     }
+    if (gWCFVerifyPending) {
+        WCFLog(@"兜底检查: 上次搬家的复查还没落地，跳过本轮（防止叠加搬家 + 叠加回滚）");
+        return;
+    }
     gWCFFixCount++;
 
     WCFLog(@"兜底检查: 命中黑屏（前台空场景）-> 第 %d 次搬家", gWCFFixCount);
@@ -437,8 +624,10 @@ static void WCFCheck(void) {
         WCFLog(@"兜底检查: 搬家失败");
         return;
     }
+    gWCFVerifyPending = YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kWCFVerifyDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        gWCFVerifyPending = NO;
         UIWindow *mw = WCFMainWindow();
         if (WCFHealthy(mw)) {
             gWCFSavedMainScene = nil;   // 成功就别再强持旧 scene 了
@@ -472,6 +661,22 @@ void WCSceneBlackFixInstall(void) {
     WCFInstallWillConnectHook();  // ① 核心：抢在激活前搬窗口
 
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+
+    // 一次性主窗口捕获：窗口 becomeVisible 时用强特征锁定，命中即注销观察者。
+    // 这样「找主窗口」这件事总共只发生一次，之后不再收任何窗口通知。
+    gWCFWindowObserver = [nc addObserverForName:UIWindowDidBecomeVisibleNotification
+                                         object:nil queue:[NSOperationQueue mainQueue]
+                                     usingBlock:^(NSNotification *note) {
+        id obj = note.object;
+        if ([obj isKindOfClass:[UIWindow class]]) WCFCaptureWindow((UIWindow *)obj);
+    }];
+
+    // 兼容「Install 晚于 didFinishLaunching」的接入方式（比如从别的 hook 里懒安装）：
+    // 先按当前状态兜一次底，随后 didFinishLaunching 通知仍会覆盖成更准的值。
+    @try {
+        UIApplication *app0 = [UIApplication sharedApplication];
+        gWCFWasHeadless = (app0 && app0.applicationState == UIApplicationStateBackground);
+    } @catch (NSException *e) {}
 
     // 记录本进程是不是「后台无头拉起」。只有这种进程才会出现黑屏；
     // 用户自己点图标冷启动的进程只需要第一次确认，之后不必再扫。

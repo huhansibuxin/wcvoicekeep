@@ -40,7 +40,8 @@ App 被 `SBSLaunchApplicationWithIdentifier(bid, 1)`（flag=Background）后台�
 __attribute__((constructor))
 static void Init(void) {
     // 可选：接管日志。不设置就走 NSLog。
-    WCSceneBlackFixSetLog(^(NSString *line) { NSLog(@"[SceneBlackFix] %@", line); });
+    // ⚠️ 回调在模块的后台串行队列执行：不要碰 UIKit / UIApplication，不要抛异常。
+    WCSceneBlackFixSetLog(^(NSString *line) { YourLogFunctionAsync(line); });
     // 可选：关掉 ②（只保留 ①核心 + ③兜底）。默认 YES。
     // WCSceneBlackFixSetRewriteConfig(NO);
     WCSceneBlackFixInstall();
@@ -65,6 +66,7 @@ wctweak_CFLAGS += -DWCVK_NO_LOG=$(WCVK_NO_LOG)
 正常（零黑屏）：
 
 ```
+[scene-fix] 主窗口已精准锁定: iConsoleWindow / rootVC=MainTabBarViewController（后续零查找、零通知）
 [scene-fix] willConnect: 已接管 MMMainSceneDelegate（orig 就是它自己的实现）
 [scene-fix] willConnect: 新场景 0x...(state=-1) 即将连接，主窗口在 0x... -> 抢先搬家
 [scene-fix] 搬家完成: 主窗口 scene=0x...(state=-1) 可用窗口=1
@@ -93,7 +95,23 @@ wctweak_CFLAGS += -DWCVK_NO_LOG=$(WCVK_NO_LOG)
 - `KnownSceneSessions` 文件删了没用（FBS 内存里也握一份），别走那条路。
 - `requestSceneSessionActivation/Destruction` 在无 `UIApplicationSceneManifest` 的单场景 App 上
   全部同步返回「当前设备不支持多个场景」，一次都不会生效，别走那条路。
-- **运行开销**：模块只在「后台无头拉起」的进程里持续工作；用户自己点图标冷启动的进程
-  只做第一次确认，之后完全不介入。兜底检查带 1s 节流，单次开销是遍历一遍窗口数组（微秒级）。
 - **想再砍一个 hook**：`WCSceneBlackFixSetRewriteConfig(NO)` 可以关掉 ②（配置掰回）。
   核心的 willConnect 抢先搬家不依赖它。要关的话记得实测几轮确认仍零黑屏。
+
+## 线程模型与运行开销（本轮优化后）
+
+| 项 | 做法 |
+|---|---|
+| 日志 IO | **一律异步**：模块内部串行队列 + 宿主日志队列，文件写 / CFPreferences / NSLog 全不占主线程。主线程只做一次字符串格式化，时间戳在投递前生成，日志时序仍准确 |
+| 主窗口查找 | **一次精准捕获、之后零查找**：`UIWindowDidBecomeVisibleNotification` 里用 rootVC 强特征（MainFrame/TabBar/Console/Main）锁定，命中即注销观察者；此后 `WCFMainWindow()` 快路径只是一次 `__weak` 读取，不遍历 `app.windows`、不造字符串。只有缓存尚未建立时才依次走 `delegate.window` → `keyWindow` → 一次 `app.windows` 遍历兜底（后台无头拉起时主窗口可能 hidden、不发 visible 通知，这一步保住与旧版等价的命中率），命中即缓存 |
+| 全类扫描 | 仅当微信那几个 delegate 类名都不存在时才发生，且用 `class_getName` 的 C 字符串比较，不再为每个类分配 NSString |
+| 兜底检查 | 1s 节流；非 headless 进程只确认一次；主窗口尚未建好时最多 3 次 0.25s 短重试；复查期间有互斥，不会叠加搬家/回滚 |
+| 搬家布局 | 主窗口 `layoutIfNeeded` 保留（落地首帧）；`vc.view.frame = main.bounds` + `setNeedsDisplay` 原样保留（上屏重绘，不能砍）；只把最贵的「整棵视图树 `layoutIfNeeded`」改成尺寸真的不一致时才做 |
+| 内存 | 旧 scene、主窗口缓存都是 `__weak`；回滚会还原搬家前强改的 `hidden`/`alpha` |
+
+仍留在主线程的重活只有一件：搬家时的 `layoutIfNeeded` + `begin/endAppearanceTransition`。
+这两步是公开 API 且必须同步执行（否则首帧空白 / 通讯录不重建），实测耗时约 80ms，
+发生在 `willConnect` 阶段、界面还没上屏，不会造成用户可感知的卡顿。
+
+**安全约束**：所有 UIKit 操作只走主线程（willConnect 回调、mainQueue 通知回调、dispatch_get_main_queue）。
+日志队列在后台，所以日志回调里绝不能调用 UIKit。

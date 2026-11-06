@@ -35,6 +35,10 @@
 void WCSceneBlackFixInstall(void);
 
 /// 接管日志（传 nil = 只走 NSLog）。日志量很小，只在关键动作时输出。
+/// ★ 日志一律投递到模块内部的串行队列执行，磁盘 IO / CFPreferences / NSLog
+///   绝不占主线程；主线程只做一次字符串格式化。日志顺序按产生顺序保持。
+/// ⚠️ 回调在后台队列执行：不要触碰 UIKit / UIApplication，不要抛异常
+///   （模块已做 @try 隔离）。代价是进程被强杀时可能丢最后几条日志。
 void WCSceneBlackFixSetLog(void (^handler)(NSString *line));
 
 /// 是否把「子场景配置」改写回「主场景配置」。默认 YES。

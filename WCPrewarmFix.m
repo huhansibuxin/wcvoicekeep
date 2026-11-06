@@ -36,12 +36,13 @@
 #import <sys/stat.h>
 #import <errno.h>
 #import <notify.h>
+#import <dispatch/dispatch.h>
 
 // 黑屏修复核心（独立可移植模块）：willConnect 抢先搬家 + 0.4s 兜底
 #import "WCSceneBlackFix.h"
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.29-roothide"
+#define WCVK_BUILD_TAG "v2.0.30-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = NO;    // 不再 exit(0)：daemon 的 PROC_EXIT 里 kRelaunchDelaySec
                                              // 秒后就会主动再拉，形成「杀-拉-黑」死循环。
@@ -238,6 +239,18 @@ static void WPFWriteFile(const char *line, size_t len) {
 
 #else
 
+/// 日志专用串行队列：文件写 / CFPreferences / NSLog 一律不占主线程。
+/// v2.0.29 之前 WPFLog 是同步的，一次 dump 十几行就要在主线程同步 open/write
+/// 多个候选路径 + 等 cfprefsd，正好卡在 willConnect / didBecomeActive 这些关键路径上。
+static dispatch_queue_t WPFLogQueue(void) {
+    static dispatch_queue_t q = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.wcvoicekeep.prewarm.log", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
 static void WPFLog(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -247,7 +260,9 @@ static void WPFLog(NSString *fmt, ...) {
     const char *cbody = body.UTF8String;
     if (!cbody) return;
 
-    // 时间用 POSIX，绕开 NSDateFormatter（ctor 早期不可靠）
+    // 时间用 POSIX，绕开 NSDateFormatter（ctor 早期不可靠）。
+    // 时间戳必须在投递**之前**生成并拼进整行，否则异步后日志时序会变成
+    // 「写盘时刻」，老板靠时序定位问题的证据链就废了。
     struct timeval tv;
     gettimeofday(&tv, NULL);
     struct tm tmv;
@@ -262,14 +277,24 @@ static void WPFLog(NSString *fmt, ...) {
     if (len <= 0) return;
     if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
 
-    // 通道 C：系统日志
-    NSLog(@"[WCPrewarm] %s", cbody);
+    // 拷到堆上再投递：line 是栈内存，异步块里不能引用。
+    NSString *payload = [[NSString alloc] initWithBytes:line
+                                                 length:(NSUInteger)len
+                                               encoding:NSUTF8StringEncoding];
+    if (!payload) return;
 
-    // 通道 A：文件
-    WPFWriteFile(line, (size_t)len);
-
-    // 通道 B：CFPreferences（文件全失败也有一条命）
-    WPFStoreAppend(line);
+    dispatch_async(WPFLogQueue(), ^{
+        @autoreleasepool {
+            const char *p = payload.UTF8String;   // 自带 NUL 结尾，WPFStoreAppend 需要
+            if (!p) return;
+            // 通道 C：系统日志
+            NSLog(@"[WCPrewarm] %@", body);
+            // 通道 A：文件
+            WPFWriteFile(p, strlen(p));
+            // 通道 B：CFPreferences（文件全失败也有一条命）
+            WPFStoreAppend(p);
+        }
+    });
 }
 
 #endif   // WCVK_NO_LOG
