@@ -73,7 +73,7 @@ static void SBLog(NSString *fmt, ...) {
 //   通道 1  open/write  —— 原始文件（保留，若沙盒放行最直观）
 //   通道 2  CFPreferences —— SB 必然有权写自己的 prefs domain
 //   通道 3  Darwin 通知 —— 由 root 的 wcvoicekeep daemon 收到后落盘（必定成功）
-#define WCVK_BUILD_TAG "v1.9.36-roothide"
+#define WCVK_BUILD_TAG "v1.9.37-roothide"
 
 // 通道 3：Darwin 通知（名字区分阶段，daemon 侧监听后写自己的日志）
 static void WCVKPostNotify(const char *name) {
@@ -225,6 +225,31 @@ static UIWindow *gKbdWarmWindow = nil;
 static UITextField *gKbdWarmField = nil;
 static UIWindow *gKbdPrevKeyWindow = nil;
 static BOOL gKbdWarmBusy = NO;
+static UIAlertController *gKbdAlert = nil;
+
+// ===== v1.9.37：键盘是否真的弹出来了（实测判据，不再靠猜）=====
+// v1.9.36 的日志写死了"(键盘已弹)"，但那是字符串不是检测结果，
+// 结果就分不清"键盘弹了但扩展没起"和"键盘压根没弹"。这里用系统通知做真判据。
+static BOOL gKbdDidShow = NO;
+static id   gKbdShowObs = nil;
+static id   gKbdHideObs = nil;
+
+static void KbdStartKbWatch(void) {
+    if (gKbdShowObs) return;
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    gKbdShowObs = [nc addObserverForName:UIKeyboardDidShowNotification
+                                  object:nil queue:[NSOperationQueue mainQueue]
+                              usingBlock:^(NSNotification *n) {
+        gKbdDidShow = YES;
+        SBLog(@"[KBDWARM] *** UIKeyboardDidShow 收到 = 键盘真的弹出来了");
+    }];
+    gKbdHideObs = [nc addObserverForName:UIKeyboardDidHideNotification
+                                  object:nil queue:[NSOperationQueue mainQueue]
+                              usingBlock:^(NSNotification *n) {
+        SBLog(@"[KBDWARM] *** UIKeyboardDidHide 收到");
+    }];
+    SBLog(@"[KBDWARM] keyboard show/hide observers installed");
+}
 
 static void KbdWarmupFinish(NSString *tag) {
     if (gKbdWarmField) {
@@ -232,6 +257,10 @@ static void KbdWarmupFinish(NSString *tag) {
         SBLog(@"[KBDWARM] %@ resignFirstResponder=%d", tag, ok);
         [gKbdWarmField removeFromSuperview];
         gKbdWarmField = nil;
+    }
+    if (gKbdAlert) {
+        [gKbdAlert dismissViewControllerAnimated:NO completion:nil];
+        gKbdAlert = nil;
     }
     if (gKbdWarmWindow) {
         gKbdWarmWindow.hidden = YES;
@@ -244,6 +273,48 @@ static void KbdWarmupFinish(NSString *tag) {
         SBLog(@"[KBDWARM] %@ restored prev keyWindow", tag);
         gKbdPrevKeyWindow = nil;
     }
+}
+
+// ===== v1.9.37 备选通道：UIAlertController + UITextField =====
+// 说明：SpringBoard 里自建 window 弹键盘未必被系统接受（2pt 高的窗口可能被视为
+// 不可见而不发起键盘请求）。alert 是系统标准 UI，其中的 textField 成为
+// firstResponder 后键盘必然要显示，用它来判定"SpringBoard 这个宿主能不能拉起
+// 微信键盘扩展"，两个通道的结论分开记录。
+static void KbdWarmupRunAlert(void) {
+    UIWindowScene *scene = KbdWarmScene();
+    if (!scene) { SBLog(@"[KBDWARM][ALERT] ABORT no scene"); gKbdWarmBusy = NO; return; }
+    UIWindow *host = nil;
+    for (UIWindow *w in scene.windows) {
+        if (w.isKeyWindow) { host = w; break; }
+    }
+    if (!host) host = scene.windows.firstObject;
+    if (!host) { SBLog(@"[KBDWARM][ALERT] ABORT no host window"); gKbdWarmBusy = NO; return; }
+
+    gKbdDidShow = NO;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"wcvk"
+                                                               message:@"warm"
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    __block UITextField *tf = nil;
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *t) { tf = t; }];
+    gKbdAlert = ac;
+    [host.rootViewController presentViewController:ac animated:NO completion:^{
+        BOOL became = [tf becomeFirstResponder];
+        SBLog(@"[KBDWARM][ALERT] becomeFirstResponder=%d isFirstResponder=%d", became, tf.isFirstResponder);
+    }];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        SBLog(@"[KBDWARM][ALERT] T+1.5s keyboardShown=%d wxkb_plugin_running=%d",
+              gKbdDidShow, KbdProcRunning());
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        SBLog(@"[KBDWARM][ALERT] T+4s keyboardShown=%d wxkb_plugin_running=%d",
+              gKbdDidShow, KbdProcRunning());
+        KbdWarmupFinish(@"ALERT-end");
+        gKbdWarmBusy = NO;
+        SBLog(@"[KBDWARM][ALERT] ===== end =====");
+    });
 }
 
 // 预热：建最小 window + textfield -> becomeFirstResponder 触发键盘加载
@@ -275,50 +346,69 @@ static void KbdWarmupRun(NSString *reason) {
         // 上一版为了"不干扰"设了 windowLevel = Normal-1 且不 makeKeyAndVisible，
         // 结果 UITextField 虽拿到 firstResponder，但键盘根本没被真正请求
         // （日志实证：becomeFirstResponder=1 而 wxkb_plugin_running 全程 0）。
-        // 键盘扩展只在「系统真的要显示键盘」时才会被 spawn，所以必须让窗口
-        // 可见 + 成为 key window，键盘才真的弹一次。
+        // v1.9.37 再修：窗口 2pt 高很可能被系统当作不可见、依然不发起键盘请求，
+        // 改成屏幕内正常尺寸窗口 + 文本框放在可见位置，并用 UIKeyboardDidShow
+        // 通知做实测判据（不再用写死的"(键盘已弹)"字符串冒充结论）。
+        gKbdDidShow = NO;
         UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
-        w.frame = CGRectMake(0, 0, 320, 2);          // 屏幕内、仅 2pt 高，尽量减少视觉干扰
+        w.frame = CGRectMake(20, 100, 180, 44);      // 屏幕可见区域内的小窗口
         w.windowLevel = UIWindowLevelNormal + 1;
+        w.backgroundColor = [UIColor clearColor];
         w.rootViewController = [[UIViewController alloc] init];
+        w.rootViewController.view.backgroundColor = [UIColor clearColor];
         gKbdPrevKeyWindow = [[UIApplication sharedApplication] keyWindow];
         [w makeKeyAndVisible];                        // 必须：可见且 key，键盘才会真弹
 
-        UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 2, 2)];
+        UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 160, 40)];
         tf.autocorrectionType = UITextAutocorrectionTypeNo;
         tf.spellCheckingType = UITextSpellCheckingTypeNo;
+        tf.textColor = [UIColor clearColor];          // 视觉上尽量不干扰
+        tf.tintColor = [UIColor clearColor];
+        tf.backgroundColor = [UIColor clearColor];
         tf.inputAssistantItem.leadingBarButtonGroups = @[];
         tf.inputAssistantItem.trailingBarButtonGroups = @[];
         [w.rootViewController.view addSubview:tf];
         BOOL became = [tf becomeFirstResponder];
         BOOL attached = tf.isFirstResponder;
-        SBLog(@"[KBDWARM] becomeFirstResponder=%d isFirstResponder=%d keyWindow=%@",
-              became, attached, NSStringFromClass([[w class] class]));
+        SBLog(@"[KBDWARM] becomeFirstResponder=%d isFirstResponder=%d isKeyWindow=%d",
+              became, attached, (int)w.isKeyWindow);
 
         gKbdWarmWindow = w;
         gKbdWarmField = tf;
 
-        // 350ms：只留够系统发出键盘请求并 spawn 扩展的时间，然后立刻收掉
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+        // 600ms：够系统走完键盘显示流程，用通知判据确认键盘到底弹没弹
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            SBLog(@"[KBDWARM] T+0.35s (键盘已弹) wxkb_plugin_running=%d", KbdProcRunning());
+            SBLog(@"[KBDWARM] T+0.6s keyboardShown=%d wxkb_plugin_running=%d",
+                  gKbdDidShow, KbdProcRunning());
         });
 
-        // v1.9.36：收键盘（对应"用户收起键盘"），之后扩展应靠已有连接常驻
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)),
+        // 收键盘（对应"用户收起键盘"），之后扩展应靠已有连接常驻
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            KbdWarmupFinish(@"T+0.75s");
-            SBLog(@"[KBDWARM] T+0.75s after resign wxkb_plugin_running=%d", KbdProcRunning());
+            KbdWarmupFinish(@"T+1.0s");
+            SBLog(@"[KBDWARM] T+1.0s after resign keyboardShown=%d wxkb_plugin_running=%d",
+                  gKbdDidShow, KbdProcRunning());
+            gKbdWarmBusy = NO;   // 先放开，下面 fallback 需要
         });
 
-        // 复检：验证拉起后能否常驻（老板预期：能一直活，只有内存压力才被杀）
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+        // 窗口法没弹键盘 -> 说明这个宿主不认自建窗口，换 alert 通道再验一次
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            SBLog(@"[KBDWARM] T+3s (resign+2.3s) wxkb_plugin_running=%d", KbdProcRunning());
+            BOOL running = KbdProcRunning();
+            SBLog(@"[KBDWARM] T+2.5s keyboardShown=%d wxkb_plugin_running=%d",
+                  gKbdDidShow, running);
+            if (!gKbdDidShow && !running) {
+                SBLog(@"[KBDWARM] window 法未弹键盘 -> 切 alert 通道验证 SpringBoard 宿主能力");
+                if (!gKbdWarmBusy) { gKbdWarmBusy = YES; KbdWarmupRunAlert(); }
+            }
         });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(9.0 * NSEC_PER_SEC)),
+
+        // 8s 最终判定
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            SBLog(@"[KBDWARM] T+9s (resign+8.3s) wxkb_plugin_running=%d", KbdProcRunning());
+            SBLog(@"[KBDWARM] T+8s FINAL keyboardShown=%d wxkb_plugin_running=%d",
+                  gKbdDidShow, KbdProcRunning());
             gKbdWarmBusy = NO;
             SBLog(@"[KBDWARM] ===== end =====");
         });
@@ -329,6 +419,19 @@ static void KbdWarmNotifyCallback(CFNotificationCenterRef center, void *observer
                                   CFStringRef name, const void *object,
                                   CFDictionaryRef userInfo) {
     KbdWarmupRun(@"darwin-notify");
+}
+
+// 诊断：强制走 alert 通道（一次 respring 内两条路都能验，不用重新编译）
+static void KbdWarmAlertNotifyCallback(CFNotificationCenterRef center, void *observer,
+                                       CFStringRef name, const void *object,
+                                       CFDictionaryRef userInfo) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gKbdWarmBusy) { SBLog(@"[KBDWARM][ALERT] skip, busy"); return; }
+        gKbdWarmBusy = YES;
+        SBLog(@"[KBDWARM][ALERT] ===== start (forced) wxkb_plugin_running_before=%d =====",
+              KbdProcRunning());
+        KbdWarmupRunAlert();
+    });
 }
 
 __attribute__((constructor)) static void SBKeepAliveInit(void) {
@@ -349,6 +452,19 @@ __attribute__((constructor)) static void SBKeepAliveInit(void) {
                                             CFSTR("com.wcvoicekeep.kbd.warmup"),
                                             NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
             SBLog(@"[KBDWARM] darwin notify com.wcvoicekeep.kbd.warmup registered");
+
+            // v1.9.37：装上键盘显示/隐藏通知观察者，用于判定键盘是否真弹
+            dispatch_async(dispatch_get_main_queue(), ^{
+                KbdStartKbWatch();
+            });
+
+            // 诊断通道：com.wcvoicekeep.kbd.warmup.alert 强制走 alert 通道，
+            // 便于一次 respring 内把两条路都验完（不需要重新编译）
+            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                            NULL, KbdWarmAlertNotifyCallback,
+                                            CFSTR("com.wcvoicekeep.kbd.warmup.alert"),
+                                            NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+            SBLog(@"[KBDWARM] darwin notify ....alert registered");
         }
     }
 }

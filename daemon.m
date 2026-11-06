@@ -579,6 +579,7 @@ static int tfpCheck(int pid) {
 static time_t gKbdCooldownUntil = 0;
 static BOOL   gKbdEverSeen = NO;      // 曾经见过它活着（区分"被内存杀掉"与"开机后还没用过键盘"）
 static BOOL   gKbdLastRunning = NO;
+static BOOL   gKbdStartupLogged = NO;
 
 static void watchKeyboardExtension(void) {
     BOOL running = procExists("wxkb_plugin");
@@ -592,7 +593,26 @@ static void watchKeyboardExtension(void) {
         LOG(@"kbd ext (wxkb_plugin) went DOWN (jetsam / memory pressure)");
         gKbdLastRunning = NO;
     }
-    if (!gKbdEverSeen) return;                    // 开机后从未启动过，不主动弹键盘
+    // v1.9.37 修 bug：原来这里写死 `if (!gKbdEverSeen) return;`，导致
+    // daemon 启动时扩展就已经被杀（respring / 内存压力，非常常见）就永远
+    // 不会预热——设备日志实证：10:58:23 daemon 起来时扩展已死，此后日志里
+    // kbd 相关一行都没有。改成用系统开机时长兜底：
+    //   开机不足 180s（用户还没开始用键盘）-> 不主动弹，避免开机就弹键盘；
+    //   开机超过 180s 却看不到扩展 -> 说明它被杀了，直接补拉。
+    if (!gKbdEverSeen) {
+        struct timeval bt;
+        size_t bsz = sizeof(bt);
+        int bmib[2] = {CTL_KERN, KERN_BOOTTIME};
+        if (sysctl(bmib, 2, &bt, &bsz, NULL, 0) != 0) return;
+        long up = (long)(time(NULL) - bt.tv_sec);
+        if (up < 180) {
+            if (!gKbdStartupLogged) {
+                gKbdStartupLogged = YES;
+                LOG(@"kbd ext absent & uptime=%lds<180 -> hold (boot phase)", up);
+            }
+            return;
+        }
+    }
     if (gLocked) {                                 // 锁屏不弹
         return;
     }
@@ -659,6 +679,15 @@ static int kbdWarmTrigger(void) {
     return st == 0 ? 0 : 1;
 }
 
+// v1.9.37：--kbd-alert 强制走 alert 通道（SpringBoard 用 UIAlertController+textField
+// 弹键盘），用于一次 respring 内对比"自建窗口"和"系统 alert"两条路谁能拉起扩展。
+static int kbdAlertTrigger(void) {
+    uint32_t st = notify_post("com.wcvoicekeep.kbd.warmup.alert");
+    fprintf(stderr, "[WCVK-KBDALERT] notify_post(....alert) -> %u (0=ok)\n", st);
+    fflush(stderr);
+    return st == 0 ? 0 : 1;
+}
+
 // v1.9.35：--kbd-warm-test —— 一次跑完给出完整结论的实验
 // 目的：老板要的是「键盘扩展被杀后能否被无头拉起并留存」，而无需反复 SSH 采样。
 // 流程：记录基线 -> post 预热通知（SB 侧建 UIKit 文本框触发键盘请求）
@@ -716,6 +745,128 @@ static int dlopenTest(const char *path) {
     return 1;
 }
 
+// ===== v1.9.37：A 路线探测 --pk-probe（PlugInKit）=====
+// 背景：wxkb_plugin 是 launchd 托管的 Extension（type=Extension，
+// extension point=com.apple.keyboard-service），kickstart 三域全部
+// 102 Operation not supported。唯一正规入口是向 pkd 申领服务连接
+// （PlugInKit：PKHost/PKManager 的 beginUsing*）。连接一建立，
+// launchd 会把扩展拉起来且 active count>=1 让它常驻，全程无 UI。
+//
+// 本探测不猜签名：先把 PlugInKit 的类与 selector 全量 dump 到文件，
+// 再按存在的 selector 尝试调用，把 pid 变化打出来。
+static int pkProbe(void) {
+    const char *logp = "/var/mobile/wcvk_pkprobe.log";
+    FILE *fp = fopen(logp, "w");
+    if (!fp) fp = stderr;
+    #define PKLOG(...) do { fprintf(fp, __VA_ARGS__); fprintf(fp, "\n"); fflush(fp); } while (0)
+
+    PKLOG("=== pkProbe start pid=%d uid=%d ===", getpid(), getuid());
+
+    const char *paths[] = {
+        "/System/Library/PrivateFrameworks/PlugInKit.framework/PlugInKit",
+        "/rootfs/System/Library/PrivateFrameworks/PlugInKit.framework/PlugInKit",
+        "/usr/lib/libpkd.dylib",
+        NULL
+    };
+    void *h = NULL;
+    const char *used = NULL;
+    for (int i = 0; paths[i]; i++) {
+        h = dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL);
+        if (h) { used = paths[i]; break; }
+        PKLOG("dlopen FAILED %s -> %s", paths[i], dlerror() ? dlerror() : "?");
+    }
+    if (!h) { PKLOG("ABORT: PlugInKit 无法加载"); if (fp != stderr) fclose(fp); return 1; }
+    PKLOG("dlopen OK: %s handle=%p", used, h);
+
+    // 枚举该镜像内的类
+    unsigned int ncls = 0;
+    const char **names = objc_copyClassNamesForImage(used, &ncls);
+    PKLOG("classes in image: %u", ncls);
+    if (names) {
+        for (unsigned i = 0; i < ncls; i++) PKLOG("  class %s", names[i]);
+        free(names);
+    }
+
+    // dump 关键类的 selector
+    const char *want[] = {"PKHost", "PKManager", "PKPlugin", "PKPlugInCore",
+                          "PKHostPlugIn", "PKService", "PKDiscoveryDriver", NULL};
+    for (int i = 0; want[i]; i++) {
+        Class cls = objc_getClass(want[i]);
+        if (!cls) { PKLOG("--- class %s NOT FOUND", want[i]); continue; }
+        PKLOG("--- class %s (%p)", want[i], cls);
+        unsigned int n = 0;
+        Method *m = class_copyMethodList(object_getClass(cls), &n);
+        for (unsigned k = 0; k < n; k++)
+            PKLOG("   + %s", sel_getName(method_getName(m[k])));
+        free(m);
+        m = class_copyMethodList(cls, &n);
+        for (unsigned k = 0; k < n; k++)
+            PKLOG("   - %s", sel_getName(method_getName(m[k])));
+        free(m);
+    }
+
+    // 尝试拿到 host 单例（不同 iOS 版本入口不同，全部试一遍）
+    id host = nil;
+    const char *hostSel[] = {"defaultHost", "sharedHost", "defaultManager",
+                             "sharedManager", NULL};
+    Class hostCls = objc_getClass("PKHost");
+    Class mgrCls  = objc_getClass("PKManager");
+    for (int i = 0; hostSel[i]; i++) {
+        SEL s = sel_registerName(hostSel[i]);
+        if (hostCls && [hostCls respondsToSelector:s]) {
+            host = ((id (*)(id, SEL))objc_msgSend)(hostCls, s);
+            PKLOG("[PKHost %s] -> %s", hostSel[i], host ? class_getName(object_getClass(host)) : "nil");
+            if (host) break;
+        }
+        if (mgrCls && [mgrCls respondsToSelector:s]) {
+            host = ((id (*)(id, SEL))objc_msgSend)(mgrCls, s);
+            PKLOG("[PKManager %s] -> %s", hostSel[i], host ? class_getName(object_getClass(host)) : "nil");
+            if (host) break;
+        }
+    }
+    if (!host) { PKLOG("no host singleton found -> A 路线需另行确认入口"); if (fp != stderr) fclose(fp); return 2; }
+
+    // 尝试 beginUsing 各种变体（签名不猜：先用 respondsToSelector 过滤）
+    NSString *bid = @"com.tencent.wetype.keyboard";
+    NSString *extPoint = @"com.apple.keyboard-service";
+    int before = procPid("wxkb_plugin");
+    PKLOG("wxkb_plugin pid before = %d", before);
+
+    SEL cand[] = {
+        sel_registerName("beginUsingPlugIn:error:"),
+        sel_registerName("beginUsingPlugIn:options:error:"),
+        sel_registerName("beginUsingPlugIn:instanceInfo:error:"),
+        sel_registerName("pluginForIdentifier:error:"),
+        sel_registerName("pluginForExtensionPoint:"),
+        sel_registerName("pluginsForExtensionPoint:")
+    };
+    for (unsigned i = 0; i < sizeof(cand)/sizeof(cand[0]); i++) {
+        BOOL r = [host respondsToSelector:cand[i]];
+        PKLOG("host respondsTo %s = %d", sel_getName(cand[i]), r);
+    }
+
+    // 只对 beginUsingPlugIn:error: 做真实尝试（最常见签名）
+    SEL bSel = sel_registerName("beginUsingPlugIn:error:");
+    if ([host respondsToSelector:bSel]) {
+        NSError *err = nil;
+        id res = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(host, bSel, bid, &err);
+        PKLOG("beginUsingPlugIn(%s) -> %s err=%s", [bid UTF8String],
+              res ? class_getName(object_getClass(res)) : "nil",
+              err ? [[err description] UTF8String] : "none");
+        sleep(4);
+        int after = procPid("wxkb_plugin");
+        PKLOG("wxkb_plugin pid after = %d (was %d)", after, before);
+    } else {
+        PKLOG("SKIP beginUsingPlugIn:error: (selector 不存在)");
+        (void)extPoint;
+    }
+
+    PKLOG("=== pkProbe end ===");
+    if (fp != stderr) fclose(fp);
+    return 0;
+    #undef PKLOG
+}
+
 int main(int argc, char *argv[]) {
     // 早期 stderr（不依赖 Foundation/ObjC runtime）——
     // launchd 任何阶段拒收(进程类型/entitlement/签名/sandbox)都能立刻看到，
@@ -737,9 +888,17 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--kbd-warm-test") == 0) {
             return kbdWarmTest();
         }
+        // v1.9.37：--kbd-alert 强制走 alert 通道验证宿主能力
+        if (strcmp(argv[i], "--kbd-alert") == 0) {
+            return kbdAlertTrigger();
+        }
         // v1.9.34：--dlopen-test <path> 验证 tweak dylib 能否被加载
         if (strcmp(argv[i], "--dlopen-test") == 0 && i + 1 < argc) {
             return dlopenTest(argv[i + 1]);
+        }
+        // v1.9.37：--pk-probe 探测 PlugInKit（A 路线：建持久服务连接）
+        if (strcmp(argv[i], "--pk-probe") == 0) {
+            return pkProbe();
         }
     }
 
