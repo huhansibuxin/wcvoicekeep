@@ -345,6 +345,15 @@ static void WCVKNotifyCallback(CFNotificationCenterRef center, void *observer,
     }
 }
 
+// 微信侧 wcprewarmfix.dylib 的 ctor 探针回调（见 WCVKInit 里的注册说明）。
+// 只写一行日志，不做任何其它动作，零副作用。
+static void WCVKPrewarmNotifyCallback(CFNotificationCenterRef center, void *observer,
+                                      CFStringRef name, const void *object,
+                                      CFDictionaryRef userInfo) {
+    SBLog(@"[PREWARM] ctor reached —— 微信侧 wcprewarmfix.dylib 已注入并执行");
+    WCVKMarker("prewarm-ctor");
+}
+
 __attribute__((constructor))
 static void WCVKInit(void) {
     WCVKMarker("ctor");
@@ -357,4 +366,14 @@ static void WCVKInit(void) {
                                     CFSTR("com.wcvoicekeep.kbd.warmup"),
                                     NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     SBLog(@"[KBDWARM] darwin notify com.wcvoicekeep.kbd.warmup registered");
+
+    // ★ 微信侧 wcprewarmfix.dylib 的「我被执行了」探针（v2.0.14）。
+    //   微信是沙盒 App，它的日志写不写得出来受容器/权限影响，这条走 darwin notify 完全
+    //   不碰文件系统：只要 wcprewarmfix 的 %ctor 跑到，这里就一定落一行 [PREWARM]。
+    //   有这行 = dylib 确实被注入并执行；没这行 = 注入链路本身没走通。
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                    NULL, WCVKPrewarmNotifyCallback,
+                                    CFSTR("com.wcvoicekeep.prewarm.ctor"),
+                                    NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    SBLog(@"[KBDWARM] prewarm probe registered (com.wcvoicekeep.prewarm.ctor)");
 }

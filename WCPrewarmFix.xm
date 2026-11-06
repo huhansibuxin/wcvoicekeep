@@ -33,8 +33,12 @@
 #import <string.h>
 #import <fcntl.h>
 #import <sys/time.h>
+#import <sys/stat.h>
+#import <errno.h>
+#import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
+#define WCVK_BUILD_TAG "v2.0.14-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
 static BOOL const kWPFExitFallback  = YES;   // L1~L4 全失败时 exit(0) 兜底
 static double const kWPFCheckDelay  = 1.0;   // 首次前台激活后多久检查
@@ -46,51 +50,106 @@ static BOOL gHandled       = NO;   // 已经做过一次检查/修复
 static BOOL gEnteredFG     = NO;   // 已经进过前台
 static int  gRepairLevel   = 0;    // 实际生效的修复级别（0=没修）
 
-// ===== 日志 =====
-// v2.0.12 修的三处致命缺陷（老板实测「日志一条都没写进去、Filza 里也找不到文件」）：
-//   ① 用 NSSearchPathForDirectoriesInDomains + NSFileHandle —— %ctor 阶段 Foundation 还没就绪，
-//      取到的路径可能是 nil 或无效值；
-//   ② `static NSString *p` 把**第一次取到的路径永久缓存** —— 第一次拿到错路径，之后全写错地方；
-//   ③ createFileAtPath: 的返回值完全没检查，fileHandleForWritingAtPath 拿不到就静默 return ——
-//      整条链路没有任何痕迹，所以既没文件也没报错。
-// 现在：
-//   ① 纯 POSIX open/write/close + strftime 拼时间，完全不依赖 Foundation 是否就绪；
-//   ② 候选路径按序试（第一顺位 getenv("HOME")，进程一启动就有，沙盒根最可靠），
-//      只缓存**真正 open 成功**的那条；写入失败立刻清缓存，下次重新试全部候选；
-//   ③ 每次写同时 NSLog 一份 —— 文件万一写不进去，还能用系统日志捞（log show）。
+// ===== 日志（v2.0.14）=====
+// 老板连续三次反馈「日志还是没有」。照 wctweak 的 WCPLLogger 对比，我旧版差在三个地方：
+//   ① wctweak 写在 Library/Application Support/WCPL/，**故意避开 Documents** ——
+//      微信的 DiskUsage 磁盘扫描会把 Documents 下的文件搬进 tmp/DiskScanTrash 再整批清掉
+//      （wctweak 自己的日志里抓到过这一幕），所以「写进去了又找不到」是常态；
+//   ② wctweak 用 NSFileManager **先 createDirectory** 再写，我旧版直接往可能不存在的
+//      子目录里 open，失败还静默 return，一点痕迹都不留；
+//   ③ wctweak 除了文件还有持久化兜底，我旧版文件写不进去就彻底失明。
+//
+// 现在四通道全开，任一条走通就能看到内容：
+//   A 文件  $HOME/Library/Application Support/WCVK/wcprewarm.log   ← 主通道（微信不扫，最先看这个）
+//           + Documents / tmp / Library/Caches / Library/Preferences 兜底
+//   B CFPreferences  suite com.wcvoicekeep.prewarmlog ← 走 cfprefsd 服务，沙盒下最稳，
+//           落盘在容器 Library/Preferences/com.wcvoicekeep.prewarmlog.plist（plutil 可读）
+//   C NSLog
+//   D darwin notify 探针（ctor 第一条就 post）→ SpringBoard 侧 wetypekeepalive 收到后写
+//     /var/mobile/wetypekeepalive.log。这条**完全不依赖微信沙盒写文件**，
+//     用来回答「dylib 到底有没有被执行」这个前置问题。
+//
+// ctor 里第一条日志会带上 `probe=` 段：HOME 值 + 每个候选的 open 结果/errno，
+// 万一哪条都写不进去，这行会先落进 CFPreferences，照样能查到失败原因。
 static char gLogPath[PATH_MAX] = {0};   // 空 = 还没找到可写路径
+static char gProbeReport[1024] = {0};   // 首次路径探测结论（写进 prefs 备查）
+
+static void WPFMkdirParents(const char *path) {
+    char dir[PATH_MAX];
+    strlcpy(dir, path, sizeof(dir));
+    char *slash = strrchr(dir, '/');
+    if (!slash || slash == dir) return;
+    *slash = 0;
+    for (char *p = dir + 1; *p; p++) {
+        if (*p == '/') { *p = 0; mkdir(dir, 0755); *p = '/'; }
+    }
+    mkdir(dir, 0755);
+}
 
 static const char *WPFLogPath(void) {
     if (gLogPath[0]) return gLogPath;
 
-    char cand[8][PATH_MAX];
+    char cand[10][PATH_MAX];
     int n = 0;
-    const char *home = getenv("HOME");
+
+    // HOME 优先，拿不到再退回 getenv（两条都记下来，方便排查沙盒根异常）
+    // ⚠️ homeNS 必须活到函数结束：fileSystemRepresentation 返回的是它内部 buffer 的指针，
+    //    在 @try 块内声明会让它提前释放 → 悬垂指针（这类坑比路径写错更难查）。
+    __attribute__((objc_precise_lifetime)) NSString *homeNS = nil;
+    __attribute__((objc_precise_lifetime)) NSString *tmpNS = nil;
+    @try { homeNS = NSHomeDirectory(); } @catch (NSException *e) {}
+    const char *home = homeNS.length ? homeNS.fileSystemRepresentation : NULL;
+    if (!home || !home[0]) home = getenv("HOME");
+
     if (home && home[0]) {
+        // ① 主通道：Application Support（微信不扫、系统低存储时也不清）
+        snprintf(cand[n++], PATH_MAX, "%s/Library/Application Support/WCVK/wcprewarm.log", home);
+        // ② 常用位置
         snprintf(cand[n++], PATH_MAX, "%s/Documents/wcprewarm.log", home);
         snprintf(cand[n++], PATH_MAX, "%s/tmp/wcprewarm.log", home);
         snprintf(cand[n++], PATH_MAX, "%s/Library/Caches/wcprewarm.log", home);
+        snprintf(cand[n++], PATH_MAX, "%s/Library/Preferences/wcprewarm.txt", home);
+        // ③ 微信自己的日志目录（一定存在）
+        snprintf(cand[n++], PATH_MAX, "%s/Documents/log/wcprewarm.log", home);
     }
-    @try {
-        NSArray *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        if (d.count) {
-            const char *u = [d[0] UTF8String];
-            if (u && u[0]) snprintf(cand[n++], PATH_MAX, "%s/wcprewarm.log", u);
-        }
-        const char *t = NSTemporaryDirectory().UTF8String;
+    @try { tmpNS = NSTemporaryDirectory(); } @catch (NSException *e) {}
+    {
+        const char *t = tmpNS.length ? tmpNS.fileSystemRepresentation : NULL;
         if (t && t[0]) snprintf(cand[n++], PATH_MAX, "%s/wcprewarm.log", t);
-    } @catch (NSException *e) {}
+    }
     snprintf(cand[n++], PATH_MAX, "/var/mobile/wcprewarm.log");   // 沙盒外兜底（一般写不进，聊胜于无）
 
+    size_t rl = snprintf(gProbeReport, sizeof(gProbeReport), "home=%s", (home && home[0]) ? home : "(null)");
     for (int i = 0; i < n; i++) {
+        WPFMkdirParents(cand[i]);
         int fd = open(cand[i], O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd >= 0) {
-            close(fd);
-            strlcpy(gLogPath, cand[i], PATH_MAX);
-            return gLogPath;
+        int err = errno;
+        if (fd >= 0) { close(fd); }
+        if (rl < sizeof(gProbeReport) - 200) {
+            const char *tail = strrchr(cand[i], '/');
+            rl += snprintf(gProbeReport + rl, sizeof(gProbeReport) - rl,
+                           " |%s=%s%d", tail ? tail + 1 : cand[i], fd >= 0 ? "ok/" : "E", fd >= 0 ? 0 : err);
         }
+        if (fd >= 0 && !gLogPath[0]) strlcpy(gLogPath, cand[i], PATH_MAX);   // 只缓存第一条成功的
     }
-    return NULL;
+    return gLogPath[0] ? gLogPath : NULL;
+}
+
+// 通道 B：CFPreferences（cfprefsd 服务，沙盒 app 写自己容器 Preferences 一定成功）
+static void WPFStoreAppend(const char *line) {
+    static BOOL sOff = NO;
+    if (sOff || !line) return;
+    @try {
+        CFStringRef appID = CFSTR("com.wcvoicekeep.prewarmlog");
+        CFStringRef key   = CFSTR("log");
+        CFStringRef old   = CFPreferencesCopyAppValue(key, appID);
+        NSString *cur = old ? (__bridge_transfer NSString *)old : @"";
+        if (cur.length > 20000) cur = [cur substringFromIndex:cur.length - 16000];
+        NSString *nv = [cur stringByAppendingString:[NSString stringWithUTF8String:line]];
+        if (!nv) return;
+        CFPreferencesSetAppValue(key, (__bridge CFStringRef)nv, appID);
+        if (!CFPreferencesAppSynchronize(appID)) sOff = YES;
+    } @catch (NSException *e) { sOff = YES; }
 }
 
 static void WPFLog(NSString *fmt, ...) {
@@ -101,9 +160,6 @@ static void WPFLog(NSString *fmt, ...) {
     if (!body) return;
     const char *cbody = body.UTF8String;
     if (!cbody) return;
-
-    // 系统日志兜底：即使文件写不进去，log show 也能捞到
-    NSLog(@"[WCPrewarm] %s", cbody);
 
     // 时间用 POSIX，绕开 NSDateFormatter（ctor 早期不可靠）
     struct timeval tv;
@@ -120,17 +176,28 @@ static void WPFLog(NSString *fmt, ...) {
     if (len <= 0) return;
     if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
 
+    // 通道 C：系统日志
+    NSLog(@"[WCPrewarm] %s", cbody);
+
+    // 通道 A：文件
     const char *path = WPFLogPath();
-    if (!path) return;
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0) { gLogPath[0] = 0; return; }      // 路径失效（容器变了/文件被删）→ 下次重试全部候选
-    size_t off = 0, total = (size_t)len;
-    while (off < total) {
-        ssize_t w = write(fd, line + off, total - off);
-        if (w <= 0) break;
-        off += (size_t)w;
+    if (path) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            size_t off = 0, total = (size_t)len;
+            while (off < total) {
+                ssize_t w = write(fd, line + off, total - off);
+                if (w <= 0) break;
+                off += (size_t)w;
+            }
+            close(fd);
+        } else {
+            gLogPath[0] = 0;   // 路径失效（容器变了/文件被删）→ 下次重试全部候选
+        }
     }
-    close(fd);
+
+    // 通道 B：CFPreferences（文件全失败也有一条命）
+    WPFStoreAppend(line);
 }
 
 // ===== 工具 =====
@@ -401,15 +468,20 @@ static void WPFOnEnterBackground(void) {
 
 %ctor {
     @autoreleasepool {
-        // v2.0.12：ctor 里就把「日志到底写去哪」交代清楚（同时 NSLog 一份），
-        // 万一文件写不进去，log show 里也能直接看到 HOME 和选中的路径。
-        WPFLog(@"==== WCPrewarmFix inject (pid=%d) ====", getpid());
+        // ★ 通道 D：第一件事就告诉 SpringBoard「我被加载并执行了」。
+        //   darwin notify 不经过文件系统，沙盒写不写得出东西都跟它无关，
+        //   所以它是「dylib 到底有没有被 dlopen 进来」的唯一硬证据：
+        //   wetypekeepalive（SB 侧）收到会写 /var/mobile/wetypekeepalive.log 的 [PREWARM] ctor reached。
+        notify_post("com.wcvoicekeep.prewarm.ctor");
+
+        WPFLog(@"==== WCPrewarmFix inject (pid=%d build=%s) ====", getpid(), WCVK_BUILD_TAG);
         WPFLog(@"env: HOME=%s ActivePrewarm=%s XPC=%s",
                getenv("HOME") ?: "(null)",
                getenv("ActivePrewarm") ?: "(null)",
                getenv("XPC_SERVICE_NAME") ?: "(null)");
         const char *lp = WPFLogPath();
-        WPFLog(@"log path = %s", lp ? lp : "(全部候选都写不进去！)");
+        WPFLog(@"log channel: file=%s", lp ? lp : "(全部候选写不进)");
+        WPFLog(@"log probe: %s", gProbeReport[0] ? gProbeReport : "(未探测)");
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
                         object:nil queue:[NSOperationQueue mainQueue]
