@@ -38,18 +38,27 @@
 #import <notify.h>
 
 // ===== 配置（先写死，实测后再按需做成 plist 开关）=====
-#define WCVK_BUILD_TAG "v2.0.16-roothide"
+#define WCVK_BUILD_TAG "v2.0.17-roothide"
 static BOOL const kWPFEnable        = YES;   // 总开关
-static BOOL const kWPFExitFallback  = YES;   // L1~L4 全失败时 exit(0) 兜底
+static BOOL const kWPFExitFallback  = NO;    // v2.0.17：不再 exit(0)。杀了微信用户更难受，
+                                             // 而且实测 L1~L4 全失败时 exit 会让 daemon 立刻再拉一次，
+                                             // 形成「杀-拉-黑-杀」死循环（v2.0.16 日志里 pid 几秒一换）。
 static double const kWPFCheckDelay  = 1.0;   // 首次前台激活后多久检查
-static double const kWPFRetryDelay  = 1.5;   // 兜底前最后复查延迟
+static double const kWPFRetryDelay  = 1.0;   // 非 Active 态复查间隔
+static int    const kWPFRetryMax    = 6;     // 非 Active 态最多复查次数（原来的 3 次太短，
+                                             // 日志里 10814 就是复查 2 次进程就换掉了）
+static int    const kWPFCheckMax    = 8;     // 同一进程内最多做几次完整检查（节流用）
 
 // ===== 运行状态 =====
 static BOOL gWasHeadless   = NO;   // 本次进程是后台无头启动的
-static BOOL gHandled       = NO;   // 已经做过一次检查/修复
 static BOOL gEnteredFG     = NO;   // 已经进过前台
 static int  gRepairLevel   = 0;    // 实际生效的修复级别（0=没修）
-static int  gCheckRetries  = 0;    // 非 Active 态复查次数（v2.0.16）
+static int  gCheckRetries  = 0;    // 非 Active 态复查次数
+static int  gCheckCount    = 0;    // 本进程已做过的检查次数
+static double gLastCheckAt = 0;    // 上次检查的绝对时间（节流）
+static UIWindow *gTakeoverWindow = nil;   // L2c 新建的接管窗口（必须强引用，否则立刻释放）
+static int  gL1Attempts = 0;       // L1 实际执行次数（防抖动，同一进程最多 2 次）
+static int  gL2Attempts = 0;       // L2 实际执行次数
 
 // ===== 日志（v2.0.14）=====
 // 老板连续三次反馈「日志还是没有」。照 wctweak 的 WCPLLogger 对比，我旧版差在三个地方：
@@ -345,6 +354,21 @@ static BOOL WPFSnapshotBlank(UIWindow *w) {
     return blank;
 }
 
+// ⭐ v2.0.17 核心修正：统一的「健康」判据。
+// v2.0.16 的致命 bug：判定黑屏用「alive && sceneOnStage」，修完复查却只查 alive。
+// 于是 L1 做完（makeKeyAndVisible 对挂错 scene 的窗口完全无效）复查 alive 依旧 =1，
+// 立刻打印「*** 修复成功，生效级别 L1 ***」并终止链条 —— 真正能治病的 L2 永远跑不到。
+// v2.0.16 实机日志（pid 10819 / 10823）两次都是这个剧本：修完 sceneOnStage 还是 0。
+static BOOL WPFHealthy(UIWindow *w, BOOL wantSnapshot) {
+    if (!WPFWindowAlive(w)) return NO;
+    if (!WPFSceneOnStage(w)) return NO;
+    // 快照只在 Active 态有意义；Inactive/Background 下离屏渲染本来就是空的
+    if (wantSnapshot && [UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
+        if (WPFSnapshotBlank(w)) return NO;
+    }
+    return YES;
+}
+
 // 全量状态 dump（诊断核心：黑屏那一刻微信内部到底是什么样）
 static void WPFDumpState(NSString *tag) {
     UIApplication *app = [UIApplication sharedApplication];
@@ -381,7 +405,15 @@ static void WPFDumpState(NSString *tag) {
 // 返回 YES = 这一级做过了（是否真修好由调用方复查）
 static BOOL WPFRepairLevel1(UIWindow *w) {
     if (!w) return NO;
-    WPFLog(@"L1: makeKeyAndVisible + 强制 layout + hidden 抖动");
+    if (gL1Attempts >= 2) { WPFLog(@"L1: 已执行 %d 次，本次跳过（防抖动）", gL1Attempts); return NO; }
+    // v2.0.17：窗口没挂在台上的话，makeKeyAndVisible 不但没用，还会把 keyWindow 抢掉
+    // （v2.0.16 日志里 key 从 1 变 0 就是这个），直接交给 L2 处理。
+    if (!WPFSceneOnStage(w)) {
+        WPFLog(@"L1: 跳过（窗口 scene 不在台上，makeKeyAndVisible 无意义）→ 交给 L2");
+        return NO;
+    }
+    gL1Attempts++;
+    WPFLog(@"L1(%d): makeKeyAndVisible + 强制 layout + hidden 抖动", gL1Attempts);
     @try {
         [w makeKeyAndVisible];
         w.hidden = YES;
@@ -396,26 +428,73 @@ static BOOL WPFRepairLevel1(UIWindow *w) {
     return YES;
 }
 
+// ⭐ v2.0.17 L2 重写：这是黑屏的唯一确定病根对应的修法。
+// v2.0.16 日志铁证（pid 10823）：
+//   scenes(2): 0x11dd08f90(state=0 前台)  0x118a367e0(state=2 后台)
+//     MMSubSceneWindow hidden=1 rootVC=(nil)   挂在前台 scene  ← 空壳
+//     iConsoleWindow   hidden=0 rootVC=MainTabBarViewController  挂在后台 scene  ← 真正的界面在这
+// 前台 scene 上一个能显示的窗口都没有 → 用户看到纯黑。
+// 三级手段按序试：改 windowScene → 改私有 ivar → 新建窗口把 rootVC 搬过去接管。
 static BOOL WPFRepairLevel2(UIWindow *w) {
     UIWindowScene *scene = WPFActiveScene();
     if (!w || !scene) { WPFLog(@"L2: 跳过（window 或前台 scene 缺失）"); return NO; }
-    if (w.windowScene == scene) { WPFLog(@"L2: 已经是目标 scene，跳过"); return NO; }
-    WPFLog(@"L2: 把 %@ 绑到 %@", NSStringFromClass([w class]), NSStringFromClass([scene class]));
-    BOOL ok = NO;
+    if (gL2Attempts >= 2 && !gTakeoverWindow) { WPFLog(@"L2: 已执行 %d 次仍无效，本次跳过（防抖动）", gL2Attempts); return NO; }
+    if (w.windowScene == scene && WPFSceneOnStage(w)) {
+        WPFLog(@"L2: 已经在前台 scene，跳过");
+        return NO;
+    }
+    gL2Attempts++;
+    WPFLog(@"L2: 把 %@ 从 %p(state=%ld) 迁到前台 scene %p(state=%ld)",
+           NSStringFromClass([w class]),
+           (__bridge void *)w.windowScene, (long)w.windowScene.activationState,
+           (__bridge void *)scene, (long)scene.activationState);
+
+    // ① 公开/半公开 setter
     @try {
         if ([w respondsToSelector:NSSelectorFromString(@"setWindowScene:")]) {
             ((void (*)(id, SEL, id))objc_msgSend)(w, NSSelectorFromString(@"setWindowScene:"), scene);
-            ok = YES;
-        } else {
-            [w setValue:scene forKey:@"windowScene"];   // KVC 走私有 ivar，兜底
-            ok = YES;
         }
-    } @catch (NSException *e) { WPFLog(@"L2 异常: %@", e.reason); }
-    if (ok) {
+    } @catch (NSException *e) { WPFLog(@"L2① 异常: %@", e.reason); }
+    if (w.windowScene == scene) {
+        WPFLog(@"L2① 成功（setWindowScene:）");
         @try { [w makeKeyAndVisible]; [w layoutIfNeeded]; } @catch (NSException *e) {}
+        return YES;
     }
-    return ok;
+
+    // ② KVC 打私有 ivar
+    for (NSString *key in @[@"windowScene", @"_windowScene"]) {
+        @try { [w setValue:scene forKey:key]; } @catch (NSException *e) { }
+        if (w.windowScene == scene) {
+            WPFLog(@"L2② 成功（KVC %@）", key);
+            @try { [w makeKeyAndVisible]; [w layoutIfNeeded]; } @catch (NSException *e) {}
+            return YES;
+        }
+    }
+    WPFLog(@"L2①② 都改不动 windowScene，改走 L2③ 新建接管窗口");
+
+    // ③ 新建一个绑在前台 scene 的窗口，把主窗口的 rootVC 搬过来
+    UIViewController *vc = w.rootViewController;
+    if (!vc) { WPFLog(@"L2③ 跳过（主窗口没有 rootViewController，没东西可搬）"); return NO; }
+    @try {
+        if (gTakeoverWindow) { gTakeoverWindow.hidden = YES; gTakeoverWindow = nil; }
+        UIWindow *nw = [[UIWindow alloc] initWithWindowScene:scene];
+        nw.frame = scene.coordinateSpace.bounds;
+        nw.windowLevel = UIWindowLevelNormal;
+        nw.backgroundColor = [UIColor blackColor];
+        nw.rootViewController = vc;          // re-parent：vc.view 会从旧窗口移除
+        nw.hidden = NO;
+        [nw makeKeyAndVisible];
+        [nw layoutIfNeeded];
+        gTakeoverWindow = nw;
+        WPFLog(@"L2③ 已新建接管窗口 %p(rootVC=%@) 挂到前台 scene", (__bridge void *)nw,
+               NSStringFromClass([vc class]));
+        return YES;
+    } @catch (NSException *e) {
+        WPFLog(@"L2③ 异常: %@", e.reason);
+        return NO;
+    }
 }
+
 
 static BOOL WPFRepairLevel3(UIWindow *w) {
     if (!w) return NO;
@@ -452,13 +531,22 @@ static BOOL WPFRepairLevel4(void) {
 // 逐级修复：每级做完等一会儿复查，修好立即停
 static void WPFRepairChain_(int level);
 
+// 当前应该修/检查的目标窗口：L2③ 建过接管窗口就用它，否则用微信主窗口
+static UIWindow *WPFTargetWindow(UIApplication *app) {
+    if (gTakeoverWindow && WPFWindowAlive(gTakeoverWindow)) return gTakeoverWindow;
+    return WPFMainWindow(app);
+}
+
 static void WPFCheckAfterRepair(UIApplication *app, int nextLevel, int doneLevel) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        UIWindow *w = WPFMainWindow(app);
+        UIWindow *w = WPFTargetWindow(app);
         BOOL alive = WPFWindowAlive(w);
-        WPFLog(@"复查(L%d 之后): alive=%d", doneLevel, alive ? 1 : 0);
-        if (alive) {
+        BOOL staged = WPFSceneOnStage(w);
+        BOOL ok = WPFHealthy(w, YES);       // ★ 判据必须和「判定黑屏」时一致，否则永远假成功
+        WPFLog(@"复查(L%d 之后): alive=%d sceneOnStage=%d healthy=%d",
+               doneLevel, alive ? 1 : 0, staged ? 1 : 0, ok ? 1 : 0);
+        if (ok) {
             gRepairLevel = doneLevel;
             WPFLog(@"*** 修复成功，生效级别 L%d ***", doneLevel);
             WPFDumpState(@"修复后");
@@ -467,15 +555,13 @@ static void WPFCheckAfterRepair(UIApplication *app, int nextLevel, int doneLevel
         if (nextLevel > 4) {
             WPFLog(@"*** L1~L4 全部无效 ***");
             WPFDumpState(@"修复失败");
-            if (!kWPFExitFallback) { WPFLog(@"exitFallback 关闭，保持现状"); return; }
-            // 最后再给一次机会：有些 App 是把界面重建排到下一个 runloop 之后的
+            WPFLog(@"exitFallback=%d（v2.0.17 默认关，保持现状等下次前台再试）", kWPFExitFallback ? 1 : 0);
+            if (!kWPFExitFallback) return;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kWPFRetryDelay * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                UIWindow *w2 = WPFMainWindow(app);
-                BOOL alive2 = WPFWindowAlive(w2);
-                WPFLog(@"最终复查: alive=%d", alive2 ? 1 : 0);
-                if (alive2) { WPFLog(@"自己好了，不退出"); return; }
-                WPFLog(@"!!! 界面确实起不来，exit(0) 让下次打开走冷启动 !!!");
+                UIWindow *w2 = WPFTargetWindow(app);
+                if (WPFHealthy(w2, YES)) { WPFLog(@"最终复查: 已恢复，不退出"); return; }
+                WPFLog(@"!!! 界面确实起不来，exit(0) !!!");
                 WPFDumpState(@"退出前");
                 exit(0);
             });
@@ -487,7 +573,7 @@ static void WPFCheckAfterRepair(UIApplication *app, int nextLevel, int doneLevel
 
 static void WPFRepairChain_(int level) {
     UIApplication *app = [UIApplication sharedApplication];
-    UIWindow *w = WPFMainWindow(app);
+    UIWindow *w = WPFTargetWindow(app);
     BOOL did = NO;
     switch (level) {
         case 1: did = WPFRepairLevel1(w); break;
@@ -504,36 +590,44 @@ static void WPFDoCheck(NSString *reason) {
     UIApplication *app = [UIApplication sharedApplication];
     // 快照判定必须在 Active 态做：v2.0.15 日志里每次「1s 后检查」时 appState 已经从
     // Active(0) 掉回 Inactive(1)，这时候离屏渲染本来就是空的，判黑没有意义。
-    if (app.applicationState != UIApplicationStateActive && gCheckRetries < 3) {
+    if (app.applicationState != UIApplicationStateActive && gCheckRetries < kWPFRetryMax) {
         gCheckRetries++;
-        WPFLog(@"检查(%@): appState=%ld 非 Active，%.1fs 后复查（第 %d 次）",
-               reason, (long)app.applicationState, kWPFRetryDelay, gCheckRetries);
+        WPFLog(@"检查(%@): appState=%ld 非 Active，%.1fs 后复查（第 %d/%d 次）",
+               reason, (long)app.applicationState, kWPFRetryDelay, gCheckRetries, kWPFRetryMax);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kWPFRetryDelay * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ WPFDoCheck(reason); });
         return;
     }
 
-    UIWindow *w = WPFMainWindow(app);
+    UIWindow *w = WPFTargetWindow(app);
     BOOL alive  = WPFWindowAlive(w);
     BOOL staged = WPFSceneOnStage(w);
-    WPFLog(@"检查(%@): mainWindow=%@ alive=%d sceneOnStage=%d appState=%ld", reason,
-           w ? NSStringFromClass([w class]) : @"(nil)", alive ? 1 : 0, staged ? 1 : 0,
-           (long)app.applicationState);
+    WPFLog(@"检查(%@): mainWindow=%@ alive=%d sceneOnStage=%d appState=%ld 已检查%d次/生效L%d",
+           reason, w ? NSStringFromClass([w class]) : @"(nil)", alive ? 1 : 0, staged ? 1 : 0,
+           (long)app.applicationState, gCheckCount, gRepairLevel);
     WPFDumpState(reason);
-    // 结构健康但 scene 不在台上（或压根没 scene）→ 一定是黑的，先修 scene
-    if (!alive || !staged) {
-        WPFLog(@"判定黑屏（结构/scene）-> 开始 L1~L4 逐级修复");
+
+    // 窗口结构都不成立 → 从 L1 起
+    if (!alive) {
+        WPFLog(@"判定黑屏（窗口结构不成立）-> L1~L4");
         WPFRepairChain_(1);
+        return;
+    }
+    // ⭐ 结构完全健康、只是没挂在台上 → L1 无意义，直接从 L2 起
+    if (!staged) {
+        WPFLog(@"判定黑屏（窗口挂在非前台 scene）-> 直接从 L2 起修");
+        WPFRepairChain_(2);
         return;
     }
     // 结构和 scene 都像样，最后用像素定死：真没画面才动
     if (WPFSnapshotBlank(w)) {
-        WPFLog(@"判定黑屏（快照无画面）-> 开始 L1~L4 逐级修复");
+        WPFLog(@"判定黑屏（快照无画面）-> L1~L4");
         WPFRepairChain_(1);
         return;
     }
     WPFLog(@"界面确认为正常，本次不修");
 }
+
 
 // ===== 生命周期埋点 =====
 static void WPFOnDidFinishLaunching(void) {
@@ -557,15 +651,31 @@ static void WPFOnWillEnterForeground(void) {
 
 static void WPFOnDidBecomeActive(void) {
     UIApplication *app = [UIApplication sharedApplication];
-    WPFLog(@"didBecomeActive: appState=%ld headless=%d handled=%d",
-           (long)app.applicationState, gWasHeadless, gHandled);
-    if (!kWPFEnable || !gWasHeadless || gHandled) return;
-    // 只处理「后台无头拉起 → 第一次真正进前台」这一次
+    WPFLog(@"didBecomeActive: appState=%ld headless=%d 已检查%d次/生效L%d",
+           (long)app.applicationState, gWasHeadless, gCheckCount, gRepairLevel);
+    if (!kWPFEnable || !gWasHeadless) return;
+    // ⭐ v2.0.17：以前这里是 `gHandled` 一次性闸门 —— 只有进程的「第一次」前台激活会检查，
+    // 之后所有 didBecomeActive 直接 return。可黑屏恰恰发生在用户后续点开的时候：
+    // v2.0.16 日志里 pid 10806 后面 6 次 `handled=1` 的激活全部零检查，等于毫无保护。
+    // 现在每次真前台激活都给一次机会，只做节流（间隔 1s、每进程最多 kWPFCheckMax 次）。
     if (app.applicationState != UIApplicationStateActive) return;
-    gHandled = YES;
-    WPFLog(@"首次前台激活，%.1fs 后检查界面健康度", kWPFCheckDelay);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kWPFCheckDelay * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ WPFDoCheck(@"首次前台激活"); });
+    if (gCheckCount >= kWPFCheckMax) {
+        WPFLog(@"本进程检查次数已满（%d），不再检查", gCheckCount);
+        return;
+    }
+    struct timeval tv; gettimeofday(&tv, NULL);
+    double now = tv.tv_sec + tv.tv_usec / 1e6;
+    if (gLastCheckAt > 0 && now - gLastCheckAt < 1.0) {
+        WPFLog(@"激活过于频繁（%.2fs），跳过本次检查", now - gLastCheckAt);
+        return;
+    }
+    gLastCheckAt = now;
+    gCheckCount++;
+    gCheckRetries = 0;
+    double delay = (gCheckCount == 1) ? kWPFCheckDelay : 0.35;   // 首次等界面建好，后续快速复核
+    WPFLog(@"前台激活 #%d，%.2fs 后检查界面健康度", gCheckCount, delay);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ WPFDoCheck(@"前台激活"); });
 }
 
 static void WPFOnEnterBackground(void) {
