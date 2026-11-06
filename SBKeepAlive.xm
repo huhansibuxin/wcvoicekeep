@@ -21,7 +21,14 @@
 #import <objc/runtime.h>
 #import <UIKit/UIKit.h>
 #import <sys/sysctl.h>
-#import <libproc.h>
+// iOS SDK 没有 macOS 的 libproc.h —— 只声明用到的两个 libproc 函数（iOS 上在 libSystem 里）
+#include <stdint.h>
+#ifndef PROC_PIDPATHINFO_MAXSIZE
+#define PROC_PIDPATHINFO_MAXSIZE 4096
+#endif
+extern int proc_listallpids(void *buffer, int buffersize);
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+
 #import <string.h>
 #import <fcntl.h>
 #import <unistd.h>
