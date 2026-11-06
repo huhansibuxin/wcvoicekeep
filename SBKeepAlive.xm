@@ -395,16 +395,9 @@ static void WCVKRevealRun(const char *bid) {
 static void WCVKRevealNotifyCallback(CFNotificationCenterRef center, void *observer,
                                      CFStringRef name, const void *object,
                                      CFDictionaryRef userInfo) {
-    const char *bid = "com.tencent.xin";
-    char buf[256] = {0};
-    if (userInfo) {
-        CFStringRef v = CFDictionaryGetValue(userInfo, CFSTR("bid"));
-        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
-            if (CFStringGetCString(v, buf, sizeof(buf), kCFStringEncodingUTF8)) bid = buf;
-        }
-    }
-    SBLog(@"[REVEAL] 收到原生激活请求 bid=%s", bid);
-    WCVKRevealRun(bid);
+    // 微信侧只发裸 notify（不带 payload），目标固定是微信
+    SBLog(@"[REVEAL] 收到原生激活请求");
+    WCVKRevealRun("com.tencent.xin");
 }
 
 __attribute__((constructor))
