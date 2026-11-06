@@ -80,9 +80,7 @@ static const char    *const kTriggerName = "com.wcvoicekeep.pip.trigger"; // 与
 static const char    *const kPipBuiltName = "com.wcvoicekeep.pip.built";  // dylib->daemon：PiP 已建
 static const int    kBootDelaySec     = 1;        // v1.9.20：1s（原 3s），注销后尽早开始预热
 static const int    kCheckIntervalSec = 60;       // 守护轮询
-// v1.9.42：键盘扩展专用轮询间隔。15s 太慢（老板实测第三次杀后等很久），
-// 5s 让"被杀 -> 发现 -> 拉起"控制在 ~6s 内；检查只是 sysctl 快照，不写盘。
-static const int    kKbdPollSec       = 5;
+// v1.9.42：键盘扩展不再用轮询间隔（改事件驱动，见 armKbdProcWatch）
 static const int    kFastRetrySec     = 5;        // 预热快循环间隔（锁屏期重试）
 static const int    kPipWaitTimeoutSec = 15;      // 等 dylib 报 pip.built 超时
 static const int    kKillStaleSec     = 25;       // 进程在跑但迟迟无 pip.built -> kill 重试（锁屏僵尸）
