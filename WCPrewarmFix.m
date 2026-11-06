@@ -354,7 +354,7 @@ static void WPFDumpState(NSString *tag) {
 
     NSMutableString *sc = [NSMutableString string];
     for (UIScene *s in app.connectedScenes) {
-        [sc appendFormat:@"%p(state=%ld) ", (void *)s, (long)s.activationState];
+        [sc appendFormat:@"%p(state=%ld) ", (__bridge void *)s, (long)s.activationState];
     }
     WPFLog(@"scenes(%lu): %@", (unsigned long)app.connectedScenes.count, sc.length ? sc : @"(none)");
 
@@ -367,7 +367,7 @@ static void WPFDumpState(NSString *tag) {
         WPFLog(@"  win %@ hidden=%d alpha=%.2f level=%.1f frame=%.0fx%.0f key=%d scene=%p/sceneState=%ld rootVC=%@ viewInWin=%d subviews=%lu",
                NSStringFromClass([w class]), (int)w.isHidden, w.alpha, w.windowLevel,
                w.bounds.size.width, w.bounds.size.height, w.isKeyWindow ? 1 : 0,
-               (void *)ws, ws ? (long)ws.activationState : (long)-1,
+               (__bridge void *)ws, ws ? (long)ws.activationState : (long)-1,
                vcs, (vc && vc.view.window == w) ? 1 : 0,
                (unsigned long)(vc ? vc.view.subviews.count : 0));
     }
