@@ -281,7 +281,12 @@ static id   gKbdShowObs = nil;
 static id   gKbdHideObs = nil;
 
 // v1.9.42：Darwin 通知（SB 侧要主动回报 daemon），notify.h 在这个 SDK 里不全，手动声明
+// .xm 按 ObjC++ 编译，必须 extern "C"，否则链接期符号带 C++ 修饰找不到
+#ifdef __cplusplus
+extern "C" uint32_t notify_post(const char *name);
+#else
 extern uint32_t notify_post(const char *name);
+#endif
 static BOOL gKbdOkPosted = NO;      // 本次预热是否已回报"成功"给 daemon
 
 // v1.9.42：这两个函数定义在后面（键盘隐藏 / 成功回报），前面多处引用，先声明
