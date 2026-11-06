@@ -15,8 +15,9 @@ concurrency:
 jobs:
   build:
     name: build (${{ matrix.variant }}-${{ matrix.flavor }})
-    # macos-14 于 2026-11 被 GitHub 下线，改用现役 macos-15 镜像
-    runs-on: macos-15
+    # 老板要求：改用 macOS 英特尔（x86_64）机器 —— macos-15/14 都是 Apple Silicon，
+    # 夜间排队严重、机器池小不够用；macos-13 是 Intel 池，可用机器更多。
+    runs-on: macos-13
     strategy:
       fail-fast: false
       matrix:
