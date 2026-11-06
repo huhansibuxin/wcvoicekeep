@@ -903,7 +903,7 @@ static void WCVKRebuildTargets(void) {
             if ([skip containsIndex:i]) continue;
             WCVKTarget *t = snapshot[i];
             int pid = (k < pids.count) ? pids[k++].intValue : 0;
-            unsigned gen = gens[i].unsignedValue;
+            unsigned gen = gens[i].unsignedIntValue;
             if (!WCVKTargetValid(t, gen)) continue;   // 重建/取消/关闭后旧结果一律作废
             if (pid > 0) WCVKArmPid(t, pid);
             else WCVKArmRetry(t, gen, 0);
