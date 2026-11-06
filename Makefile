@@ -48,6 +48,15 @@ wcvoicekeep_FRAMEWORKS = Foundation MobileCoreServices
 wcvoicekeep_CODESIGN_FLAGS = -S$(THEOS_PROJECT_DIR)/entitlements.plist
 wcvoicekeep_CFLAGS = -fobjc-arc -fno-modules -w -DWCVK_NO_LOG=$(WCVK_NO_LOG)
 
+# ===== 注入微信侧：后台预热黑屏 诊断 + 四级修复（2.0.9）=====
+# TrollFools 注入 com.tencent.xin（也可随 deb 装到 DynamicLibraries，靠 wcprewarmfix.plist 限定只注入微信）
+# 目的：daemon 后台拉起微信后点开黑屏 —— 从 App 内部检查主窗口健康度并逐级修复
+wcprewarmfix_FILES = WCPrewarmFix.xm
+wcprewarmfix_FRAMEWORKS = UIKit Foundation
+wcprewarmfix_LDFLAGS = -Wl,-no_warn_inits -F$(THEOS_PROJECT_DIR)/Frameworks -framework CydiaSubstrate
+wcprewarmfix_CFLAGS = -fobjc-arc -fno-modules -w
+TWEAK_NAME = wetypekeepalive wcprewarmfix
+
 include $(THEOS_MAKE_PATH)/tweak.mk
 include $(THEOS_MAKE_PATH)/tool.mk
 
