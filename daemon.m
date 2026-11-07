@@ -1,4 +1,4 @@
-// wcvoicekeep daemon — v2.0.32「只负责拉起」
+// wcvoicekeep daemon — v2.0.33「只负责拉起」
 //
 // 职责（老板 2026-11-07 定案）：本工程**不再注入任何 App 进程**，daemon 只做两件事：
 //   1) 键盘扩展 wxkb_plugin —— 必须保活（不可关闭、永不熔断）。它一退出，发 Darwin 通知
@@ -7,10 +7,20 @@
 //      flag=Background，不切前台）。
 //   每次拉起写一条记录（log/pure 都写，受设置里的记录开关控制）。
 //
-// ★ 拉起语义一个数没动（老板 2026-11-07 定案，禁止再改）：
-//   任何 EXIT 事件 -> 固定 1s 立刻拉起，不引入任何指数退避；
+// ★ 拉起语义（老板 2026-11-07 定案）：
+//   键盘扩展 EXIT -> 固定 1s 立刻拉起（输入法必需项，不引入任何指数退避）；
+//   用户勾选的 App EXIT -> 5s 后再拉（v2.0.33 新增，见下方说明）；
 //   键盘 3s 防抖、App 失败 15s 冷却、连续 3 次失败熔断（**键盘豁免**）、
 //   拉起后 1.5s 按真实 pid 校验、失败按 5s/15s 重试两次、挂监视重试 2/5/10/20/40s。
+//
+// ===== v2.0.33：用户勾选的 App 退出后等 5s 再拉（老板 2026-11-07）=====
+//   原来 EXIT 事件固定 1s 拉起（键盘/App 共用 kRelaunchDelaySec）。现在拆成两档：
+//     · App  -> kAppRelaunchDelaySec = 5，退出后等 5s 才 SBSLaunch；
+//     · 键盘 -> 仍 1s 不变（wxkb_plugin 是输入法必需项，慢 5s 键盘就等于废了）。
+//   只改「退出事件 -> 拉起」这一个等待；15s 冷却 / 熔断 / 1.5s 校验 /
+//   5s·15s 重试 / 挂监视重试链一个数没动。
+//   daemon 启动 / 设置重建时「目标不在运行主动补拉」不走 EXIT 事件，也不延迟。
+//   5s 等待期间若设置里取消勾选或改了 gen，WCVKTargetValid 会直接作废回调，不会误拉。
 //
 // ===== v2.0.32：拉起记录改写到固定 /var/mobile（老板 2026-11-07）=====
 //   旧实现用 WCVKExistingPrefsDir() 推导记录路径，实机选中的是
@@ -549,7 +559,8 @@ static void WCVKScanTargetsSync(const WCVKScanSpec *specs, int n, int *outPids) 
 }
 
 // ===== 目标 =====
-static const int kRelaunchDelaySec = 1;      // EXIT -> 固定 1s，绝不退避
+static const int kRelaunchDelaySec    = 1;   // 键盘扩展 EXIT -> 1s（保活必需，绝不退避）
+static const int kAppRelaunchDelaySec = 5;   // ★ v2.0.33：用户勾选的 App EXIT -> 5s 后再拉
 static const int kShortLifeSec     = 60;     // 仅用于日志措辞，不影响延迟
 static const int kFailCooldownSec  = 15;
 static const int kKbdDebounceSec   = 3;
@@ -686,12 +697,14 @@ static void WCVKArmPid(WCVKTarget *t, int pid) {
     dispatch_source_set_event_handler(src, ^{
         WCVKTarget *st = wt;
         if (!st || st.gen != gen) return;
-        // 纯事件驱动：任何退出 -> 固定 1s 立刻拉起（短命只做日志统计，绝不改延迟）
+        // 纯事件驱动：键盘 EXIT -> 1s 立刻拉起；用户勾选的 App EXIT -> 5s 后再拉。
+        // 短命只做日志统计、绝不改延迟；冷却/熔断/校验/重试链一个数没动。
+        int delay = WCVKIsKbd(st) ? kRelaunchDelaySec : kAppRelaunchDelaySec;
         time_t life = (st.armedAt > 0) ? (time(NULL) - st.armedAt) : -1;
         if (!WCVKIsKbd(st) && life >= 0 && life < kShortLifeSec) {
             st.shortLives++;
-            LOG(@"### %@ (pid=%d) 退出（只活了 %lds，累计短命 %d 次）-> %ds 后立刻拉起",
-                st.display, st.pid, (long)life, st.shortLives, kRelaunchDelaySec);
+            LOG(@"### %@ (pid=%d) 退出（只活了 %lds，累计短命 %d 次）-> %ds 后拉起",
+                st.display, st.pid, (long)life, st.shortLives, delay);
         } else if (st.shortLives > 0) {
             LOG(@"### %@ 这次活了 %lds -> 短命计数清零（原连击 %d 次）",
                 st.display, (long)life, st.shortLives);
@@ -700,7 +713,7 @@ static void WCVKArmPid(WCVKTarget *t, int pid) {
         st.armedAt = 0;
         st.pid = 0;                               // 缓存失效
         if (st.src) { dispatch_source_cancel(st.src); st.src = nil; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRelaunchDelaySec * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                        WCVKQueue(), ^{
             if (!WCVKTargetValid(st, gen)) return;
             WCVKDoRelaunch(st, gen);               // ★ 只拉起；挂监视交给校验/kbd.up，不再重复
