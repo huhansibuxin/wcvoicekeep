@@ -1,4 +1,14 @@
-// wcvoicekeep daemon — v2.0.34「开机/注销错峰拉起 + 卸载清理 + 熔断重置」
+// wcvoicekeep daemon — v2.0.35「prefs 真值统一到设置页 plist」
+//
+// ===== v2.0.35（老板 2026-11-09 定案）=====
+//  修 v2.0.34 回归：设置页取消勾选 App（如 WeType）后 daemon 仍按旧列表拉起。
+//  根因：设置页（mobile / CurrentUser 域）写 /var/mobile/Library/Preferences/...，
+//  daemon（root）却用 kCFPreferencesAnyUser 读 /private/var/preferences/... 另一份快照；
+//  v2.0.34 的卸载清理往该域写过一次 enabledApps 后 viaCF 恒为 YES，文件再也不被读。
+//  ① WCVKReadPrefs：文件里存在的键一律以文件为准，AnyUser 域只在缺键时兜底；
+//  ② 启动时 WCVKClearLegacyAnyUserApps() 删掉 AnyUser 域那个 enabledApps 僵尸键；
+//  ③ 卸载清理只写 plist 文件（三份候选含设置页那份），不再写 AnyUser 域；
+//  ④ 键盘 wxkb_plugin 是硬编码 target、不依赖 enabledApps，仍然必拉且永不熔断。
 //
 // ===== v2.0.34（老板 2026-11-09 定案）=====
 //  ① 已卸载的 bundle ID 自动从 prefs 剔除并写回（LaunchServices 解析不到即视为卸载，
@@ -251,28 +261,36 @@ static BOOL WCVKReadPrefs(void) {
     NSArray *oldBIDs   = gAppBIDs;
     NSString *p = WCVKPrefsPath();
 
-    // 优先走 CFPreferences（cfprefsd 的内存值），盘上 plist 可能还没 flush（v2.0.2 实测）
-    id en = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("enabled"),
+    // ===== v2.0.35：prefs 真值 = 设置页写的那份 plist =====
+    //  设置页 / AltList 以 mobile 身份写 CurrentUser 域 ->
+    //    /var/mobile/Library/Preferences/com.wcvoicekeep.bgkeep.plist
+    //  daemon 以 root 跑，旧代码用 kCFPreferencesAnyUser 读的其实是
+    //    /private/var/preferences/com.wcvoicekeep.bgkeep.plist —— 完全另一份独立快照。
+    //  v2.0.34 的卸载清理往 AnyUser 域写过一次 enabledApps 之后 viaCF 恒为 YES，
+    //  设置页再怎么勾/取消勾选 daemon 都看不见（老板 16:01 报「关掉 WeType 还被拉起」）。
+    //  现在：文件里存在的键一律以文件为准；CF(AnyUser) 只在该键文件里读不到时兜底。
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+    if (!d) {
+        for (NSString *dir in WCVKPrefsDirCandidates()) {
+            NSDictionary *t = [NSDictionary dictionaryWithContentsOfFile:
+                               [dir stringByAppendingFormat:@"/%@.plist", kPrefsDomain]];
+            if (t) { d = t; break; }
+        }
+    }
+
+    id en   = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("enabled"),
               (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
-    id lg = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("logging"),
+    id lg   = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("logging"),
               (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
-    id rec = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("record"),
+    id rec  = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("record"),
               (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
     id apps = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("enabledApps"),
               (__bridge CFStringRef)kPrefsDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
-
-    BOOL viaCF = (en || rec || apps);
-    if (!viaCF) {
-        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
-        if (!d) {
-            for (NSString *dir in WCVKPrefsDirCandidates()) {
-                NSDictionary *t = [NSDictionary dictionaryWithContentsOfFile:
-                                   [dir stringByAppendingFormat:@"/%@.plist", kPrefsDomain]];
-                if (t) { d = t; break; }
-            }
-        }
-        en = d[@"enabled"]; lg = d[@"logging"]; rec = d[@"record"]; apps = d[@"enabledApps"];
-    }
+    if (d[@"enabled"])     en   = d[@"enabled"];
+    if (d[@"logging"])     lg   = d[@"logging"];
+    if (d[@"record"])      rec  = d[@"record"];
+    if (d[@"enabledApps"]) apps = d[@"enabledApps"];
+    BOOL viaFile = (d != nil);
 
     gEnabled = en ? [en boolValue] : YES;
     gLogging = lg ? [lg boolValue] : NO;
@@ -298,9 +316,22 @@ static BOOL WCVKReadPrefs(void) {
     BOOL changed = (oldEnabled != gEnabled) || (oldLogging != gLogging) || (oldRecord != gRecord)
                    || ![oldBIDs isEqualToArray:gAppBIDs];
     (void)oldLogging;
-    LOG(@"prefs loaded (%s): enabled=%d record=%d apps=%@ changed=%d",
-        viaCF ? "cfprefs" : "file", gEnabled, gRecord, gAppBIDs, changed);
+    LOG(@"prefs loaded (source=%@): enabled=%d record=%d apps=%@ changed=%d",
+        viaFile ? p : @"cfprefs/AnyUser兜底", gEnabled, gRecord, gAppBIDs, changed);
     return changed;
+}
+
+// ===== v2.0.35：清掉 v2.0.34 卸载清理误写进 AnyUser 域的 enabledApps 僵尸快照 =====
+//  只删这一个键（enabled / record 不动），只在 daemon 启动时跑一次。
+//  留着它虽然新的「文件优先」逻辑已不会再读，但 cfprefsd 内存里那份旧值仍可能
+//  在文件暂时读不到时兜底回来，所以启动即根除，两套域从此不再打架。
+static void WCVKClearLegacyAnyUserApps(void) {
+    CFPreferencesSetValue(CFSTR("enabledApps"), NULL,
+                          (__bridge CFStringRef)kPrefsDomain,
+                          kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    CFPreferencesSynchronize((__bridge CFStringRef)kPrefsDomain,
+                             kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    LOG(@"prefs: 已清除 AnyUser 域 legacy enabledApps 快照（设置页 plist = 唯一真值）");
 }
 
 // ===== 拉起记录（纯净版也写；设置页「拉起记录」读它）=====
@@ -523,11 +554,12 @@ static void WCVKPruneUninstalledBIDs(void) {
                 LOG(@"卸载清理：prefs 已写回 %@", p);
             }
         }
-        CFPreferencesSetValue(CFSTR("enabledApps"), (__bridge CFPropertyListRef)snapshot,
-                              (__bridge CFStringRef)kPrefsDomain,
-                              kCFPreferencesAnyUser, kCFPreferencesAnyHost);
-        CFPreferencesSynchronize((__bridge CFStringRef)kPrefsDomain,
-                                 kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+        // ⚠️ v2.0.35：这里**绝不写 AnyUser 域**。v2.0.34 曾在此用
+        //    CFPreferencesSetValue(..., kCFPreferencesAnyUser, ...) 造出一份
+        //    /private/var/preferences/ 下的独立快照，导致 daemon 与设置页各读一套，
+        //    「取消勾选 App」永远不生效。设置页读的就是上面写回的 plist 文件，
+        //    三份候选已覆盖它，无需再碰 cfprefsd 的另一域。
+        //    历史遗留的那份快照由启动时 WCVKClearLegacyAnyUserApps() 清掉。
     });
 }
 
@@ -1512,7 +1544,8 @@ int main(int argc, char *argv[]) {
         gBootSequenceActive = YES;     // 开机序列开始前先抑制 Rebuild 的并发拉起 / 重试链
         LOG(@"===== daemon start (pid=%d, flavor=%s) =====", getpid(),
             WCVK_NO_LOG ? "pure" : "log");
-        WCVKReadPrefs();
+        WCVKClearLegacyAnyUserApps();  // v2.0.35：先根除 AnyUser 域僵尸快照
+        WCVKReadPrefs();               // 真值 = 设置页 plist（文件优先）
         WCVKRebuildTargets();
         WCVKRegisterKbdUp();
         WCVKRegisterPrefsNotify();
