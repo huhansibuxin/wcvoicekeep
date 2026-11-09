@@ -20,6 +20,10 @@
 //     attributesOfItemAtPath / open / seekToEnd / close 这一串同步文件 IO。
 //   * pure 版 SBLog 编译期整体剥离，连参数求值都不发生（KbdSceneTag 等不会被调用）。
 //
+// v2.0.34（注销后键盘拉起成功率）：注入端在 constructor 注册完 warmup 通道之后，
+//   广播一次 com.wcvoicekeep.sb.ready。daemon 的第一次 warmup 常常发得比这里早而丢失，
+//   收到就绪信号后会补发一次（只在启动/注销阶段，事件驱动、零轮询）。
+//
 // 关键实测结论（保留备查，别改）：
 //   * 键盘只能由「有真实输入焦点的前台宿主 + SpringBoard 自己的 scene」发起；
 //     connectedScenes 无序，必须先取 keyWindow.windowScene，否则会选中
@@ -383,4 +387,8 @@ static void WCVKInit(void) {
 
     // kbd.up 的 token 只用来写 notify state（把新扩展 pid 递给 daemon），不注册回调
     notify_register_check("com.wcvoicekeep.kbd.up", &gKbdUpToken);
+
+    // v2.0.34：注册完成后再广播就绪，确保 daemon 补发的 warmup 一定能被这里收到。
+    notify_post("com.wcvoicekeep.sb.ready");
+    SBLog(@"[KBDWARM] sb.ready posted (warmup 通道已注册)");
 }

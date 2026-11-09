@@ -1,4 +1,18 @@
-// wcvoicekeep daemon — v2.0.33「只负责拉起」
+// wcvoicekeep daemon — v2.0.34「开机/注销错峰拉起 + 卸载清理 + 熔断重置」
+//
+// ===== v2.0.34（老板 2026-11-09 定案）=====
+//  ① 已卸载的 bundle ID 自动从 prefs 剔除并写回（LaunchServices 解析不到即视为卸载，
+//     有「本次至少有一个其它 App 能解析」保护，开机早期 LS 未就绪绝不误删）。
+//  ② 监听 SpringBoard 进程退出 = 用户空间重启/注销：清掉所有 target 的 fails/disabled/
+//     shortLives/短命冷却/pid 缓存（熔断解除），并按优先级错峰重新拉起。
+//  ③ 开机 / 注销统一走「启动序列」：键盘 → 5s → 微信 → 5s → 其它 App（每个 5s），
+//     已在运行的只挂监视不拉起，不同时冷启动多个 App（避免内存峰值被 jetsam 立刻杀掉）。
+//  ④ 短命连击抑制：同一 App 连续 3 次在 60s 内被杀 -> 暂停 60s 再拉起（在
+//     v2.0.33「键盘 1s / App 5s」之上唯一的额外等待；正常路径一个数没动。
+//  ⑤ 键盘多阶段确认（1.5/4/8s，4s 未起补发一次 warmup）+ kbd.up 迟到补写成功记录 +
+//     SpringBoard 注入端就绪通知（com.wcvoicekeep.sb.ready）触发补发预热，
+//     解决「注销后提示拉起失败、实际稍后才起来」。
+//  ⑥ 常态依然事件驱动：只看内核进程退出事件，无轮询、无心跳，CPU 占用为 0。
 //
 // 职责（老板 2026-11-07 定案）：本工程**不再注入任何 App 进程**，daemon 只做两件事：
 //   1) 键盘扩展 wxkb_plugin —— 必须保活（不可关闭、永不熔断）。它一退出，发 Darwin 通知
@@ -67,6 +81,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+// WCVKReadPrefs 里的「已剔除 ID 复检」要用，定义在后面
+static NSDictionary *WCVKAppMeta(NSString *bid);
+
 // iOS SDK 没有 macOS 的 libproc.h —— 只声明用到的两个 libproc 函数（iOS 上在 libSystem 里）
 #ifndef PROC_PIDPATHINFO_MAXSIZE
 #define PROC_PIDPATHINFO_MAXSIZE 4096
@@ -99,6 +116,18 @@ static NSString *const kPrefsDomain   = @"com.wcvoicekeep.bgkeep";
 // 写盘不会触发 com.apple.preferences-changed 广播 -> daemon 不会自己唤醒自己（零多余开销）。
 static NSString *const kRecordsPath = @"/var/mobile/wcvoicekeep.records.plist";
 static NSString *const kRecordsAlt  = @"/var/mobile/Library/Preferences/com.wcvoicekeep.bgkeep.records.plist";
+
+// ===== v2.0.34 常量（放在文件前部：WCVKReadPrefs / 卸载清理也要用 kWeChatBID）=====
+static NSString *const kWeChatBID      = @"com.tencent.xin";
+static const int kBootStepIntervalSec   = 5;    // 开机/注销后每个目标之间固定间隔 5s
+static const int kBootStartDelaySec     = 2;    // 序列起点：等 SpringBoard 注入端就绪
+static const int kShortLifeBurstLimit   = 3;    // 连续短命 3 次触发抑制
+static const int kShortLifeCooldownSec  = 60;   // 抑制时长；只作用于异常连击
+static const int kKbdConfirmDelaysMs[]  = { 1500, 4000, 8000 };
+static const int kSBWatchRetryMax       = 8;    // 开机早期找 SpringBoard 最多重试 8 次（3s 一次，非轮询）
+// 已从 prefs 剔除的 ID：防 cfprefsd 旧内存快照回弹造成「反复剔除/反复写盘」。
+// 只在 WCVKQueue 上读写；定义在文件前部（WCVKReadPrefs / 卸载清理都要用）。
+static NSMutableSet<NSString *> *gPrunedBIDs = nil;
 
 #if WCVK_NO_LOG
 #define LOG(...) do {} while (0)
@@ -251,9 +280,18 @@ static BOOL WCVKReadPrefs(void) {
 
     NSMutableArray *bids = [NSMutableArray array];
     if ([apps isKindOfClass:[NSArray class]]) {
+        if (!gPrunedBIDs) gPrunedBIDs = [NSMutableSet set];
         for (id b in apps) {
-            if ([b isKindOfClass:[NSString class]] && [b length] && ![bids containsObject:b])
-                [bids addObject:b];
+            if (![b isKindOfClass:[NSString class]] || ![b length]) continue;
+            // v2.0.34：cfprefsd 可能还持有「已剔除」的旧快照。若这个 ID 现在又能解析到
+            // （App 装回来了 / 用户重新勾选），就放它回来；否则一律忽略，防止反复写盘。
+            if ([gPrunedBIDs containsObject:b]) {
+                if (WCVKAppMeta(b)) {
+                    [gPrunedBIDs removeObject:b];
+                    LOG(@"prefs: %@ 重新可用 -> 恢复保活", b);
+                } else continue;
+            }
+            if (![bids containsObject:b]) [bids addObject:b];
         }
     }
     gAppBIDs = bids;
@@ -427,6 +465,72 @@ static NSDictionary *WCVKAppMeta(NSString *bid) {
     return out;
 }
 
+// ===== v2.0.34：已卸载 ID 自动剔除（老板 2026-11-09）=====
+//  老板换装 CocoaTop（cn.zqbb... -> ru.domo...）后旧 ID 永久残留在 enabledApps，
+//  AltList 里已卸载的条目不再显示、UI 上无法取消勾选，daemon 却每轮都按 bid 拉起 3 次。
+//  这里在「建 target 之前」解析一次，解析不到的直接从列表剔除并写回 plist + cfprefsd。
+//  ★ 防误删：开机早期 LaunchServices 可能整体不可用 —— 本次一个 App 都解析不到时
+//    一律不剔除（序列结束后还会复查一次，那时 LS 必定就绪）。
+//  ★ 只在 prefs 变更 / 开机 / 用户空间重启时执行，常态零 LaunchServices 调用、零 CPU。
+static void WCVKPruneUninstalledBIDs(void) {
+    if (!gAppBIDs.count) return;
+    if (!gPrunedBIDs) gPrunedBIDs = [NSMutableSet set];
+
+    NSMutableArray *missing = [NSMutableArray array];
+    NSMutableArray *kept    = [NSMutableArray array];
+    for (NSString *bid in gAppBIDs) {
+        if (WCVKAppMeta(bid)) [kept addObject:bid];
+        else [missing addObject:bid];
+    }
+    if (!missing.count) return;
+    // 判据：本次有别的 App 能解析，或者系统自带的微信能解析 => LaunchServices 确实可用。
+    // 开机早期 LS 整体不可用时（连微信都查不到）绝不误删用户勾选的 App。
+    BOOL lsUsable = (kept.count > 0) || (WCVKAppMeta(kWeChatBID) != nil);
+    if (!lsUsable) {
+        LOG(@"卸载清理：%lu 个 ID 解析失败，但 LaunchServices 尚不可用（连微信都查不到）-> 不剔除",
+            (unsigned long)missing.count);
+        return;
+    }
+
+    LOG(@"卸载清理：自动剔除 %lu 个已卸载 ID：%@（保留 %lu 个）",
+        (unsigned long)missing.count, missing, (unsigned long)kept.count);
+    for (NSString *bid in missing) [gPrunedBIDs addObject:bid];
+    gAppBIDs = [kept copy];
+
+    // 写盘搬到串行后台队列，不占事件队列；三份候选都写，避免 cfprefsd 从另一份读回旧值。
+    NSArray<NSString *> *snapshot = [kept copy];
+    NSArray<NSString *> *dirs     = WCVKPrefsDirCandidates();
+    dispatch_async(WCVKRecordQueue(), ^{
+        for (NSString *dir in dirs) {
+            NSString *p = [dir stringByAppendingFormat:@"/%@.plist", kPrefsDomain];
+            NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:p] mutableCopy];
+            if (!d) continue;
+            NSArray *old = d[@"enabledApps"];
+            if (![old isKindOfClass:[NSArray class]]) continue;
+            NSMutableArray *fresh = [NSMutableArray array];
+            for (id b in old)
+                if ([b isKindOfClass:[NSString class]] && [snapshot containsObject:b]) [fresh addObject:b];
+            if ([fresh isEqualToArray:old]) continue;
+            d[@"enabledApps"] = fresh;
+            if ([d writeToFile:p atomically:YES]) {
+                // 设置页（mobile）要能继续写这个 plist
+                struct stat st;
+                if (stat(p.fileSystemRepresentation, &st) != 0 || st.st_uid != 501 ||
+                    (st.st_mode & 07777) != 0644) {
+                    chown(p.fileSystemRepresentation, 501, 501);
+                    chmod(p.fileSystemRepresentation, 0644);
+                }
+                LOG(@"卸载清理：prefs 已写回 %@", p);
+            }
+        }
+        CFPreferencesSetValue(CFSTR("enabledApps"), (__bridge CFPropertyListRef)snapshot,
+                              (__bridge CFStringRef)kPrefsDomain,
+                              kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+        CFPreferencesSynchronize((__bridge CFStringRef)kPrefsDomain,
+                                 kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    });
+}
+
 // ===== 无头拉起（完全后台，不切前台）=====
 static int (*g_SBSLaunch)(CFStringRef, int) = NULL;
 static BOOL WCVKSBSReady(void) {
@@ -559,15 +663,16 @@ static void WCVKScanTargetsSync(const WCVKScanSpec *specs, int n, int *outPids) 
 }
 
 // ===== 目标 =====
-static const int kRelaunchDelaySec    = 1;   // 键盘扩展 EXIT -> 1s（保活必需，绝不退避）
-static const int kAppRelaunchDelaySec = 5;   // ★ v2.0.33：用户勾选的 App EXIT -> 5s 后再拉
-static const int kShortLifeSec     = 60;     // 仅用于日志措辞，不影响延迟
+static const int kRelaunchDelaySec    = 1;   // 键盘扩展 EXIT -> 1s（老板 11-07，绝不退避）
+static const int kAppRelaunchDelaySec = 5;   // ★ 用户勾选的 App EXIT -> 5s 后再拉（老板 11-07）
+static const int kShortLifeSec        = 60;
 static const int kFailCooldownSec  = 15;
 static const int kKbdDebounceSec   = 3;
 static const int kArmRetrySecs[]   = {2, 5, 10, 20, 40};
 static const int kFuseFailLimit    = 3;
 static const int kVerifyDelayMs    = 1500;
 static const int kAppRetryDelay[]  = { 5, 15 };
+
 
 @interface WCVKTarget : NSObject
 @property (nonatomic, copy)   NSString *ident;
@@ -583,6 +688,10 @@ static const int kAppRetryDelay[]  = { 5, 15 };
 @property (nonatomic, assign) BOOL disabled;
 @property (nonatomic, assign) time_t armedAt;
 @property (nonatomic, assign) int shortLives;
+// v2.0.34：短命连击抑制 / 键盘多阶段确认状态
+@property (nonatomic, assign) time_t shortCooldownUntil;
+@property (nonatomic, assign) BOOL kbdAwaitingConfirm;
+@property (nonatomic, assign) BOOL kbdConfirmDone;
 @property (nonatomic, strong) dispatch_source_t src;
 @end
 @implementation WCVKTarget
@@ -590,10 +699,23 @@ static const int kAppRetryDelay[]  = { 5, 15 };
 
 static NSMutableArray<WCVKTarget *> *gTargets = nil;
 
+// ===== v2.0.34 全局状态（只在 WCVKQueue 上读写）=====
+static unsigned gBootSeqGen          = 0;    // 启动序列令牌：用户空间重启时 ++ 作废旧序列
+static BOOL     gBootSequenceActive  = NO;   // 序列进行中：抑制 Rebuild 的主动拉起/重试链
+static int      gSBPid               = 0;    // SpringBoard 进程 pid 缓存
+static dispatch_source_t gSBSource  = nil;   // 用户空间重启检测（DISPATCH_PROC_EXIT）
+
 static BOOL WCVKIsKbd(WCVKTarget *t) { return [t.kind isEqualToString:@"kbd"]; }
 
-// 前置声明：退出事件 handler（定义在下面）要调它
+// 前置声明
 static void WCVKDoRelaunch(WCVKTarget *t, unsigned gen);
+static void WCVKScheduleExitRelaunch(WCVKTarget *t, unsigned gen);
+static void WCVKKbdWarmupWithConfirm(WCVKTarget *t, unsigned gen);
+static void WCVKPruneUninstalledBIDs(void);
+static void WCVKStartBootSequence(int startDelaySec, NSArray<WCVKTarget *> *only);
+static void WCVKOnUserSpaceRestart(void);
+static void WCVKSBArmWatch(int attempt);
+static int  WCVKFindSpringBoardPidSync(void);
 
 // 所有 target 状态只在 gQueue 上读写
 static BOOL WCVKTargetValid(WCVKTarget *t, unsigned gen) {
@@ -697,36 +819,32 @@ static void WCVKArmPid(WCVKTarget *t, int pid) {
     dispatch_source_set_event_handler(src, ^{
         WCVKTarget *st = wt;
         if (!st || st.gen != gen) return;
-        // 纯事件驱动：键盘 EXIT -> 1s 立刻拉起；用户勾选的 App EXIT -> 5s 后再拉。
-        // 短命只做日志统计、绝不改延迟；冷却/熔断/校验/重试链一个数没动。
-        int delay = WCVKIsKbd(st) ? kRelaunchDelaySec : kAppRelaunchDelaySec;
+        // 纯事件驱动：键盘 EXIT -> 1s 立刻拉起；App EXIT -> 5s 后再拉（老板 11-07 保留）。
+        // v2.0.34 唯一额外等待：连续 3 次「活不过 60s」（内存压力下刚拉起就被杀）
+        // 才对该 target 暂停 60s，避免拉起→被杀→再拉起的死循环反复吃 CPU/内存。
         time_t life = (st.armedAt > 0) ? (time(NULL) - st.armedAt) : -1;
         if (!WCVKIsKbd(st) && life >= 0 && life < kShortLifeSec) {
             st.shortLives++;
-            LOG(@"### %@ (pid=%d) 退出（只活了 %lds，累计短命 %d 次）-> %ds 后拉起",
-                st.display, st.pid, (long)life, st.shortLives, delay);
-        } else if (st.shortLives > 0) {
-            LOG(@"### %@ 这次活了 %lds -> 短命计数清零（原连击 %d 次）",
+            LOG(@"### %@ (pid=%d) 退出（只活了 %lds，累计短命 %d 次）",
+                st.display, st.pid, (long)life, st.shortLives);
+            if (st.shortLives >= kShortLifeBurstLimit) {
+                st.shortCooldownUntil = time(NULL) + kShortLifeCooldownSec;
+                LOG(@"### %@ 连续短命 %d 次 -> 暂停 %ds 再拉起（避免内存压力下反复被杀）",
+                    st.display, st.shortLives, kShortLifeCooldownSec);
+                WCVKRecord(st.display, st.ident, st.kind, NO,
+                           [NSString stringWithFormat:@"连续短命 %d 次，暂停 %ds 再拉起（保护内存）",
+                                                      st.shortLives, kShortLifeCooldownSec]);
+            }
+        } else if (st.shortLives > 0 || st.shortCooldownUntil > 0) {
+            LOG(@"### %@ 这次活了 %lds -> 短命计数/冷却清零（原连击 %d 次）",
                 st.display, (long)life, st.shortLives);
             st.shortLives = 0;
+            st.shortCooldownUntil = 0;
         }
         st.armedAt = 0;
         st.pid = 0;                               // 缓存失效
         if (st.src) { dispatch_source_cancel(st.src); st.src = nil; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                       WCVKQueue(), ^{
-            if (!WCVKTargetValid(st, gen)) return;
-            WCVKDoRelaunch(st, gen);               // ★ 只拉起；挂监视交给校验/kbd.up，不再重复
-            // ★ 兜底（鲁棒性）：如果这次拉起被冷却挡掉了，旧监视已取消、又没人重挂，
-            //   这个 target 会永久收不到退出事件。2s 后仅当「仍无监视」才启动挂监视重试；
-            //   正常路径 1.5s 校验已挂上 src，这里直接 return，零额外扫描。
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                           WCVKQueue(), ^{
-                if (!WCVKTargetValid(st, gen) || st.src) return;
-                LOG(@"%@ 退出后仍无监视 -> 启动挂监视兜底", st.display);
-                WCVKArmRetry(st, gen, 0);
-            });
-        });
+        WCVKScheduleExitRelaunch(st, gen);
     });
     t.src = src;
     t.armedGen = gen;
@@ -734,6 +852,36 @@ static void WCVKArmPid(WCVKTarget *t, int pid) {
     // 键盘重新挂上监视 = 上次拉起已成功 -> 清 3s 防抖，下次退出立刻处理
     if (WCVKIsKbd(t)) t.lastRelaunch = 0;
     LOG(@"watch ARMED: %@ (pid=%d)", t.display, pid);
+}
+
+// v2.0.34：退出后的统一调度。正常 = 键盘 1s / App 5s（老板 11-07 语义原样保留）；
+// 短命连击抑制期间 = 等到冷却结束。一次性 dispatch_after 链，事件驱动绝不轮询。
+static void WCVKScheduleExitRelaunch(WCVKTarget *t, unsigned gen) {
+    if (!WCVKTargetValid(t, gen)) return;
+    time_t now = time(NULL);
+    int wait = WCVKIsKbd(t) ? kRelaunchDelaySec : kAppRelaunchDelaySec;
+    if (!WCVKIsKbd(t) && t.shortCooldownUntil > now) {
+        wait = (int)(t.shortCooldownUntil - now);
+        LOG(@"%@ 短命连击冷却中 -> %ds 后再拉起", t.display, wait);
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
+                   WCVKQueue(), ^{
+        if (!WCVKTargetValid(t, gen)) return;      // 重启 / 重建 / 熔断后旧回调一律作废
+        if (!WCVKIsKbd(t) && t.shortCooldownUntil > time(NULL)) {
+            WCVKScheduleExitRelaunch(t, gen);      // 冷却被延长，继续等（单次定时器，零轮询）
+            return;
+        }
+        WCVKDoRelaunch(t, gen);                    // ★ 只拉起；挂监视交给校验/kbd.up
+        // ★ 兜底（鲁棒性）：如果这次拉起被冷却挡掉了，旧监视已取消、又没人重挂，
+        //   这个 target 会永久收不到退出事件。2s 后仅当「仍无监视」才启动挂监视重试；
+        //   正常路径 1.5s 校验已挂上 src，这里直接 return，零额外扫描。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                       WCVKQueue(), ^{
+            if (!WCVKTargetValid(t, gen) || t.src) return;
+            LOG(@"%@ 退出后仍无监视 -> 启动挂监视兜底", t.display);
+            WCVKArmRetry(t, gen, 0);
+        });
+    });
 }
 
 // 挂监视重试链（只在「没有拉起链在跑」时才启动，避免两套链并发重复拉起）
@@ -820,8 +968,56 @@ static void WCVKRelaunchAttempt(WCVKTarget *t, int attempt, unsigned gen) {
     });
 }
 
+// ===== v2.0.34：键盘扩展多阶段确认 =====
+//  旧实现只在 warmup 后 1.5s 判一次，而 SpringBoard 侧 DidShow 后还要 +0.25s、
+//  注销时注入端甚至还没注册通知 -> 1.5s 必判 FAIL，随后系统自己 spawn 才「实际成功」。
+//  现在 1.5/4/8s 三次单点校验（成功即停），4s 未起补发一次 warmup；
+//  kbd.up 迟到到达时补写一条成功记录。键盘永不熔断、不累计 fails（老板铁律）。
+static void WCVKKbdWarmupWithConfirm(WCVKTarget *t, unsigned gen) {
+    NSString *disp = t.display ?: @"键盘";
+    t.kbdAwaitingConfirm = YES;
+    t.kbdConfirmDone = NO;
+    notify_post("com.wcvoicekeep.kbd.warmup");
+    LOG(@"%@ 键盘预热已发出（多阶段确认 1.5/4/8s；4s 未起补发一次）", disp);
+
+    int stages = (int)(sizeof(kKbdConfirmDelaysMs) / sizeof(kKbdConfirmDelaysMs[0]));
+    for (int i = 0; i < stages; i++) {
+        int ms = kKbdConfirmDelaysMs[i];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms * NSEC_PER_MSEC)),
+                       WCVKQueue(), ^{
+            if (!WCVKTargetValid(t, gen) || t.kbdConfirmDone) return;
+            WCVKResolvePids(@[t], ^(NSArray<NSNumber *> *pids) {
+                if (!WCVKTargetValid(t, gen) || t.kbdConfirmDone) return;
+                int pid = pids.firstObject.intValue;
+                if (pid > 0) {
+                    t.kbdConfirmDone = YES;
+                    t.kbdAwaitingConfirm = NO;
+                    WCVKRecord(disp, @"wxkb_plugin", @"kbd", YES,
+                               [NSString stringWithFormat:@"键盘扩展已拉起 (pid=%d, T+%dms 确认)", pid, ms]);
+                    LOG(@"%@ 键盘扩展确认成功 pid=%d (T+%dms)", disp, pid, ms);
+                    WCVKArmPid(t, pid);
+                } else if (ms >= 4000 && ms < 8000) {
+                    LOG(@"%@ T+%dms 未确认 -> 补发一次键盘预热（应对注销后 SB 晚就绪）", disp, ms);
+                    notify_post("com.wcvoicekeep.kbd.warmup");
+                } else if (ms >= 8000) {
+                    t.kbdAwaitingConfirm = NO;
+                    WCVKRecord(disp, @"wxkb_plugin", @"kbd", NO,
+                               @"键盘预热已发出但扩展未起来（不熔断，等 kbd.up / 下次事件）");
+                    LOG(@"%@ 8s 仍未确认（不熔断，等待 kbd.up 迟到确认）", disp);
+                }
+            });
+        });
+    }
+}
+
 static void WCVKDoRelaunch(WCVKTarget *t, unsigned gen) {
     time_t now = time(NULL);
+    // v2.0.34：短命连击冷却（唯一破「固定 1s」的例外，键盘豁免）
+    if (!WCVKIsKbd(t) && t.shortCooldownUntil > now) {
+        LOG(@"%@ 短命连击冷却中（还剩 %lds），跳过本次拉起", t.display,
+            (long)(t.shortCooldownUntil - now));
+        return;
+    }
     int cooldown = WCVKIsKbd(t) ? kKbdDebounceSec : kFailCooldownSec;
     if (t.lastRelaunch && now - t.lastRelaunch < cooldown) {
         LOG(@"%@ 冷却中（%lds 前刚处理过，冷却 %ds），跳过", t.display,
@@ -831,26 +1027,7 @@ static void WCVKDoRelaunch(WCVKTarget *t, unsigned gen) {
     t.lastRelaunch = now;
 
     if (WCVKIsKbd(t)) {
-        // 键盘扩展没有别的门路：让 SpringBoard 弹一次键盘，系统才会 spawn 它
-        notify_post("com.wcvoicekeep.kbd.warmup");
-        NSString *disp = t.display ?: @"键盘";
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kVerifyDelayMs * NSEC_PER_MSEC)),
-                       WCVKQueue(), ^{
-            if (!WCVKTargetValid(t, gen)) return;
-            WCVKResolvePids(@[t], ^(NSArray<NSNumber *> *pids) {
-                if (!WCVKTargetValid(t, gen)) return;
-                int pid = pids.firstObject.intValue;
-                if (pid > 0) {
-                    WCVKRecord(disp, @"wxkb_plugin", @"kbd", YES,
-                               [NSString stringWithFormat:@"键盘扩展已拉起 (pid=%d)", pid]);
-                    WCVKArmPid(t, pid);
-                } else {
-                    // ★ 键盘不熔断、不累计 fails、不停看护：只记一条，下次退出事件照常再拉
-                    WCVKRecord(disp, @"wxkb_plugin", @"kbd", NO, @"键盘预热已发出但扩展未起来");
-                    LOG(@"%@ 键盘扩展未起来（不熔断，等下次事件）", disp);
-                }
-            });
-        });
+        WCVKKbdWarmupWithConfirm(t, gen);         // 键盘永不熔断、不累计 fails
         return;
     }
     WCVKRelaunchAttempt(t, 0, gen);
@@ -859,6 +1036,7 @@ static void WCVKDoRelaunch(WCVKTarget *t, unsigned gen) {
 // ===== 按当前设置重建目标表 =====
 static void WCVKRebuildTargets(void) {
     if (!gTargets) gTargets = [NSMutableArray array];
+    WCVKPruneUninstalledBIDs();      // v2.0.34：先剔除已卸载 ID，不再为它建 target
 
     if (!gEnabled) {
         for (WCVKTarget *old in gTargets) WCVKStopTarget(old);
@@ -877,9 +1055,15 @@ static void WCVKRebuildTargets(void) {
 
     for (NSString *bid in gAppBIDs) {
         NSDictionary *meta = WCVKAppMeta(bid);
+        if (!meta) {
+            // v2.0.34：解析不到 = 已卸载。即便 cfprefsd 旧快照回弹，也不为它建 target，
+            // 更不会每轮为它跑 3 次 SBSLaunch + 5s/15s 重试。
+            LOG(@"跳过已卸载/无法解析的 ID: %@", bid);
+            continue;
+        }
         WCVKTarget *t = [WCVKTarget new];
         t.ident = bid;
-        t.display = meta[@"display"] ?: bid;   // 解析不到也照常保活（只认 bundle id）
+        t.display = meta[@"display"] ?: bid;
         t.kind = @"app";
         t.exeSuffix = meta[@"exeSuffix"];
         [want addObject:t];
@@ -891,6 +1075,7 @@ static void WCVKRebuildTargets(void) {
         if (!keep) { LOG(@"target 移除: %@", old.display); WCVKStopTarget(old); }
     }
     NSMutableArray *merged = [NSMutableArray array];
+    NSMutableArray<WCVKTarget *> *newTargets = [NSMutableArray array];
     for (WCVKTarget *n in want) {
         WCVKTarget *exist = nil;
         for (WCVKTarget *old in gTargets) if ([old.ident isEqualToString:n.ident]) { exist = old; break; }
@@ -898,23 +1083,25 @@ static void WCVKRebuildTargets(void) {
             exist.display = n.display; exist.exeSuffix = n.exeSuffix;
             exist.gen++;                       // 作废所有旧异步回调（精准命中）
             exist.relaunching = NO;
-            exist.disabled = NO;              // 键盘永远 NO；App 改设置后恢复
+            exist.disabled = NO;              // 键盘永远 NO；App 改设置 / 注销后恢复
             exist.fails = 0;
             [merged addObject:exist];
         } else {
             [merged addObject:n];
+            if (!WCVKIsKbd(n)) [newTargets addObject:n];
         }
     }
     gTargets = merged;
     LOG(@"targets 重建：共 %lu 个（键盘扩展 + App %lu）",
         (unsigned long)gTargets.count, (unsigned long)(gTargets.count ? gTargets.count - 1 : 0));
 
-    // v2.0.7：重建时目标不在运行就必须主动拉起（否则没有退出事件，永远等不到触发点）
-    for (WCVKTarget *t in gTargets) {
-        if (WCVKIsKbd(t)) continue;            // 键盘那条链是好的，不碰
-        if (t.disabled || t.pid > 0 || t.src || t.lastRelaunch) continue;
-        LOG(@"%@ 重建时不在运行 -> 主动后台拉起", t.display);
-        WCVKDoRelaunch(t, t.gen);
+    // v2.0.34：不再「一次性把没在跑的 App 全部拉起」—— 那是内存峰值 / jetsam 连杀的放大器。
+    // 开机与注销由 WCVKStartBootSequence 完整错峰覆盖；运行中设置变更只把新增的 App
+    // 排进同样的 5s 间隔队列。已在运行的 target 由下面的批量解析直接挂监视。
+    if (newTargets.count && !gBootSequenceActive) {
+        LOG(@"新增 %lu 个 App -> 排入错峰拉起序列（每个间隔 %ds）",
+            (unsigned long)newTargets.count, kBootStepIntervalSec);
+        WCVKStartBootSequence(kBootStartDelaySec, newTargets);
     }
 
     // ★ 一次批量解析所有目标（原来每个 target 各扫一遍进程表）；
@@ -938,9 +1125,158 @@ static void WCVKRebuildTargets(void) {
             unsigned gen = gens[i].unsignedIntValue;
             if (!WCVKTargetValid(t, gen)) continue;   // 重建/取消/关闭后旧结果一律作废
             if (pid > 0) WCVKArmPid(t, pid);
-            else WCVKArmRetry(t, gen, 0);
+            else if (!gBootSequenceActive) WCVKArmRetry(t, gen, 0);
+            // 序列进行中：不启动 2/5/10/20/40s 重试链（会和错峰拉起并发、白扫进程表），
+            // 由启动序列每一步自己解析并挂监视。
         }
     });
+}
+
+// ===== v2.0.34：开机 / 注销的优先级错峰启动序列 =====
+//  老板 2026-11-09 定案：键盘 → 5s → 微信 → 5s → 其它 App（每个再隔 5s）。
+//  开机与注销都按这个顺序，绝不同时冷启动多个 App —— 同时拉起是内存/CPU 峰值、
+//  刚拉起就被 jetsam 杀掉、杀掉又立刻拉起的根因。
+static NSArray<WCVKTarget *> *WCVKOrderedTargets(NSArray<WCVKTarget *> *src) {
+    WCVKTarget *kbd = nil, *wechat = nil;
+    NSMutableArray<WCVKTarget *> *rest = [NSMutableArray array];
+    for (WCVKTarget *t in src) {
+        if (WCVKIsKbd(t)) kbd = t;
+        else if ([t.ident isEqualToString:kWeChatBID]) wechat = t;
+        else [rest addObject:t];
+    }
+    NSMutableArray<WCVKTarget *> *out = [NSMutableArray arrayWithCapacity:src.count + 2];
+    if (kbd) [out addObject:kbd];                 // 第 1 优先：微信输入法键盘扩展
+    if (wechat) [out addObject:wechat];           // 第 2 优先：微信
+    [out addObjectsFromArray:rest];               // 其余按设置里的顺序，每个间隔 5s
+    return out;
+}
+
+static void WCVKBootLaunchOne(WCVKTarget *t, unsigned gen) {
+    if (!WCVKTargetValid(t, gen)) return;
+    WCVKResolvePids(@[t], ^(NSArray<NSNumber *> *pids) {
+        if (!WCVKTargetValid(t, gen)) return;
+        int pid = pids.firstObject.intValue;
+        if (pid > 0) {
+            LOG(@"[错峰] %@ 已在运行 (pid=%d) -> 只挂监视，不重复拉起", t.display, pid);
+            WCVKArmPid(t, pid);                  // 已在跑就不浪费一次冷启动
+            return;
+        }
+        LOG(@"[错峰] 拉起 %@（kind=%@）", t.display, t.kind);
+        if (WCVKIsKbd(t)) WCVKKbdWarmupWithConfirm(t, gen);
+        else WCVKRelaunchAttempt(t, 0, gen);
+    });
+}
+
+static void WCVKBootStep(NSArray<WCVKTarget *> *ordered, NSUInteger idx, unsigned gen, int delaySec) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delaySec * NSEC_PER_SEC)),
+                   WCVKQueue(), ^{
+        if (gen != gBootSeqGen) return;                // 新序列已接管，旧序列直接退场
+        if (!gEnabled) {                               // 总开关关闭：清标志，别让 Rebuild 一直被抑制
+            gBootSequenceActive = NO;
+            LOG(@"启动序列中止：总开关已关闭");
+            return;
+        }
+        if (idx >= ordered.count) {
+            gBootSequenceActive = NO;
+            LOG(@"===== 错峰启动序列完成（%lu 步，每步间隔 %ds）=====",
+                (unsigned long)ordered.count, kBootStepIntervalSec);
+            // 序列结束时 LaunchServices 必定就绪：复查一次卸载清理（一次性，非轮询）
+            WCVKPruneUninstalledBIDs();
+            return;
+        }
+        WCVKTarget *t = ordered[idx];
+        if ([gTargets containsObject:t]) WCVKBootLaunchOne(t, t.gen);
+        else LOG(@"[错峰] 第 %lu 步目标已移除，跳过", (unsigned long)(idx + 1));
+        WCVKBootStep(ordered, idx + 1, gen, kBootStepIntervalSec);
+    });
+}
+
+static void WCVKStartBootSequence(int startDelaySec, NSArray<WCVKTarget *> *only) {
+    // 完整序列（开机/注销）推进全局令牌，作废旧序列；设置变更引起的局部序列
+    // 复用当前令牌，绝不把正在跑的开机序列打断（否则后面的 App 永远不会被拉起）。
+    unsigned gen = only ? gBootSeqGen : ++gBootSeqGen;
+    gBootSequenceActive = YES;
+    NSArray<WCVKTarget *> *ordered = WCVKOrderedTargets(only ?: [gTargets copy]);
+    LOG(@"===== 启动序列 gen=%u：%lu 个目标，%ds 后开始，之后每个间隔 %ds =====",
+        gen, (unsigned long)ordered.count, startDelaySec, kBootStepIntervalSec);
+    for (NSUInteger i = 0; i < ordered.count; i++)
+        LOG(@"  [%lu] %@ (%@)", (unsigned long)(i + 1), ordered[i].display, ordered[i].ident);
+    WCVKBootStep(ordered, 0, gen, startDelaySec);
+}
+
+// ===== v2.0.34：用户空间重启检测（SpringBoard 进程退出）=====
+//  不用 kern.boottime（respring 时它不变）；用内核 proc EXIT 事件，纯事件驱动零轮询。
+static int WCVKFindSpringBoardPidSync(void) {
+    int total = proc_listallpids(NULL, 0);
+    if (total <= 0) return 0;
+    int cap = total + 64;
+    pid_t *pids = (pid_t *)calloc((size_t)cap, sizeof(pid_t));
+    if (!pids) return 0;
+    int cnt = proc_listallpids(pids, cap * (int)sizeof(pid_t));
+    int found = 0;
+    for (int j = 0; j < cnt; j++) {
+        pid_t p = pids[j];
+        if (p <= 1) continue;
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        int n = proc_pidpath(p, path, sizeof(path));
+        if (n <= 0) continue;
+        if (strstr(path, "/SpringBoard.app/SpringBoard")) { found = p; break; }
+    }
+    free(pids);
+    return found;
+}
+
+static void WCVKSBArmWatch(int attempt) {
+    if (attempt > kSBWatchRetryMax) {
+        LOG(@"SpringBoard 监视：多次未找到 pid，放弃重挂（不影响启动序列）");
+        return;
+    }
+    dispatch_async(WCVKScanQueue(), ^{
+        int pid = WCVKFindSpringBoardPidSync();
+        dispatch_async(WCVKQueue(), ^{
+            if (pid <= 0) {
+                LOG(@"SpringBoard 尚未就绪（第 %d 次）-> 3s 后再找", attempt);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                               WCVKQueue(), ^{ WCVKSBArmWatch(attempt + 1); });
+                return;
+            }
+            if (gSBSource) { dispatch_source_cancel(gSBSource); gSBSource = nil; }
+            gSBPid = pid;
+            dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC,
+                                        (uintptr_t)pid, DISPATCH_PROC_EXIT, WCVKQueue());
+            if (!src) { gSBPid = 0; return; }
+            gSBSource = src;
+            dispatch_source_set_event_handler(src, ^{
+                LOG(@"===== SpringBoard (pid=%d) 退出 -> 判定注销/用户空间重启 =====", gSBPid);
+                if (gSBSource) { dispatch_source_cancel(gSBSource); gSBSource = nil; }
+                gSBPid = 0;
+                WCVKOnUserSpaceRestart();
+            });
+            dispatch_resume(src);
+            LOG(@"SpringBoard 监视已挂 pid=%d（事件驱动，零轮询）", pid);
+        });
+    });
+}
+
+static void WCVKOnUserSpaceRestart(void) {
+    LOG(@"===== 用户空间重启：解除全部熔断 / 清看护状态 / 按优先级错峰重新拉起 =====");
+    gBootSeqGen++;                       // 作废旧启动序列的所有回调
+    gBootSequenceActive = YES;           // 抑制 Rebuild 的主动拉起 / 重试链
+    for (WCVKTarget *t in gTargets) {
+        WCVKStopTarget(t);               // gen++ / cancel src / pid=0 / relaunching=NO
+        t.fails = 0;
+        t.disabled = NO;                 // ★ 老板要求：注销后熔断必须解除
+        t.shortLives = 0;
+        t.shortCooldownUntil = 0;
+        t.lastRelaunch = 0;
+        t.kbdAwaitingConfirm = NO;
+        t.kbdConfirmDone = NO;
+    }
+    gMetaCache = nil;                    // 新用户空间重新解析（顺带清掉卸载 ID 的旧缓存）
+    WCVKReadPrefs();                     // 注销前改过的设置在这里生效
+    WCVKRebuildTargets();                // 按当前 prefs 重建（内部再做一次卸载清理）
+    WCVKSBArmWatch(0);                   // 重挂新 SpringBoard 的退出监视
+    WCVKStartBootSequence(kBootStartDelaySec, nil);
 }
 
 // ===== 设置热生效 =====
@@ -1028,7 +1364,8 @@ static void WCVKRegisterPrefsNotify(void) {
 }
 
 // ===== 键盘扩展拉起成功：SpringBoard 把新 pid 放进 notify state 直接递过来 =====
-static int gKbdUpToken = 0;
+static int gKbdUpToken    = 0;
+static int gSBReadyToken  = 0;
 static void WCVKRegisterKbdUp(void) {
     notify_register_dispatch("com.wcvoicekeep.kbd.up", &gKbdUpToken, WCVKQueue(), ^(int token) {
         uint64_t state = 0;
@@ -1039,6 +1376,15 @@ static void WCVKRegisterKbdUp(void) {
             if (pid > 1 && WCVKValidatePid(t, pid)) {
                 LOG(@"kbd.up state pid=%d -> 直接挂监视（零全表扫描）", pid);
                 WCVKArmPid(t, pid);           // 同 pid 已挂时 ArmPid 自己会 return
+                // v2.0.34：扩展比 1.5s 判定晚起来时，补写一条成功记录，
+                // 不再出现「提示拉起失败、注销后其实成功」的假象。
+                if (t.kbdAwaitingConfirm) {
+                    t.kbdAwaitingConfirm = NO;
+                    t.kbdConfirmDone = YES;
+                    WCVKRecord(t.display ?: @"键盘", @"wxkb_plugin", @"kbd", YES,
+                               [NSString stringWithFormat:@"键盘扩展已拉起 (kbd.up 迟到确认, pid=%d)", pid]);
+                    LOG(@"kbd.up 迟到确认 -> 补写一条成功记录 pid=%d", pid);
+                }
             } else {
                 LOG(@"kbd.up state 无效(%d) -> 回退一次解析", pid);
                 WCVKArmTarget(t, t.gen, 0);
@@ -1046,6 +1392,21 @@ static void WCVKRegisterKbdUp(void) {
             break;
         }
     });
+
+    // v2.0.34：SpringBoard 注入端每次加载都广播一次就绪。注销时 daemon 发的第一次 warmup
+    // 很容易早于它注册通知而丢失 —— 收到就绪信号且键盘仍在待确认状态时补发一次。
+    // 事件驱动、只在启动/注销阶段动作，常态零开销。
+    notify_register_dispatch("com.wcvoicekeep.sb.ready", &gSBReadyToken, WCVKQueue(), ^(int token) {
+        LOG(@"sb.ready: SpringBoard 注入端已就绪");
+        for (WCVKTarget *t in gTargets) {
+            if (!WCVKIsKbd(t) || !t.kbdAwaitingConfirm) continue;
+            if (t.pid > 0 && WCVKValidatePid(t, t.pid)) return;   // 已在跑就别再弹
+            LOG(@"sb.ready -> 补发一次键盘预热（注销时第一次 warmup 可能丢了）");
+            notify_post("com.wcvoicekeep.kbd.warmup");
+            break;
+        }
+    });
+    LOG(@"kbd.up / sb.ready notify registered");
 }
 
 // ===== 子命令 =====
@@ -1073,12 +1434,13 @@ static void WCVKPrintStatus(void) {
     }
     WCVKScanTargetsSync(specs, n, pids);
     printf("  [kbd] wxkb_plugin pid=%d\n", pids[0]);
+    printf("  boot order: 键盘 -> 微信 -> 其它 App（每个间隔 %ds）\n", kBootStepIntervalSec);
     for (int i = 1; i < n; i++) {
         NSString *bid = ((WCVKTarget *)ts[i]).ident;
         NSDictionary *m = WCVKAppMeta(bid);
         printf("  [app] %-34s %-14s pid=%-6d exe=%s\n", bid.UTF8String,
                [(m[@"display"] ?: bid) UTF8String], pids[i],
-               [(m[@"exeSuffix"] ?: @"(解析失败, 仍按 bid 保活)") UTF8String]);
+               [(m[@"exeSuffix"] ?: @"(已卸载, 自动剔除)") UTF8String]);
     }
     free(specs); free(pids);
 
@@ -1147,6 +1509,7 @@ int main(int argc, char *argv[]) {
         }
 
         // ===== 常驻守护 =====
+        gBootSequenceActive = YES;     // 开机序列开始前先抑制 Rebuild 的并发拉起 / 重试链
         LOG(@"===== daemon start (pid=%d, flavor=%s) =====", getpid(),
             WCVK_NO_LOG ? "pure" : "log");
         WCVKReadPrefs();
@@ -1154,7 +1517,9 @@ int main(int argc, char *argv[]) {
         WCVKRegisterKbdUp();
         WCVKRegisterPrefsNotify();
         WCVKArmPrefsWatch();
-        LOG(@"daemon ready: 事件驱动看护中（缓存优先，常态零全表扫描）");
+        WCVKSBArmWatch(0);            // 用户空间重启 / 注销检测（熔断解除的触发源）
+        WCVKStartBootSequence(kBootStartDelaySec, nil);
+        LOG(@"daemon ready: 事件驱动看护中（开机按 键盘→5s→微信→5s→其它 错峰拉起）");
 
         dispatch_main();
     }
