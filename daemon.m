@@ -1,18 +1,4 @@
-// wcvoicekeep daemon — v2.0.36「进程死因识别（只认系统内存杀）+ 记录开关严格零开销」
-//
-// ===== v2.0.36（老板 2026-11-09 定案）=====
-//  ① 只做二分类：内核 exit reason namespace 1=OS_REASON_JETSAM（系统内存杀），
-//     2=OS_REASON_SIGNAL（用户上滑 / CocoaTop / 任何 kill —— 这两者按老板要求不再区分）。
-//     在进程 EXIT handler 里同步读一次 proc_pidinfo(flavor 25/24)，把死因拼进下一次
-//     拉起记录的 detail；设置页只读 rows[].detail，UI 一行都不用改。
-//  ② ★ 老板铁律：记录开关（record）关闭时，EXIT handler 第一行就 return ——
-//     不解析符号、不调 proc_pidinfo、不构造字符串、不写 plist、不进任何队列，
-//     0 CPU / 0 syscall。只有开关打开时才有「那一次读取 + 那一次记录写入」，
-//     常态依旧纯事件驱动、无轮询、无心跳。
-//  ③ 纯旁路：死因不参与拉起 / 冷却 / 熔断 / 错峰任何判断；内核 zombie 已被 reap
-//     读不到就记「未知」，绝不靠存活时长之类去猜。
-//  ④ 新增 --probe-exit 自检：fork 一个父进程不 wait 的子进程再 SIGKILL（必定留在僵尸队列），
-//     立刻读它的 exit reason；SSH 跑一条命令即可定性「这台设备 API 到底通不通」。
+// wcvoicekeep daemon — v2.0.35「prefs 真值统一到设置页 plist」
 //
 // ===== v2.0.35（老板 2026-11-09 定案）=====
 //  修 v2.0.34 回归：设置页取消勾选 App（如 WeType）后 daemon 仍按旧列表拉起。
@@ -104,10 +90,6 @@
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
-// v2.0.36：退出原因读取要用 errno；--probe-exit 自检子进程要用 SIGKILL / waitpid
-#include <errno.h>
-#include <signal.h>
-#include <sys/wait.h>
 
 // WCVKReadPrefs 里的「已剔除 ID 复检」要用，定义在后面
 static NSDictionary *WCVKAppMeta(NSString *bid);
@@ -190,128 +172,6 @@ static void LOG(NSString *fmt, ...) {
 }
 #endif
 
-// ===== v2.0.36：进程退出原因（纯旁路，只在记录开关打开时才会被调用）=====
-// XNU 给每个退出进程挂一个 os_reason：
-//   namespace 1 = OS_REASON_JETSAM -> 系统内存杀（code 见 JETSAM_REASON_*）
-//   namespace 2 = OS_REASON_SIGNAL -> 用户上滑 / CocoaTop / 任何 kill（都是 SIGKILL 9）
-// 老板定案只做这个二分类：上滑和 CocoaTop 不用区分，关键是能不能把「内存杀」单独认出来。
-// ⚠️ flavor 24/25 在内核里走 proc_find_zombref —— 只查僵尸队列。iOS App 的父进程是
-//    launchd，reap 很快，EXIT 回调异步到达时可能已经查不到。读不到就是「未知」，不猜。
-#define WCVK_EXITREASON_INFO        24   // PROC_PIDEXITREASONINFO
-#define WCVK_EXITREASON_BASICINFO   25   // PROC_PIDEXITREASONBASICINFO
-#define WCVK_OS_REASON_JETSAM       1u
-#define WCVK_OS_REASON_SIGNAL       2u
-
-// 与 xnu/bsd/sys/proc_info.h 的 proc_exitreasonbasicinfo / proc_exitreasoninfo 一致，packed
-struct WCVKExitReasonBasic {
-    uint32_t ns;
-    uint64_t code;
-    uint64_t flags;
-    uint32_t bufSize;
-} __attribute__((packed));
-struct WCVKExitReasonFull {
-    uint32_t ns;
-    uint64_t code;
-    uint64_t flags;
-    uint32_t bufSize;
-    uint64_t kcdBuf;
-} __attribute__((packed));
-
-// iOS SDK 没有公开 libproc.h；和已有的 proc_listallpids / proc_pidpath 一样按符号解析，
-// 但用 dlsym 弱取，彻底避免链接期 Undefined symbols（找不到就退化成「未知」，绝不翻车）。
-typedef int (*WCVKProcPidInfoFn)(int, int, uint64_t, void *, int);
-static WCVKProcPidInfoFn WCVKGetProcPidInfo(void) {
-    static WCVKProcPidInfoFn fn = NULL;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        fn = (WCVKProcPidInfoFn)dlsym(RTLD_DEFAULT, "proc_pidinfo");
-    });
-    return fn;
-}
-
-static NSString *WCVKJetsamCodeName(uint64_t c) {
-    switch (c) {
-        case 1:  return @"generic";
-        case 2:  return @"highwater(超内存水位)";
-        case 3:  return @"vnode";
-        case 4:  return @"vm-pageshortage(内存页不足)";
-        case 5:  return @"proc-thrashing";
-        case 6:  return @"fc-thrashing";
-        case 7:  return @"per-process-limit(单进程内存上限)";
-        case 8:  return @"disk-space-shortage";
-        case 9:  return @"idle-exit(空闲回收)";
-        case 10: return @"zone-map-exhaustion";
-        case 11: return @"vmcompressor-thrashing";
-        case 12: return @"vmcompressor-space-shortage";
-        case 13: return @"lowswap";
-        case 14: return @"sustained-pressure(持续内存压力)";
-        case 15: return @"vmpageout-starvation";
-        case 16: return @"conclave-limit";
-        case 17: return @"long-idle-exit";
-        case 100:return @"cpu-limit";
-        default: return [NSString stringWithFormat:@"code=%llu", (unsigned long long)c];
-    }
-}
-
-static NSString *WCVKDescribeExitReason(uint32_t ns, uint64_t code) {
-    if (ns == WCVK_OS_REASON_JETSAM)
-        return [NSString stringWithFormat:@"系统内存杀(jetsam %@)", WCVKJetsamCodeName(code)];
-    if (ns == WCVK_OS_REASON_SIGNAL)
-        return [NSString stringWithFormat:@"手动/信号杀(SIG %llu，上滑或 CocoaTop 等)",
-                                         (unsigned long long)code];
-    return [NSString stringWithFormat:@"其它退出(ns=%u code=%llu)", ns,
-                                      (unsigned long long)code];
-}
-
-// 返回 YES = 拿到了有效 namespace；outRc / outErr 供日志定位是「API 不通」还是「僵尸已 reap」。
-// 只在 WCVKQueue 上、且仅在 gRecord=YES 时调用；同步、一次或两次 syscall，无队列切换。
-static BOOL WCVKReadExitReason(int pid, uint32_t *outNs, uint64_t *outCode,
-                               int *outFlavor, int *outRc, int *outErr) {
-    if (outNs) *outNs = 0;
-    if (outCode) *outCode = 0;
-    if (outFlavor) *outFlavor = 0;
-    if (outRc) *outRc = 0;
-    if (outErr) *outErr = 0;
-    WCVKProcPidInfoFn fn = WCVKGetProcPidInfo();
-    if (!fn || pid <= 1) { if (outErr) *outErr = ESRCH; return NO; }
-
-    struct WCVKExitReasonBasic b;
-    memset(&b, 0, sizeof(b));
-    errno = 0;
-    int rc25 = fn(pid, WCVK_EXITREASON_BASICINFO, 0, &b, (int)sizeof(b));
-    int e25  = errno;
-    if (rc25 >= (int)sizeof(b) && b.ns != 0) {
-        if (outNs) *outNs = b.ns;
-        if (outCode) *outCode = b.code;
-        if (outFlavor) *outFlavor = WCVK_EXITREASON_BASICINFO;
-        if (outRc) *outRc = rc25;
-        return YES;
-    }
-
-    struct WCVKExitReasonFull f;
-    memset(&f, 0, sizeof(f));
-    errno = 0;
-    int rc24 = fn(pid, WCVK_EXITREASON_INFO, 0, &f, (int)sizeof(f));
-    int e24  = errno;
-    // 详细原始值只进日志版（pure 版 LOG 是空宏，下面这些参数根本不求值）
-    LOG(@"[死因] pid=%d f25(rc=%d errno=%d ns=%u code=%llu flags=%llu buf=%u) "
-         @"f24(rc=%d errno=%d ns=%u code=%llu flags=%llu buf=%u)",
-        pid, rc25, e25, b.ns, (unsigned long long)b.code,
-        (unsigned long long)b.flags, b.bufSize,
-        rc24, e24, f.ns, (unsigned long long)f.code,
-        (unsigned long long)f.flags, f.bufSize);
-    if (rc24 >= (int)sizeof(struct WCVKExitReasonBasic) && f.ns != 0) {
-        if (outNs) *outNs = f.ns;
-        if (outCode) *outCode = f.code;
-        if (outFlavor) *outFlavor = WCVK_EXITREASON_INFO;
-        if (outRc) *outRc = rc24;
-        return YES;
-    }
-    if (outRc) *outRc = rc24;
-    if (outErr) *outErr = e24;
-    return NO;
-}
-
 // ===== 队列 =====
 static dispatch_queue_t WCVKQueue(void) {
     static dispatch_queue_t q = nil;
@@ -393,9 +253,6 @@ static BOOL     gEnabled = YES;
 static BOOL     gLogging = NO;
 static BOOL     gRecord  = YES;
 static NSArray *gAppBIDs = nil;
-// v2.0.36：每个 bid 的「上一次怎么被杀的」，只在 WCVKQueue 上读写（无锁、零竞争）。
-// 只有 gRecord=YES 时才会被写入；gRecord=NO 时这张表永远是空的（连读都不发生）。
-static NSMutableDictionary<NSString *, NSString *> *gLastExitByBID = nil;
 
 // 返回「值是否有变化」：com.apple.preferences-changed 是系统级广播，
 // 任何 App 改任何偏好都会打过来，值没变就跳过重建（不做全量 LaunchServices 解析）。
@@ -516,27 +373,16 @@ static void WCVKRecordWrite(NSString *path, NSDictionary *row) {
 }
 
 static void WCVKRecord(NSString *display, NSString *ident, NSString *kind, BOOL ok, NSString *detail) {
-    // ★ 老板 v2.0.36 铁律：记录开关关掉时**第一行直接返回** ——
-    //   不读内核死因、不读文件、不写文件、不进队列、不构造字符串，零 syscall、零 CPU。
+    // 记录开关关掉时**直接返回**：不读文件、不写文件、不进队列，零 syscall、零 CPU
     if (!gRecord) return;
     NSString *path = WCVKRecordsPath();     // 固定 /var/mobile 路径，后台线程零共享状态
-
-    // 把「上一次是怎么被杀掉的」拼进 detail：设置页只读 rows[].detail，UI 零改动。
-    // 只有开关打开过、且真的读到/记过死因才有值；没读到就是「未知」，不猜。
-    NSString *last = ident.length ? gLastExitByBID[ident] : nil;
-    NSString *full = detail ?: @"";
-    if (last.length) {
-        full = full.length ? [NSString stringWithFormat:@"%@｜上次退出：%@", full, last]
-                           : [NSString stringWithFormat:@"上次退出：%@", last];
-    }
-
     NSMutableDictionary *row = [NSMutableDictionary dictionary];
     row[@"t"] = [NSDate date];
     row[@"name"] = display ?: ident ?: @"?";
     row[@"bid"] = ident ?: @"";
     row[@"kind"] = kind ?: @"app";
     row[@"ok"] = @(ok);
-    if (full.length) row[@"detail"] = full;
+    if (detail.length) row[@"detail"] = detail;
     dispatch_async(WCVKRecordQueue(), ^{ WCVKRecordWrite(path, row); });
 }
 
@@ -987,25 +833,6 @@ static void WCVKResolvePids(NSArray<WCVKTarget *> *targets,
 static void WCVKArmTarget(WCVKTarget *t, unsigned gen, int attempt);
 static void WCVKArmRetry(WCVKTarget *t, unsigned gen, int attempt);
 
-// ===== v2.0.36：进程退出时判定死因（纯旁路，绝不参与拉起/冷却/熔断判断）=====
-static void WCVKNoteExit(WCVKTarget *t, int pid, long life) {
-    // ★★★ 老板铁律：记录开关关闭时，这里就是整个 EXIT handler 的第一个动作 ——
-    //     直接返回。不 dlsym、不调 proc_pidinfo、不拼字符串、不写 plist、不进任何队列。
-    //     只有打开「记录拉起动作」时才会有「这一次读取 + 这一次记录写入」。
-    if (!gRecord) return;
-
-    uint32_t ns = 0;
-    uint64_t code = 0;
-    int flavor = 0, rc = 0, err = 0;
-    BOOL got = WCVKReadExitReason(pid, &ns, &code, &flavor, &rc, &err);
-    NSString *reason = got ? WCVKDescribeExitReason(ns, code)
-        : [NSString stringWithFormat:@"未知（内核退出原因未读到，rc=%d errno=%d）", rc, err];
-    LOG(@"[死因] %@ pid=%d 存活=%lds flavor=%d -> %@", t.display, pid, life, flavor, reason);
-
-    if (!gLastExitByBID) gLastExitByBID = [NSMutableDictionary dictionary];
-    if (t.ident.length) gLastExitByBID[t.ident] = reason;   // 供下一条拉起记录拼接
-}
-
 static void WCVKArmPid(WCVKTarget *t, int pid) {
     // ★ 同一个 pid + 同一个 gen 已经挂过就不再重复 cancel/resume
     //   （实机日志每次拉起 "watch ARMED" 打两遍的根因）。
@@ -1028,9 +855,6 @@ static void WCVKArmPid(WCVKTarget *t, int pid) {
         // v2.0.34 唯一额外等待：连续 3 次「活不过 60s」（内存压力下刚拉起就被杀）
         // 才对该 target 暂停 60s，避免拉起→被杀→再拉起的死循环反复吃 CPU/内存。
         time_t life = (st.armedAt > 0) ? (time(NULL) - st.armedAt) : -1;
-        // ★ v2.0.36：EXIT 第一时间读死因（趁 zombie 还没被 launchd reap）。
-        //   函数第一行就是 gRecord 门禁：记录开关关掉 = 这一步整个不存在，0 CPU。
-        WCVKNoteExit(st, st.pid, (long)life);
         if (!WCVKIsKbd(st) && life >= 0 && life < kShortLifeSec) {
             st.shortLives++;
             LOG(@"### %@ (pid=%d) 退出（只活了 %lds，累计短命 %d 次）",
@@ -1707,33 +1531,6 @@ int main(int argc, char *argv[]) {
                            [(m[@"exeSuffix"] ?: @"nil") UTF8String],
                            [(m[@"display"] ?: @"nil") UTF8String]);
                 }
-                return 0;
-            }
-            // v2.0.36：一条命令定性「这台设备能不能拿到 exit reason」。
-            // 造一个父进程故意不 wait 的子进程再 SIGKILL —— 它必定留在僵尸队列，
-            // 排除了「App 被 launchd 提前 reap」这个变量。不受 record 开关影响（手动诊断）。
-            if (strcmp(argv[i], "--probe-exit") == 0) {
-                WCVKProcPidInfoFn pinfo = WCVKGetProcPidInfo();
-                printf("proc_pidinfo: %s\n", pinfo ? "found (libSystem)" : "NOT FOUND");
-                typedef pid_t (*WCVKForkFn)(void);
-                WCVKForkFn fk = (WCVKForkFn)dlsym(RTLD_DEFAULT, "fork");
-                if (!pinfo || !fk) { printf("probe aborted: symbol missing\n"); return 1; }
-                pid_t child = fk();
-                if (child < 0) { printf("fork failed errno=%d\n", errno); return 1; }
-                if (child == 0) { for (;;) pause(); }   // 子进程：等 SIGKILL，父进程绝不 wait
-                usleep(80000);
-                kill(child, SIGKILL);
-                usleep(120000);                          // 等内核完成 exit + 挂进 zombie 队列
-                uint32_t ns = 0; uint64_t code = 0;
-                int fl = 0, rc = 0, err = 0;
-                BOOL got = WCVKReadExitReason((int)child, &ns, &code, &fl, &rc, &err);
-                printf("child pid=%d got=%d ns=%u code=%llu flavor=%d rc=%d errno=%d\n",
-                       (int)child, got, ns, (unsigned long long)code, fl, rc, err);
-                printf("described: %s\n", got ? WCVKDescribeExitReason(ns, code).UTF8String
-                                              : "unknown (API 不通 / 结构不匹配)");
-                waitpid(child, NULL, 0);
-                printf("判读：got=1 且 ns=2 code=9 -> API 通；"
-                       "若真实 App 退出仍显示「未知」，说明只是 launchd 已提前 reap 僵尸。\n");
                 return 0;
             }
             if (strcmp(argv[i], "--clear-records") == 0) {
