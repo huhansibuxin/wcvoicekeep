@@ -1,4 +1,14 @@
-// wcvoicekeep daemon — v2.0.35「prefs 真值统一到设置页 plist」
+// wcvoicekeep daemon — v2.0.37「回退 v2.0.36 死因探测，恢复 v2.0.35 基线」
+//
+// ===== v2.0.37（老板 2026-11-09 定案）=====
+//  v2.0.36 试做的「内核退出原因（proc_pidinfo flavor 24/25）」实机读不到，整段回退。
+//  实机证据：--probe-exit 自造僵尸能读到 ns=2 code=9（API/权限/结构都对），
+//  但真实 App 的 DISPATCH_PROC_EXIT 回调一律 errno=3(ESRCH，launchd 已 reap 僵尸)
+//  或 errno=13(EACCES，跨 uid 被 CHECK_SAME_USER 拒) -> 记录恒为「未知」。
+//  替代信号源 JetsamEvent-*.ips 只在真实内存事件时落盘、需目录监听 + 解析大 JSON +
+//  处理时序竞态，不够简单可靠，按「复杂就算了」放弃。
+//  本版代码与 v2.0.35 完全一致，仅版本号顺延便于和手机上旧 deb 区分；记录开关关闭
+//  仍是零写入、零额外 syscall。
 //
 // ===== v2.0.35（老板 2026-11-09 定案）=====
 //  修 v2.0.34 回归：设置页取消勾选 App（如 WeType）后 daemon 仍按旧列表拉起。
