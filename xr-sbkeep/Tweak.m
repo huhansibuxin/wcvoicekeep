@@ -1,4 +1,4 @@
-// XRWeChatKeep — v1.3.2（安全模式已修）
+// XRWeChatKeep — v1.4.0（有头模式）
 // 老板 2026-11-19 定案：XR 放屋里、没人解锁，微信掉了必须自动拉起并「一直跑」。
 //
 // v1.3.0（XR 实机装 v1.2.0 后「日志 0 字节、ctor 疑似没执行」后加的诊断版）：
@@ -33,6 +33,11 @@
 //   - 静音音频走 App 层 audio session，会被微信自己的通话 session 抢，插件抢不过。
 // → 正解是 RunningBoard 层：由 SpringBoard 身份持 RBSAssertion(PreventTaskSuspend)，
 //   让系统「不挂起」微信。社区参考 bakgrunnur（udevs, GPLv3, iOS 14.3 实测锁屏可用）。
+//
+// v1.4.0（老板实测「无头拉起后微信里注入的插件不跑」后新增）：
+//   设备不设锁屏密码时，可以真正做到「免密解锁 → 有头拉起 → 常驻前台」，
+//   微信才认为自己在跑，内部注入的插件才会持续工作。有密码则自动回落无头模式。
+//   模式文件：/var/mobile/Library/SpringBoard/xrkeep.mode（headful / headless）。
 //
 // 本实现的两个取舍（比 bakgrunnur 保守）：
 //   ① 解锁使用期间**不**做场景扶持，只持断言 —— 不抢前台归属，界面零异常；
@@ -209,6 +214,128 @@ static BOOL SBKIsLocked(void) {
         (void)e;
         return NO;
     }
+}
+
+// ===== v1.4.0 有头模式基础设施 =====
+// 老板 2026-11-19 实测结论：无头（suspended）拉起后进程在、断言也在，但微信内部注入的插件不干活
+// —— 因为 App 始终处于「后台/锁屏下」状态，插件要的前台运行态拿不到。
+// 结论：设备不设锁屏密码（XR 放屋里没人碰）时，可以真正做到「免密解锁 → 有头拉起 → 常驻前台」。
+//
+// 关键认知：有密码的设备在锁屏下**无法**免密解锁，此时有头拉起会被锁屏挡回去，
+// 所以只在「无密码」时启用有头模式；有密码自动回落到无头模式（现在的行为）。
+
+static BOOL SBKHasPasscode(void) {
+    BOOL has = YES;   // 读不到就按「有密码」保守处理
+    @try {
+        Class mc = objc_getClass("MCProfileConnection");
+        if (mc) {
+            id conn = ((id (*)(id, SEL))objc_msgSend)((id)mc, sel_registerName("sharedConnection"));
+            if (conn && [conn respondsToSelector:sel_registerName("isPasscodeSet")]) {
+                has = ((BOOL (*)(id, SEL))objc_msgSend)(conn, sel_registerName("isPasscodeSet"));
+            }
+        }
+    } @catch (NSException *e) {
+        (void)e;
+    }
+    return has;
+}
+
+// 有头模式开关：/var/mobile/Library/SpringBoard/xrkeep.mode
+//   内容 "headful"  → 强制有头（无密码设备）
+//   内容 "headless" → 强制无头（老行为）
+//   文件不存在      → 按是否有锁屏密码自动判定
+static BOOL gHeadful = NO;
+
+static void SBKLoadMode(void) {
+    NSString *txt = nil;
+    @try {
+        txt = [NSString stringWithContentsOfFile:@"/var/mobile/Library/SpringBoard/xrkeep.mode"
+                                        encoding:NSUTF8StringEncoding error:NULL];
+    } @catch (NSException *e) { (void)e; }
+    txt = [txt stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *low = txt.lowercaseString;
+    BOOL hasPc = SBKHasPasscode();
+    if (low.length && [low containsString:@"headless"]) {
+        gHeadful = NO;
+        SBKLog(@"模式=无头（由 xrkeep.mode 指定）hasPasscode=%d", hasPc ? 1 : 0);
+    } else if (low.length && [low containsString:@"headful"]) {
+        gHeadful = YES;
+        SBKLog(@"模式=有头（由 xrkeep.mode 指定）hasPasscode=%d", hasPc ? 1 : 0);
+    } else {
+        gHeadful = (hasPc == NO);
+        SBKLog(@"模式自动判定=%@ hasPasscode=%d %@",
+               gHeadful ? @"有头" : @"无头", hasPc ? 1 : 0,
+               gHeadful ? @"(无密码 → 可免密解锁并有头拉起)" : @"(有密码 → 只能用无头)");
+    }
+}
+
+// 免密解锁：只有「设备无锁屏密码」时才可能成功。
+// 用 +sharedInstanceIfExists（绝不用 +sharedInstance，v1.3.2 已证会崩 SpringBoard）。
+static time_t gLastUnlockAt = 0;
+
+static BOOL SBKUnlockDevice(NSString *why) {
+    if (!SBKIsLocked()) return YES;
+    if (SBKHasPasscode()) {
+        return NO;   // 有密码：不解锁，交给无头路径
+    }
+    time_t now = time(NULL);
+    if (gLastUnlockAt > 0 && (now - gLastUnlockAt) < 5) return NO;   // 5s 限流，别刷屏
+    gLastUnlockAt = now;
+
+    Class cls = objc_getClass("SBLockScreenManager");
+    if (!cls) { SBKLog(@"解锁失败：SBLockScreenManager 缺失"); return NO; }
+
+    id mgr = nil;
+    @try {
+        SEL sIf = sel_registerName("sharedInstanceIfExists");
+        if (class_respondsToSelector(object_getClass((id)cls), sel_registerName("sharedInstanceIfExists"))) {
+            mgr = ((id (*)(id, SEL))objc_msgSend)((id)cls, sIf);
+        }
+        (void)sIf;
+    } @catch (NSException *e) { (void)e; }
+    if (!mgr) { SBKLog(@"解锁跳过：SpringBoard 还没起 SBLockScreenManager (%@)", why ?: @"?"); return NO; }
+
+    BOOL did = NO;
+    // ① iOS 14 常见：-unlockUIFromSource:withOptions:
+    SEL s2 = sel_registerName("unlockUIFromSource:withOptions:");
+    if (!did && [mgr respondsToSelector:s2]) {
+        int sources[3] = { 0, 7, 6 };
+        for (int i = 0; i < 3 && !did; i++) {
+            @try {
+                did = ((BOOL (*)(id, SEL, int, id))objc_msgSend)(mgr, s2, sources[i], nil);
+            } @catch (NSException *e) { (void)e; }
+            if (did || !SBKIsLocked()) { did = YES; break; }
+        }
+    }
+    // ② 老签名：-unlockUIFromSource:
+    SEL s1 = sel_registerName("unlockUIFromSource:");
+    if (!did && [mgr respondsToSelector:s1]) {
+        int sources[3] = { 0, 7, 6 };
+        for (int i = 0; i < 3 && !did; i++) {
+            @try {
+                did = ((BOOL (*)(id, SEL, int))objc_msgSend)(mgr, s1, sources[i]);
+            } @catch (NSException *e) { (void)e; }
+            if (did || !SBKIsLocked()) { did = YES; break; }
+        }
+    }
+
+    BOOL stillLocked = SBKIsLocked();
+    SBKLog(@"免密解锁 (%@) 调用=%@ 结果 locked=%d", why ?: @"?", did ? @"YES" : @"NO", stillLocked ? 1 : 0);
+    return (stillLocked == NO);
+}
+
+// 微信场景是否前台（由场景 hook 顺带采集，未知 = -1）
+static int gTargetSceneFG = -1;
+
+static int SBKSettingsForeground(id settings) {
+    if (!settings) return -1;
+    SEL a = sel_registerName("isForeground");
+    SEL b = sel_registerName("foreground");
+    @try {
+        if ([settings respondsToSelector:a]) return ((BOOL (*)(id, SEL))objc_msgSend)(settings, a) ? 1 : 0;
+        if ([settings respondsToSelector:b]) return ((BOOL (*)(id, SEL))objc_msgSend)(settings, b) ? 1 : 0;
+    } @catch (NSException *e) { (void)e; }
+    return -1;
 }
 
 // ===== 找微信 pid（容器无关：路径后缀匹配）=====
@@ -477,6 +604,11 @@ static void SBKLaunchViaSBS(NSString *why) {
 }
 
 static void SBKLaunch(NSString *why) {
+    if (gHeadful) {
+        // 有头模式第一步：把锁屏解掉。锁屏还在的话，任何拉起都会被 SpringBoard 压回后台，
+        // 微信内部的注入插件就永远拿不到前台运行态。
+        SBKUnlockDevice(why ?: @"拉起前");
+    }
     Class cPM  = objc_getClass("FBProcessManager");
     Class cReq = objc_getClass("FBSystemServiceOpenApplicationRequest");
     Class cOpt = objc_getClass("FBSOpenApplicationOptions");
@@ -515,7 +647,8 @@ static void SBKLaunch(NSString *why) {
     id ws  = ((id (*)(id, SEL))objc_msgSend)((id)cWS, sel_registerName("sharedInstance"));
     if (!svc || !ws) { SBKLog(@"拉起失败：service/workspace 空"); return; }
 
-    SBKLog(@"发起拉起 (%@) locked=%d", why ?: @"?", SBKIsLocked());
+    SBKLog(@"发起拉起 (%@) mode=%@ locked=%d", why ?: @"?",
+           gHeadful ? @"headful" : @"headless", SBKIsLocked());
     @try {
         ((void (*)(id, SEL, id, id, id))objc_msgSend)(
             ws, sel_registerName("systemService:handleOpenApplicationRequest:withCompletion:"),
@@ -658,6 +791,23 @@ static void SBKTick(void) {
         SBKLog(@"锁屏期健康复核 pid=%d stat=%d 断言tier=%d", pid, st, gAssertTier);
     }
 
+    // ===== 有头模式复核（v1.4.0）=====
+    // 目的：微信必须真的处于「前台运行态」，否则内部注入的插件不干活。
+    // 触发条件（任一）：① 设备又锁屏了（无密码，可免密解开）② 微信场景不在前台
+    // 动作：解锁 → 需要的话再走一次有头拉起。约 30s 最多修一次，避免反复扰动。
+    if (gHeadful && gStallTicks == 0) {
+        static int sFixWindow = 0;
+        sFixWindow++;
+        BOOL lockedNow = SBKIsLocked();
+        BOOL sceneBG   = (gTargetSceneFG == 0);
+        if ((lockedNow || sceneBG) && (sFixWindow % 3) == 0) {
+            SBKLog(@"有头复核：locked=%d sceneFG=%d stat=%d → 解锁并确认前台",
+                   lockedNow ? 1 : 0, gTargetSceneFG, st);
+            BOOL unlocked = SBKUnlockDevice(@"有头复核");
+            if (sceneBG && (unlocked || !lockedNow)) SBKForceRelaunch(@"目标不在前台");
+        }
+    }
+
     gTick++;
 }
 
@@ -762,6 +912,21 @@ static void SBKApplySettingsHook(id self, SEL _cmd, id settings, id scene, id ct
     if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-call-orig\n", no); SBKRawLog(b); }
     if (gOrigApplySettings) gOrigApplySettings(self, _cmd, settings, scene, ctx, completion);
     if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-orig-done\n", no); SBKRawLog(b); }
+
+    // 采集微信场景的前台状态（只读，供有头模式的健康复核用）
+    if (gHeadful && SBKSettled()) {
+        @try {
+            NSString *bid2 = SBKSceneBID(scene);
+            if ([bid2 isEqualToString:kTargetBID]) {
+                int fg = SBKSettingsForeground(settings);
+                if (fg >= 0 && fg != gTargetSceneFG) {
+                    gTargetSceneFG = fg;
+                    SBKLog(@"微信场景前台状态 → %@ (locked=%d)",
+                           fg ? @"前台" : @"非前台", SBKIsLocked() ? 1 : 0);
+                }
+            }
+        } @catch (NSException *e) { (void)e; }
+    }
 }
 
 static void SBKDidExitHook(id self, SEL _cmd, id ctx) {
@@ -814,7 +979,7 @@ __attribute__((constructor)) static void SBKInit(void) {
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v1.3.3 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
+             "\n===== XRWeChatKeep v1.4.0 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB);
     SBKRawLog(head);
     gCtorAt = time(NULL);
@@ -844,7 +1009,10 @@ __attribute__((constructor)) static void SBKInit(void) {
                           (IMP)SBKDidExitHook, (IMP *)&gOrigDidExit);
     SBKLog(@"hook 结果 sceneMgr=%d(FBSceneManager=%s) didExit=%d(SBApplication=%s)",
            okScene ? 1 : 0, cSceneMgr ? "yes" : "nil", okExit ? 1 : 0, cApp ? "yes" : "nil");
-    SBKRawLog("STAGE: hook-all-done, schedule selfcheck\n");
+    SBKRawLog("STAGE: hook-all-done, load mode\n");
+
+    // 有头 / 无头模式判定（无密码设备默认有头）
+    SBKLoadMode();
 
     // ③ 3s 只做「无副作用」的状态观测（读 pid / 读状态 / 读锁屏），不碰任何系统单例构建
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), SBKQueue(), ^{
