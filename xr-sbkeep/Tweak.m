@@ -167,8 +167,9 @@ static const int kLaunchBackoffCount = 5;
 // 目的：给微信自身/系统一次自然回收的机会，避免「杀掉-秒拉」的抖动；也少一次亮屏。
 static const int kRelaunchDelaySec = 5;
 
-// 健康检查间隔（秒）。真正的退出检测走 DISPATCH_PROC_EXIT 事件，这个只做挂起态复核。
-static const int kHealthIntervalSec = 10;
+// 健康检查间隔（秒）。真正的退出检测走 DISPATCH_PROC_EXIT 事件（实时），
+// 这个只做挂起态兜底复核 → 10s 放宽到 15s，息屏时少 1/3 的唤醒。
+static const int kHealthIntervalSec = 15;
 
 // ===== 日志（v2.0.0 降频版）=====
 // 两路 fd：A = SpringBoard 自有目录（首选），B = /var/mobile（旧路径兜底）
@@ -1343,7 +1344,7 @@ __attribute__((constructor)) static void SBKInit(void) {
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v2.0.0 pid=%d proc=%s fdA=%d(e%d) fdB=%d(e%d) stage=%d =====\n",
+             "\n===== XRWeChatKeep v2.0.1 pid=%d proc=%s fdA=%d(e%d) fdB=%d(e%d) stage=%d =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB, gStageOn);
     SBKRawLog(head);
     gCtorAt = time(NULL);
