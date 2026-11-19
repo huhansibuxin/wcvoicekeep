@@ -1,4 +1,13 @@
-// XRWeChatKeep — v1.6.1（前台过一遍 + 用 SpringBoard 有头拉起 + 可靠锁屏）
+// XRWeChatKeep — v2.0.0（正式版：5 秒延迟拉起 + 日志降频 + CPU 优化）
+//
+// v2.0.0（老板 2026-11-19 定案，正式使用版）：
+//   ① 微信被杀后**延迟 5 秒**再拉起（原来杀掉同一秒就拉），给系统一次自然回收机会；
+//   ② 日志降频：STAGE 逐段埋点默认全关（仅 xrkeep.dump 存在时输出）、场景前后台切换
+//      日志按 key 限流 60s、首次 ctx 完整描述仅诊断模式输出、日志超 256KB 自动轮转为 .1；
+//   ③ CPU 优化：日志改单路写（A 能开就不写 B）、锁屏状态查询加 1s 缓存、
+//      进程查找加 pid 缓存（不再每 10s 遍历全表 proc_pidpath）、场景探针限流 0.5s、
+//      主线程阻塞等待从 300~500ms 降到 120~150ms（降低 SpringBoard 卡顿/看门狗风险）；
+//   ④ 已在跑且在前台时直接跳过「过一遍」，避免无谓亮屏。
 // 老板 2026-11-19 定案：XR 放屋里、没人解锁，微信掉了必须自动拉起并「一直跑」。
 //
 // v1.3.0（XR 实机装 v1.2.0 后「日志 0 字节、ctor 疑似没执行」后加的诊断版）：
@@ -64,6 +73,7 @@
 #import <unistd.h>
 #import <fcntl.h>
 #import <errno.h>
+#import <sys/stat.h>
 #import <dlfcn.h>
 
 // 不引用 substrate.h：本工程已完全不用 Logos，hook 走 ObjC runtime 替换 IMP
@@ -143,41 +153,103 @@ static NSString *const kLogPathB = @"/var/mobile/wcvoicekeep.xrkeep.log";
 static const NSTimeInterval kLaunchBackoff[] = {3, 8, 20, 45, 60};
 static const int kLaunchBackoffCount = 5;
 
-// 健康检查间隔（秒）。真正的退出检测走 DISPATCH_PROC_EXIT 事件，这个只做挂起态/断言复核。
+// 老板 2026-11-19 定案：微信被杀后**等 5 秒**再拉起（不要杀掉立刻拉）。
+// 目的：给微信自身/系统一次自然回收的机会，避免「杀掉-秒拉」的抖动；也少一次亮屏。
+static const int kRelaunchDelaySec = 5;
+
+// 健康检查间隔（秒）。真正的退出检测走 DISPATCH_PROC_EXIT 事件，这个只做挂起态复核。
 static const int kHealthIntervalSec = 10;
 
-// ===== 日志 =====
+// ===== 日志（v2.0.0 降频版）=====
 // 两路 fd：A = SpringBoard 自有目录（首选），B = /var/mobile（旧路径兜底）
+// 优化：**A 路能开就只写 A 路**，不再双写——省掉一半 write 系统调用。
 static int gLogFd = -1;    // A 路
-static int gLogFdB = -1;   // B 路
+static int gLogFdB = -1;   // B 路（仅当 A 打不开时才用）
+
+// STAGE 逐段埋点总开关：只有 /var/mobile/Library/SpringBoard/xrkeep.dump 存在时才输出。
+// 正常使用下完全静默，排障时放个文件就恢复全量埋点。
+static int gStageOn = 0;
+
+static void SBKWriteBytes(const char *s, size_t n) {
+    if (!s || n == 0) return;
+    if (gLogFd >= 0) { ssize_t ig = write(gLogFd, s, n); (void)ig; return; }
+    if (gLogFdB >= 0) { ssize_t ig = write(gLogFdB, s, n); (void)ig; }
+}
 
 // 纯 C 落盘：不碰 ObjC/NSString，ctor 第一行就能用
 static void SBKRawLog(const char *s) {
     if (!s) return;
-    size_t n = strlen(s);
-    if (gLogFd >= 0) { ssize_t ig = write(gLogFd, s, n); (void)ig; }
-    if (gLogFdB >= 0) { ssize_t ig = write(gLogFdB, s, n); (void)ig; }
+    SBKWriteBytes(s, strlen(s));
 }
 
-static void SBKLog(NSString *fmt, ...) {
-    if (gLogFd < 0 && gLogFdB < 0) return;
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
+// 诊断埋点（默认关闭）
+static void SBKStage(const char *s) {
+    if (!gStageOn || !s) return;
+    SBKRawLog(s);
+}
 
+// 按 key 限流的日志：同一个 key 在 sec 秒内只写一次，避免周期性刷屏
+#define SBK_THR_SLOTS 12
+static struct { const char *key; time_t at; } gThrTab[SBK_THR_SLOTS];
+static int gThrIdx = 0;
+
+static BOOL SBKThrottleAllow(const char *key, int sec) {
+    if (!key) return YES;
+    time_t now = time(NULL);
+    for (int i = 0; i < SBK_THR_SLOTS; i++) {
+        if (gThrTab[i].key && strcmp(gThrTab[i].key, key) == 0) {
+            if (now - gThrTab[i].at < sec) return NO;
+            gThrTab[i].at = now;
+            return YES;
+        }
+    }
+    gThrTab[gThrIdx].key = key;
+    gThrTab[gThrIdx].at = now;
+    gThrIdx = (gThrIdx + 1) % SBK_THR_SLOTS;
+    return YES;
+}
+
+static void SBKVLog(BOOL force, const char *thrKey, int thrSec, NSString *fmt, va_list ap) {
+    if (gLogFd < 0 && gLogFdB < 0) return;
+    if (!force && thrKey && !SBKThrottleAllow(thrKey, thrSec)) return;
+
+    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
     time_t now = time(NULL);
     struct tm tmv;
     localtime_r(&now, &tmv);
     char ts[32];
     strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", &tmv);
 
-    char line[1400];
+    char line[1200];
     int n = snprintf(line, sizeof(line), "[%s] %s\n", ts, body.UTF8String ?: "?");
-    if (n > 0) {
-        if (gLogFd >= 0) { ssize_t ig = write(gLogFd, line, (size_t)n); (void)ig; }
-        if (gLogFdB >= 0) { ssize_t ig = write(gLogFdB, line, (size_t)n); (void)ig; }
-    }
+    if (n > 0) SBKWriteBytes(line, (size_t)n);
+}
+
+// 关键事件日志（无条件写）
+static void SBKLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    SBKVLog(YES, NULL, 0, fmt, ap);
+    va_end(ap);
+}
+
+// 可限流日志：thrKey 相同、且距上次写入不足 sec 秒时丢弃
+static void SBKLogT(const char *thrKey, int sec, NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    SBKVLog(NO, thrKey, sec, fmt, ap);
+    va_end(ap);
+}
+
+// 日志体积控制：超过 kLogMaxBytes 就把当前文件滚成 .1（只留一份历史），避免无限增长
+static const off_t kLogMaxBytes = 256 * 1024;
+
+static void SBKLogRotateIfNeeded(const char *path) {
+    if (!path) return;
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if (st.st_size < kLogMaxBytes) return;
+    char bak[512];
+    snprintf(bak, sizeof(bak), "%s.1", path);
+    rename(path, bak);   // 失败也无所谓，继续 append 即可
 }
 
 // ===== 串行队列 =====
@@ -196,7 +268,14 @@ static dispatch_queue_t SBKQueue(void) {
 //   去 +sharedInstance 会触发它现场 alloc/init，UI 依赖没就绪 → SpringBoard 直接崩 → 安全模式。
 //   改用 +sharedInstanceIfExists：只读已存在的实例，不存在就返回 nil（此时必然是开机早期，
 //   也不可能处于「锁屏使用中」状态），零副作用。
+// v2.0.0 优化：加 1 秒缓存。场景 hook 每次 settings 落地都会问锁屏状态（每秒几十次），
+// 每次都 objc_msgSend 到 SpringBoard 单例是无谓开销；锁屏状态秒级精度完全够用。
 static BOOL SBKIsLocked(void) {
+    static time_t cacheAt = 0;
+    static BOOL   cacheVal = NO;
+    time_t now = time(NULL);
+    if (cacheAt == now) return cacheVal;
+
     static Class cls;
     static SEL selIfExists, selShared, selLocked;
     static dispatch_once_t once;
@@ -207,6 +286,8 @@ static BOOL SBKIsLocked(void) {
         selLocked   = sel_registerName("isUILocked");
     });
     if (!cls) return NO;
+    cacheAt = now;
+    cacheVal = NO;
     @try {
         id inst = nil;
         if (class_respondsToSelector(object_getClass((id)cls), selIfExists)) {
@@ -214,12 +295,11 @@ static BOOL SBKIsLocked(void) {
         } else {
             inst = ((id (*)(id, SEL))objc_msgSend)((id)cls, selShared);
         }
-        if (!inst) return NO;
-        return ((BOOL (*)(id, SEL))objc_msgSend)(inst, selLocked);
+        if (inst) cacheVal = ((BOOL (*)(id, SEL))objc_msgSend)(inst, selLocked);
     } @catch (NSException *e) {
         (void)e;
-        return NO;
     }
+    return cacheVal;
 }
 
 // ===== SpringBoard 实例 & 通用调用助手（v1.6.0 按真机 API 重写）=====
@@ -312,7 +392,7 @@ static BOOL SBKUnlockDevice(NSString *why) {
     if (sb && [sb respondsToSelector:sOn]) {
         @try { ((void (*)(id, SEL, id))objc_msgSend)(sb, sOn, ^{}); }
         @catch (NSException *e) { (void)e; }
-        usleep(300 * 1000);
+        usleep(120 * 1000);
         ok = !SBKIsLocked();
         if (ok) SBKLog(@"解锁 (%@) 走 _turnScreenOnAndUnlock ✔", why ?: @"?");
     }
@@ -320,7 +400,7 @@ static BOOL SBKUnlockDevice(NSString *why) {
     if (!ok && sb && [sb respondsToSelector:sel_registerName("requestDeviceUnlock")]) {
         @try { ((void (*)(id, SEL))objc_msgSend)(sb, sel_registerName("requestDeviceUnlock")); }
         @catch (NSException *e) { (void)e; }
-        usleep(300 * 1000);
+        usleep(120 * 1000);
         ok = !SBKIsLocked();
         if (ok) SBKLog(@"解锁 (%@) 走 requestDeviceUnlock ✔", why ?: @"?");
     }
@@ -339,7 +419,7 @@ static BOOL SBKUnlockDevice(NSString *why) {
             for (int i = 0; i < 3 && !ok; i++) {
                 @try { ((void (*)(id, SEL, int, id))objc_msgSend)(mgr, s2, sources[i], nil); }
                 @catch (NSException *e) { (void)e; }
-                usleep(250 * 1000);
+                usleep(120 * 1000);
                 ok = !SBKIsLocked();
                 if (ok) SBKLog(@"解锁 (%@) 走 unlockUIFromSource:%d ✔", why ?: @"?", sources[i]);
             }
@@ -378,7 +458,7 @@ static void SBKRelockDevice(NSString *why) {
         if (!ok && [mgr respondsToSelector:s1]) {
             @try { ((void (*)(id, SEL, int, id, id))objc_msgSend)(mgr, s1, 0, nil, ^{}); }
             @catch (NSException *e) { (void)e; }
-            usleep(400 * 1000);
+            usleep(150 * 1000);
             ok = SBKIsLocked();
             if (ok) SBKLog(@"恢复息屏（%@）lockUIFromSource:withOptions:completion: ✔", why ?: @"?");
         }
@@ -389,7 +469,7 @@ static void SBKRelockDevice(NSString *why) {
                 ((void (*)(id, SEL, BOOL, id, BOOL, BOOL, BOOL, id))objc_msgSend)(
                     mgr, s2, YES, ^{ return (id)nil; }, YES, YES, NO, ^{});
             } @catch (NSException *e) { (void)e; }
-            usleep(500 * 1000);
+            usleep(150 * 1000);
             ok = SBKIsLocked();
             if (ok) SBKLog(@"恢复息屏（%@）_activateLockScreenAnimated ✔", why ?: @"?");
         }
@@ -398,14 +478,14 @@ static void SBKRelockDevice(NSString *why) {
         if (!ok && [mgr respondsToSelector:s3]) {
             @try { ((BOOL (*)(id, SEL))objc_msgSend)(mgr, s3); }
             @catch (NSException *e) { (void)e; }
-            usleep(400 * 1000);
+            usleep(150 * 1000);
             ok = SBKIsLocked();
             if (ok) SBKLog(@"恢复息屏（%@）_lockUI ✔", why ?: @"?");
         }
     }
     // ④ 最后试按键模拟
     if (!ok && SBKTryVoidSel(SBKSpringBoard(), "_simulateLockButtonPress")) {
-        usleep(400 * 1000);
+        usleep(150 * 1000);
         ok = SBKIsLocked();
         if (ok) SBKLog(@"恢复息屏（%@）_simulateLockButtonPress ✔", why ?: @"?");
     }
@@ -428,6 +508,19 @@ static int SBKSettingsForeground(id settings) {
 
 // ===== 找微信 pid（容器无关：路径后缀匹配）=====
 static pid_t SBKPidForTarget(void) {
+    // v2.0.0 优化：先校验缓存 pid。健康检查每 10s 跑一次，绝大多数时候微信 pid 没变，
+    // 原来每次都要 malloc + 遍历全表（几百个进程）逐个 proc_pidpath，纯浪费 CPU。
+    // 现在常态下只做 1 次 proc_pidpath 就返回。
+    static pid_t sCached = -1;
+    if (sCached > 0) {
+        char cp[SBK_PIDPATH_MAX];
+        memset(cp, 0, sizeof(cp));
+        if (proc_pidpath(sCached, cp, sizeof(cp)) > 0 && strstr(cp, "/WeChat.app/WeChat") != NULL) {
+            return sCached;
+        }
+        sCached = -1;
+    }
+
     int cap = 4096;
     pid_t *pids = (pid_t *)malloc(sizeof(pid_t) * (size_t)cap);
     if (!pids) return -1;
@@ -447,6 +540,7 @@ static pid_t SBKPidForTarget(void) {
         }
     }
     free(pids);
+    if (found > 0) sCached = found;
     return found;
 }
 
@@ -825,7 +919,7 @@ static void SBKDumpAPI(void) {
 static BOOL SBKGoHome(void) {
     id sb = SBKSpringBoard();
     if (SBKTryVoidSel(sb, "_simulateHomeButtonPress")) {
-        usleep(300 * 1000);
+        usleep(120 * 1000);
         SBKLog(@"回主屏：SpringBoard _simulateHomeButtonPress");
         return YES;
     }
@@ -838,13 +932,13 @@ static BOOL SBKGoHome(void) {
         if (ui && [ui respondsToSelector:s1]) {
             @try { ((BOOL (*)(id, SEL))objc_msgSend)(ui, s1); }
             @catch (NSException *e) { (void)e; }
-            usleep(300 * 1000);
+            usleep(120 * 1000);
             SBKLog(@"回主屏：SBUIController handleHomeButtonSinglePressUp");
             return YES;
         }
     }
     if (SBKTryVoidSel(sb, "_resetToHomeScreen")) {
-        usleep(300 * 1000);
+        usleep(120 * 1000);
         SBKLog(@"回主屏：SpringBoard _resetToHomeScreen");
         return YES;
     }
@@ -852,11 +946,29 @@ static BOOL SBKGoHome(void) {
     return NO;
 }
 
+// ===== 状态机 =====
+static int    gFailCount = 0;
+static time_t gLastLaunchAt = 0;
+static dispatch_source_t gHealthTimer = nil;
+static dispatch_source_t gExitSource = nil;
+static pid_t  gWatchedPid = 0;
+static int    gTick = 0;
+static int    gLastProcStatus = -99;
+static uint64_t gLastCPUTime = 0;
+static int    gStallTicks = 0;       // 连续多少 tick CPU 时间没前进
+
 static void SBKStartPrime(NSString *why) {
     time_t now = time(NULL);
     if (gLastPrimeAt > 0 && (now - gLastPrimeAt) < 15) return;   // 15s 内不重复过前台
-    gLastPrimeAt = now;
 
+    // v2.0.0 优化：微信已经在跑、场景就在前台、且没被挂起 → 没必要再亮屏折腾一遍
+    pid_t already = SBKPidForTarget();
+    if (already > 0 && gTargetSceneFG == 1 && !SBKIsLocked() && SBKProcStatus(already) != SBK_SSTOP) {
+        SBKLogT("primeSkip", 120, @"跳过过前台：微信 pid=%d 已在前台运行（%@）", already, why ?: @"?");
+        return;
+    }
+
+    gLastPrimeAt = now;
     SBKLog(@"===== 前台过一遍开始：%@ (locked=%d) =====", why ?: @"?", SBKIsLocked() ? 1 : 0);
     // 解锁 / 回主屏 / 锁屏都是 SpringBoard 内部状态操作，统一放主线程做（SBKLaunch 自己也会再保险解锁一次）
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -901,6 +1013,33 @@ static void SBKStartPrime(NSString *why) {
     });
 }
 
+// ===== 5 秒延迟拉起（v2.0.0 老板定案：被杀后不要立刻拉，等 5 秒）=====
+// 好处：给微信/系统一次自然回收机会，避免「杀掉-秒拉」抖动；少一次无谓亮屏；
+// 也防住退出事件 + 健康定时器 + 场景 hook 三处同时触发导致的重复拉起。
+static time_t gPendingRelaunchAt = 0;
+
+static void SBKScheduleRelaunch(NSString *why) {
+    time_t now = time(NULL);
+    if (gPendingRelaunchAt > 0 && (now - gPendingRelaunchAt) <= (time_t)kRelaunchDelaySec + 3) {
+        return;   // 已经排了队，别叠任务
+    }
+    gPendingRelaunchAt = now;
+    NSString *reason = why ? [why copy] : @"?";
+    SBKLog(@"微信不在运行 → %d 秒后拉起（%@）", kRelaunchDelaySec, reason);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRelaunchDelaySec * NSEC_PER_SEC)),
+                   SBKQueue(), ^{
+        gPendingRelaunchAt = 0;
+        if (SBKPidForTarget() > 0) {
+            SBKLogT("relaunchSkip", 60, @"等待期内微信已自行启动，取消本次拉起");
+            return;
+        }
+        gLastLaunchAt = time(NULL);
+        if (gFailCount < kLaunchBackoffCount) gFailCount++;
+        SBKStartPrime(reason);
+    });
+}
+
 static void SBKForceRelaunch(NSString *why) {
     time_t now = time(NULL);
     if (gLastForceLaunchAt > 0 && (now - gLastForceLaunchAt) < 12) return;   // 12s 内不重复
@@ -925,17 +1064,6 @@ static void SBKSuspendRecheck(NSString *tag) {
     });
 }
 
-// ===== 状态机 =====
-static int    gFailCount = 0;
-static time_t gLastLaunchAt = 0;
-static dispatch_source_t gHealthTimer = nil;
-static dispatch_source_t gExitSource = nil;
-static pid_t  gWatchedPid = 0;
-static int    gTick = 0;
-static int    gLastProcStatus = -99;
-static uint64_t gLastCPUTime = 0;
-static int    gStallTicks = 0;       // 连续多少 tick CPU 时间没前进
-
 static void SBKArmExitWatch(pid_t pid);
 
 static void SBKTick(void) {
@@ -952,9 +1080,7 @@ static void SBKTick(void) {
         time_t now = time(NULL);
         NSTimeInterval wait = kLaunchBackoff[gFailCount < kLaunchBackoffCount ? gFailCount : kLaunchBackoffCount - 1];
         if (gLastLaunchAt > 0 && (now - gLastLaunchAt) < (time_t)wait) return;   // 退避中
-        gLastLaunchAt = now;
-        if (gFailCount < kLaunchBackoffCount) gFailCount++;
-        SBKStartPrime(@"微信不在运行");
+        SBKScheduleRelaunch(@"微信不在运行");
         return;
     }
 
@@ -1024,10 +1150,9 @@ static void SBKArmExitWatch(pid_t pid) {
             dispatch_source_cancel(strongSrc);
             if (gExitSource == strongSrc) gExitSource = nil;
         }
-        // 立刻走一次状态机（会按退避阶梯发起拉起）
-        gLastLaunchAt = 0;   // 退出是明确事件，不等退避
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                       SBKQueue(), ^{ SBKTick(); });
+        // 退出是明确事件：清掉退避基准，交给 5 秒延迟拉起
+        gLastLaunchAt = 0;
+        SBKScheduleRelaunch(@"微信退出事件");
     });
     dispatch_resume(src);
     gExitSource = src;
@@ -1077,12 +1202,12 @@ static int gHookNo = 0;
 static void SBKApplySettingsHook(id self, SEL _cmd, id settings, id scene, id ctx, id completion) {
     // 埋点：只记前 3 次，确认 hook 是否在启动期就被调用、是否死在半路
     int no = gHookNo < 100 ? ++gHookNo : 100;
-    if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-enter\n", no); SBKRawLog(b); }
+    if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-enter\n", no); SBKStage(b); }
 
     if (gForceScene && gInForce == 0 && SBKSettled()) {
-        if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-precheck\n", no); SBKRawLog(b); }
+        if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-precheck\n", no); SBKStage(b); }
         BOOL locked = SBKIsLocked();
-        if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-locked=%d\n", no, locked ? 1 : 0); SBKRawLog(b); }
+        if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-locked=%d\n", no, locked ? 1 : 0); SBKStage(b); }
         if (locked) {
             @try {
                 NSString *bid = SBKSceneBID(scene);
@@ -1103,23 +1228,30 @@ static void SBKApplySettingsHook(id self, SEL _cmd, id settings, id scene, id ct
             }
         }
     }
-    if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-call-orig\n", no); SBKRawLog(b); }
+    if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-call-orig\n", no); SBKStage(b); }
     if (gOrigApplySettings) gOrigApplySettings(self, _cmd, settings, scene, ctx, completion);
-    if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-orig-done\n", no); SBKRawLog(b); }
+    if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-orig-done\n", no); SBKStage(b); }
 
     // 采集微信场景的前台状态（只读，供有头模式的健康复核用）
+    // v2.0.0 优化：场景 settings 每秒落地几十次，探针降到 0.5s 最多一次；
+    // 状态变化日志按 key 限流 60s——原来前后台一切换就写一条，日志被刷爆。
     if (gHeadfulMode != 0 && SBKSettled()) {
-        @try {
-            NSString *bid2 = SBKSceneBID(scene);
-            if ([bid2 isEqualToString:kTargetBID]) {
-                int fg = SBKSettingsForeground(settings);
-                if (fg >= 0 && fg != gTargetSceneFG) {
-                    gTargetSceneFG = fg;
-                    SBKLog(@"微信场景前台状态 → %@ (locked=%d)",
-                           fg ? @"前台" : @"非前台", SBKIsLocked() ? 1 : 0);
+        static NSTimeInterval sProbeAt = 0;
+        NSTimeInterval nowProbe = [NSDate timeIntervalSinceReferenceDate];
+        if (nowProbe - sProbeAt >= 0.5) {
+            sProbeAt = nowProbe;
+            @try {
+                NSString *bid2 = SBKSceneBID(scene);
+                if ([bid2 isEqualToString:kTargetBID]) {
+                    int fg = SBKSettingsForeground(settings);
+                    if (fg >= 0 && fg != gTargetSceneFG) {
+                        gTargetSceneFG = fg;
+                        SBKLogT("sceneFG", 60, @"微信场景前台状态 → %@ (locked=%d)",
+                                fg ? @"前台" : @"非前台", SBKIsLocked() ? 1 : 0);
+                    }
                 }
-            }
-        } @catch (NSException *e) { (void)e; }
+            } @catch (NSException *e) { (void)e; }
+        }
     }
 }
 
@@ -1147,12 +1279,13 @@ static void SBKDidExitHook(id self, SEL _cmd, id ctx) {
                     if (d) reasonDesc = [reasonDesc stringByAppendingFormat:@" | desc=%@", d];
                 }
             } @catch (NSException *e) { (void)e; }
-            SBKLog(@"_didExitWithContext 微信退出，清理断言 | reason=%@ | ctx=%@", reasonDesc, ctxDesc);
+            // 日志降频：平时只写一行简短死因；完整 ctx 只在 xrkeep.dump 诊断模式下才写
+            SBKLog(@"_didExitWithContext 微信退出 | %@", reasonDesc);
+            if (gStageOn) SBKLog(@"_didExitWithContext 完整 ctx=%@", ctxDesc);
             dispatch_async(SBKQueue(), ^{
                 SBKDropAssertion(@"_didExitWithContext");
                 gLastLaunchAt = 0;
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                               SBKQueue(), ^{ SBKTick(); });
+                SBKScheduleRelaunch(@"微信被杀死");
             });
         }
     } @catch (NSException *e) {
@@ -1163,18 +1296,29 @@ static void SBKDidExitHook(id self, SEL _cmd, id ctx) {
 
 // ===== 入口（普通 constructor，不依赖 Logos）=====
 __attribute__((constructor)) static void SBKInit(void) {
-    // ① 先开两路日志：纯 C，不依赖 ObjC / NSString，ctor 第一件事就能落盘
+    // ① 日志：先按体积轮转，再只开一路 fd（A 优先，打不开才退回 B）——单路写，省一半 IO
+    const char *pathA = kLogPathA.fileSystemRepresentation;
+    const char *pathB = kLogPathB.fileSystemRepresentation;
+    SBKLogRotateIfNeeded(pathA);
+    SBKLogRotateIfNeeded(pathB);
+
     errno = 0;
-    gLogFd = open(kLogPathA.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    gLogFd = open(pathA, O_WRONLY | O_CREAT | O_APPEND, 0644);
     int errA = errno;
-    errno = 0;
-    gLogFdB = open(kLogPathB.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    int errB = errno;
+    int errB = 0;
+    if (gLogFd < 0) {
+        errno = 0;
+        gLogFdB = open(pathB, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        errB = errno;
+    }
+
+    // 诊断开关（STAGE 埋点 / API 勘探）统一由 xrkeep.dump 控制，默认全静默
+    gStageOn = (access("/var/mobile/Library/SpringBoard/xrkeep.dump", F_OK) == 0) ? 1 : 0;
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v1.6.1 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
-             getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB);
+             "\n===== XRWeChatKeep v2.0.0 pid=%d proc=%s fdA=%d(e%d) fdB=%d(e%d) stage=%d =====\n",
+             getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB, gStageOn);
     SBKRawLog(head);
     gCtorAt = time(NULL);
 
@@ -1191,60 +1335,60 @@ __attribute__((constructor)) static void SBKInit(void) {
         return;
     }
 
-    SBKRawLog("STAGE: springboard-ctor-enter\n");
+    SBKStage("STAGE: springboard-ctor-enter\n");
 
     Class cSceneMgr = objc_getClass("FBSceneManager");
     BOOL okScene = SBKHook(cSceneMgr,
                            sel_registerName("_applyMutableSettings:toScene:withTransitionContext:completion:"),
                            (IMP)SBKApplySettingsHook, (IMP *)&gOrigApplySettings);
-    SBKRawLog("STAGE: hook-scene-done\n");
+    SBKStage("STAGE: hook-scene-done\n");
     Class cApp = objc_getClass("SBApplication");
     BOOL okExit = SBKHook(cApp, sel_registerName("_didExitWithContext:"),
                           (IMP)SBKDidExitHook, (IMP *)&gOrigDidExit);
     SBKLog(@"hook 结果 sceneMgr=%d(FBSceneManager=%s) didExit=%d(SBApplication=%s)",
            okScene ? 1 : 0, cSceneMgr ? "yes" : "nil", okExit ? 1 : 0, cApp ? "yes" : "nil");
-    SBKRawLog("STAGE: hook-all-done, load mode\n");
+    SBKStage("STAGE: hook-all-done, load mode\n");
 
     // 有头 / 无头模式判定（无密码设备默认有头）
     SBKLoadMode();
 
     // ③ 3s 只做「无副作用」的状态观测（读 pid / 读状态 / 读锁屏），不碰任何系统单例构建
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), SBKQueue(), ^{
-        SBKRawLog("STAGE: selfcheck-enter\n");
+        SBKStage("STAGE: selfcheck-enter\n");
         @try {
             pid_t pid = SBKPidForTarget();
-            SBKRawLog("STAGE: selfcheck-pid-done\n");
+            SBKStage("STAGE: selfcheck-pid-done\n");
             int st = SBKProcStatus(pid);
-            SBKRawLog("STAGE: selfcheck-stat-done\n");
+            SBKStage("STAGE: selfcheck-stat-done\n");
             int locked = SBKIsLocked() ? 1 : 0;
-            SBKRawLog("STAGE: selfcheck-locked-done\n");
+            SBKStage("STAGE: selfcheck-locked-done\n");
             SBKLog(@"启动自检 pid=%d stat=%d locked=%d", pid, st, locked);
         } @catch (NSException *e) {
             SBKLog(@"自检异常 %@", e.reason ?: @"?");
-            SBKRawLog("STAGE: selfcheck-exception\n");
+            SBKStage("STAGE: selfcheck-exception\n");
         }
     });
 
     // ④ 15s 后才开始「动系统」（断言 / 退出监听 / 健康定时器）。给 SpringBoard 充分启动时间。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)), SBKQueue(), ^{
-        SBKRawLog("STAGE: active-enter\n");
+        SBKStage("STAGE: active-enter\n");
         @try {
             pid_t pid = SBKPidForTarget();
             if (pid > 0) {
                 SBKArmExitWatch(pid);
-                SBKRawLog("STAGE: active-watch-done\n");
+                SBKStage("STAGE: active-watch-done\n");
                 SBKEnsureAssertion(pid);
-                SBKRawLog("STAGE: active-assert-done\n");
+                SBKStage("STAGE: active-assert-done\n");
             }
             SBKStartHealthTimer();
-            SBKRawLog("STAGE: active-timer-done\n");
+            SBKStage("STAGE: active-timer-done\n");
             // 诊断开关：/var/mobile/Library/SpringBoard/xrkeep.dump 存在时输出 API 勘探结果
             if (access("/var/mobile/Library/SpringBoard/xrkeep.dump", F_OK) == 0) SBKDumpAPI();
             SBKTick();
-            SBKRawLog("STAGE: active-tick-done\n");
+            SBKStage("STAGE: active-tick-done\n");
         } @catch (NSException *e) {
             SBKLog(@"启动异常 %@", e.reason ?: @"?");
-            SBKRawLog("STAGE: active-exception\n");
+            SBKStage("STAGE: active-exception\n");
         }
     });
 }
