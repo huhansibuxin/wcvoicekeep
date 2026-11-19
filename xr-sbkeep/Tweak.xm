@@ -448,7 +448,13 @@ static void SBKStartHealthTimer(void) {
 - (void)_didExitWithContext:(id)ctx {
     BOOL target = NO;
     @try {
-        target = [[self valueForKey:@"bundleIdentifier"] isEqualToString:kTargetBID];
+        // self 在 %hook 内是前置声明类型，统一走 id 收发消息
+        id app = (id)self;
+        NSString *bid = [app valueForKey:@"bundleIdentifier"];
+        if (![bid isKindOfClass:[NSString class]]) {
+            bid = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("bundleIdentifier"));
+        }
+        target = [bid isKindOfClass:[NSString class]] && [bid isEqualToString:kTargetBID];
     } @catch (NSException *e) {
             (void)e;
         }
