@@ -1,4 +1,13 @@
-// XRWeChatKeep — v2.0.0（正式版：5 秒延迟拉起 + 日志降频 + CPU 优化）
+// XRWeChatKeep — v2.0.1（正式版：5 秒延迟拉起 + 日志降频 + CPU 优化）
+//
+// v2.0.1（修 v2.0.0 实测暴露的解锁误判）：
+//   v2.0.0 给 SBKIsLocked 加的「1 秒缓存」把解锁后的回读也缓存了 —— 解锁刚做完 120ms 就回查，
+//   拿到的还是旧的 locked=1，于是把「无密码设备」误判成有密码、整条链路退化成无头拉起。
+//   修法：① 缓存改 200ms（毫秒级）并新增无缓存的 SBKLockedNow()；
+//        ② 解锁/锁屏/回主屏内部一律用 SBKLockedNow() 回读；
+//        ③ 模式判定可纠正：只要解开过一次就永远按有头跑，不再一次失败就锁死无头；
+//        ④ 拉起前总是尝试解锁（不再按模式跳过），模式判错也能自愈；
+//        ⑤ 解锁等待 120ms → 250ms；场景采集不再依赖模式判定。
 //
 // v2.0.0（老板 2026-11-19 定案，正式使用版）：
 //   ① 微信被杀后**延迟 5 秒**再拉起（原来杀掉同一秒就拉），给系统一次自然回收机会；
@@ -270,12 +279,8 @@ static dispatch_queue_t SBKQueue(void) {
 //   也不可能处于「锁屏使用中」状态），零副作用。
 // v2.0.0 优化：加 1 秒缓存。场景 hook 每次 settings 落地都会问锁屏状态（每秒几十次），
 // 每次都 objc_msgSend 到 SpringBoard 单例是无谓开销；锁屏状态秒级精度完全够用。
-static BOOL SBKIsLocked(void) {
-    static time_t cacheAt = 0;
-    static BOOL   cacheVal = NO;
-    time_t now = time(NULL);
-    if (cacheAt == now) return cacheVal;
-
+// 原始读取（无缓存）。解锁/锁屏这类「刚改变状态」的场景必须用它，否则会读到缓存旧值。
+static BOOL SBKLockedNow(void) {
     static Class cls;
     static SEL selIfExists, selShared, selLocked;
     static dispatch_once_t once;
@@ -286,8 +291,6 @@ static BOOL SBKIsLocked(void) {
         selLocked   = sel_registerName("isUILocked");
     });
     if (!cls) return NO;
-    cacheAt = now;
-    cacheVal = NO;
     @try {
         id inst = nil;
         if (class_respondsToSelector(object_getClass((id)cls), selIfExists)) {
@@ -295,10 +298,30 @@ static BOOL SBKIsLocked(void) {
         } else {
             inst = ((id (*)(id, SEL))objc_msgSend)((id)cls, selShared);
         }
-        if (inst) cacheVal = ((BOOL (*)(id, SEL))objc_msgSend)(inst, selLocked);
+        if (!inst) return NO;
+        return ((BOOL (*)(id, SEL))objc_msgSend)(inst, selLocked);
     } @catch (NSException *e) {
         (void)e;
+        return NO;
     }
+}
+
+// v2.0.0 优化：普通逻辑走 200ms 缓存（场景 hook 每次 settings 落地都会问一次）。
+// 注意 v2.0.0 首版的 1 秒缓存导致「解锁后回读仍是旧值 → 误判无密码设备为有密码」，
+// 现已改为毫秒级 + 关键路径强制走 SBKLockedNow()。
+static double SBKNowMs(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+}
+
+static BOOL SBKIsLocked(void) {
+    static double cacheAt = 0;
+    static BOOL   cacheVal = NO;
+    double now = SBKNowMs();
+    if (cacheAt > 0 && (now - cacheAt) < 200.0) return cacheVal;
+    cacheVal = SBKLockedNow();
+    cacheAt = now;
     return cacheVal;
 }
 
@@ -379,7 +402,7 @@ static void SBKLoadMode(void) {
 //   SpringBoard -requestDeviceUnlock
 //   SBLockScreenManager -unlockUIFromSource:withOptions:（注意是 void 返回，之前当 BOOL 用是错的）
 static BOOL SBKUnlockDevice(NSString *why) {
-    if (!SBKIsLocked()) return YES;
+    if (!SBKLockedNow()) return YES;
     time_t now = time(NULL);
     if (gLastUnlockAt > 0 && (now - gLastUnlockAt) < 3) return NO;
     gLastUnlockAt = now;
@@ -392,16 +415,16 @@ static BOOL SBKUnlockDevice(NSString *why) {
     if (sb && [sb respondsToSelector:sOn]) {
         @try { ((void (*)(id, SEL, id))objc_msgSend)(sb, sOn, ^{}); }
         @catch (NSException *e) { (void)e; }
-        usleep(120 * 1000);
-        ok = !SBKIsLocked();
+        usleep(250 * 1000);
+        ok = !SBKLockedNow();
         if (ok) SBKLog(@"解锁 (%@) 走 _turnScreenOnAndUnlock ✔", why ?: @"?");
     }
     // ② requestDeviceUnlock
     if (!ok && sb && [sb respondsToSelector:sel_registerName("requestDeviceUnlock")]) {
         @try { ((void (*)(id, SEL))objc_msgSend)(sb, sel_registerName("requestDeviceUnlock")); }
         @catch (NSException *e) { (void)e; }
-        usleep(120 * 1000);
-        ok = !SBKIsLocked();
+        usleep(250 * 1000);
+        ok = !SBKLockedNow();
         if (ok) SBKLog(@"解锁 (%@) 走 requestDeviceUnlock ✔", why ?: @"?");
     }
     // ③ SBLockScreenManager（void 返回，逐个 source 试）
@@ -419,21 +442,23 @@ static BOOL SBKUnlockDevice(NSString *why) {
             for (int i = 0; i < 3 && !ok; i++) {
                 @try { ((void (*)(id, SEL, int, id))objc_msgSend)(mgr, s2, sources[i], nil); }
                 @catch (NSException *e) { (void)e; }
-                usleep(120 * 1000);
-                ok = !SBKIsLocked();
+                usleep(250 * 1000);
+                ok = !SBKLockedNow();
                 if (ok) SBKLog(@"解锁 (%@) 走 unlockUIFromSource:%d ✔", why ?: @"?", sources[i]);
             }
         }
     }
 
-    BOOL stillLocked = SBKIsLocked();
+    BOOL stillLocked = SBKLockedNow();
     SBKLog(@"解锁 (%@) 结果 locked=%d", why ?: @"?", stillLocked ? 1 : 0);
-    if (!stillLocked && gHeadfulMode < 0) {
+    // 模式判定允许纠正：只要成功解开过一次，就永远按有头跑。
+    // （v2.0.0 首版把一次失败的解锁固化成"无头"，之后再也不解锁 → 必须修）
+    if (!stillLocked && gHeadfulMode != 1) {
         gHeadfulMode = 1;
         SBKLog(@"模式判定=有头（免密解锁成功）");
     } else if (stillLocked && gHeadfulMode < 0) {
         gHeadfulMode = 0;
-        SBKLog(@"模式判定=无头（解锁不成功，多半还设着密码）");
+        SBKLog(@"模式判定=待定（本次解锁未成功，下次继续尝试）");
     }
     return (stillLocked == NO);
 }
@@ -441,7 +466,7 @@ static BOOL SBKUnlockDevice(NSString *why) {
 // 交回后台 / 恢复息屏。真机实测：_simulateLockButtonPress 调了但 locked 仍为 0（不生效），
 // 所以改用 SBLockScreenManager 的锁屏实现，逐档尝试并实测 locked。
 static void SBKRelockDevice(NSString *why) {
-    if (SBKIsLocked()) return;
+    if (SBKLockedNow()) return;
 
     Class cls = objc_getClass("SBLockScreenManager");
     id mgr = nil;
@@ -458,8 +483,8 @@ static void SBKRelockDevice(NSString *why) {
         if (!ok && [mgr respondsToSelector:s1]) {
             @try { ((void (*)(id, SEL, int, id, id))objc_msgSend)(mgr, s1, 0, nil, ^{}); }
             @catch (NSException *e) { (void)e; }
-            usleep(150 * 1000);
-            ok = SBKIsLocked();
+            usleep(250 * 1000);
+            ok = SBKLockedNow();
             if (ok) SBKLog(@"恢复息屏（%@）lockUIFromSource:withOptions:completion: ✔", why ?: @"?");
         }
         // ② _activateLockScreenAnimated:...（SpringBoard 真正的锁屏流程）
@@ -469,8 +494,8 @@ static void SBKRelockDevice(NSString *why) {
                 ((void (*)(id, SEL, BOOL, id, BOOL, BOOL, BOOL, id))objc_msgSend)(
                     mgr, s2, YES, ^{ return (id)nil; }, YES, YES, NO, ^{});
             } @catch (NSException *e) { (void)e; }
-            usleep(150 * 1000);
-            ok = SBKIsLocked();
+            usleep(250 * 1000);
+            ok = SBKLockedNow();
             if (ok) SBKLog(@"恢复息屏（%@）_activateLockScreenAnimated ✔", why ?: @"?");
         }
         // ③ _lockUI（BOOL 返回）
@@ -478,18 +503,18 @@ static void SBKRelockDevice(NSString *why) {
         if (!ok && [mgr respondsToSelector:s3]) {
             @try { ((BOOL (*)(id, SEL))objc_msgSend)(mgr, s3); }
             @catch (NSException *e) { (void)e; }
-            usleep(150 * 1000);
-            ok = SBKIsLocked();
+            usleep(250 * 1000);
+            ok = SBKLockedNow();
             if (ok) SBKLog(@"恢复息屏（%@）_lockUI ✔", why ?: @"?");
         }
     }
     // ④ 最后试按键模拟
     if (!ok && SBKTryVoidSel(SBKSpringBoard(), "_simulateLockButtonPress")) {
-        usleep(150 * 1000);
-        ok = SBKIsLocked();
+        usleep(250 * 1000);
+        ok = SBKLockedNow();
         if (ok) SBKLog(@"恢复息屏（%@）_simulateLockButtonPress ✔", why ?: @"?");
     }
-    SBKLog(@"恢复息屏（%@）结束 locked=%d", why ?: @"?", SBKIsLocked() ? 1 : 0);
+    SBKLog(@"恢复息屏（%@）结束 locked=%d", why ?: @"?", SBKLockedNow() ? 1 : 0);
 }
 
 // 微信场景是否前台（由场景 hook 顺带采集，未知 = -1）
@@ -788,10 +813,10 @@ static void SBKLaunchViaSBS(NSString *why) {
 }
 
 static void SBKLaunch(NSString *why) {
-    if (gHeadfulMode != 0) {
-        // 有头第一步：把锁屏解掉（息屏/锁屏下必须先解开，否则拉起会被压回后台）。
-        SBKUnlockDevice(why ?: @"拉起前");
-
+    // 先尝试解锁（无密码设备必成功）。不按 gHeadfulMode 跳过——万一模式被判错，
+    // 也能在这里自愈回有头；有密码设备解锁失败会自然落到下面的无头路径。
+    BOOL unlocked = SBKUnlockDevice(why ?: @"拉起前");
+    if (unlocked) {
         // SpringBoard 自己的有头拉起（真机 API 勘探确认存在）：
         //   -launchApplicationWithIdentifier:suspended:
         //   suspended=NO → 带 UI 前台启动，这是「过前台」最正规的入口。
@@ -919,7 +944,7 @@ static void SBKDumpAPI(void) {
 static BOOL SBKGoHome(void) {
     id sb = SBKSpringBoard();
     if (SBKTryVoidSel(sb, "_simulateHomeButtonPress")) {
-        usleep(120 * 1000);
+        usleep(250 * 1000);
         SBKLog(@"回主屏：SpringBoard _simulateHomeButtonPress");
         return YES;
     }
@@ -932,13 +957,13 @@ static BOOL SBKGoHome(void) {
         if (ui && [ui respondsToSelector:s1]) {
             @try { ((BOOL (*)(id, SEL))objc_msgSend)(ui, s1); }
             @catch (NSException *e) { (void)e; }
-            usleep(120 * 1000);
+            usleep(250 * 1000);
             SBKLog(@"回主屏：SBUIController handleHomeButtonSinglePressUp");
             return YES;
         }
     }
     if (SBKTryVoidSel(sb, "_resetToHomeScreen")) {
-        usleep(120 * 1000);
+        usleep(250 * 1000);
         SBKLog(@"回主屏：SpringBoard _resetToHomeScreen");
         return YES;
     }
@@ -1235,7 +1260,7 @@ static void SBKApplySettingsHook(id self, SEL _cmd, id settings, id scene, id ct
     // 采集微信场景的前台状态（只读，供有头模式的健康复核用）
     // v2.0.0 优化：场景 settings 每秒落地几十次，探针降到 0.5s 最多一次；
     // 状态变化日志按 key 限流 60s——原来前后台一切换就写一条，日志被刷爆。
-    if (gHeadfulMode != 0 && SBKSettled()) {
+    if (SBKSettled()) {
         static NSTimeInterval sProbeAt = 0;
         NSTimeInterval nowProbe = [NSDate timeIntervalSinceReferenceDate];
         if (nowProbe - sProbeAt >= 0.5) {
