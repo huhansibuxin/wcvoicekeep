@@ -1,4 +1,15 @@
-// XRWeChatKeep — v2.1.0（正式版收尾：修「用户在用手机时被抢屏锁黑」）
+// XRWeChatKeep — v2.2.0（收尾改回主屏不锁屏，修「卡在通知中心不熄屏」）
+//
+// v2.2.0（老板 2026-11-20 实机反馈）：
+//   现象：CocoaTop 杀微信 → 马上熄屏 → 几秒后自动拉起 → 又过几秒变成通知中心 →
+//         卡在通知中心不熄屏，必须摸一下屏幕才熄。
+//   根因：收尾的 SBKRelockDevice 走 _activateLockScreenAnimated:...inScreenOffMode:YES,
+//         dismissNotificationCenter:NO ...，这个私有 API 只把 UI 锁上、不让背光真正熄灭，
+//         又因为 dismissNotificationCenter=NO 把通知中心留在屏上，于是屏幕常亮卡在通知中心。
+//   改法：过完前台**只回主屏，不主动锁屏**，交给系统自己的自动锁定时间熄屏（老板要求）；
+//         需要旧行为时放 /var/mobile/Library/SpringBoard/xrkeep.relock 文件。
+//         另外把 SBKRelockDevice 里的 dismissNotificationCenter 从 NO 改成 YES，
+//         即使走 relock 也不会再把通知中心留在锁屏界面上。
 //
 // v2.1.0（老板 2026-11-19 收尾排查）：
 //   ① **真 bug**：设备未锁屏（= 老板正在用手机）时，原逻辑照样「解锁+抢前台+停 15s+回主屏+息屏锁屏」，
@@ -539,11 +550,13 @@ static void SBKRelockDevice(NSString *why) {
             if (ok) SBKLog(@"恢复息屏（%@）lockUIFromSource:withOptions:completion: ✔", why ?: @"?");
         }
         // ② _activateLockScreenAnimated:...（SpringBoard 真正的锁屏流程）
+        // v2.2.0：dismissNotificationCenter 由 NO 改成 YES。传 NO 会把通知中心留在锁屏界面上，
+        // 实机表现就是「变成通知中心并卡在那儿」。
         SEL s2 = sel_registerName("_activateLockScreenAnimated:animationProvider:automatically:inScreenOffMode:dismissNotificationCenter:completion:");
         if (!ok && [mgr respondsToSelector:s2]) {
             @try {
                 ((void (*)(id, SEL, BOOL, id, BOOL, BOOL, BOOL, id))objc_msgSend)(
-                    mgr, s2, YES, ^{ return (id)nil; }, YES, YES, NO, ^{});
+                    mgr, s2, YES, ^{ return (id)nil; }, YES, YES, YES, ^{});
             } @catch (NSException *e) { (void)e; }
             usleep(250 * 1000);
             ok = SBKLockedNow();
@@ -1108,11 +1121,21 @@ static void SBKStartPrime(NSString *why) {
         SBKLog(@"前台停留 %ds 结束 pid=%d stat=%d sceneFG=%d → 交回后台",
                gPrimeHoldSec, p, st, gTargetSceneFG);
         BOOL homeOK = SBKGoHome();
-        // 默认「过完前台就恢复息屏」（无 xrkeep.stay 时）；息屏后微信自然回后台。
-        if (access("/var/mobile/Library/SpringBoard/xrkeep.stay", F_OK) != 0) {
-            SBKRelockDevice(homeOK ? @"过完前台恢复息屏" : @"回主屏不可用，直接恢复息屏");
-        } else {
+        // v2.2.0（老板 2026-11-20 实机反馈）：过完前台**只回主屏，不再主动锁屏**。
+        // 原来这里调 SBKRelockDevice → _activateLockScreenAnimated:...:inScreenOffMode:YES
+        // dismissNotificationCenter:NO ...，实机表现是：屏幕一亮、过几秒变成通知中心（锁屏界面），
+        // 然后**卡在通知中心不熄屏，必须摸一下屏幕才熄**。
+        // 根因：这个私有 API 只把 UI 锁上，既不让背光真正熄灭，又因为 dismissNotificationCenter=NO
+        // 把通知中心留在屏上；inScreenOffMode=YES 还会按"息屏锁屏"样式铺通知。
+        // 老板的要求：回到桌面就行了，之后由系统自己的「自动锁定」时间负责熄屏，不要拉通知中心。
+        // 真需要主动锁屏时放一个 xrkeep.relock 文件即可（保留原行为）。
+        if (access("/var/mobile/Library/SpringBoard/xrkeep.relock", F_OK) == 0) {
+            SBKRelockDevice(@"xrkeep.relock 存在 → 过完前台仍主动锁屏");
+        } else if (access("/var/mobile/Library/SpringBoard/xrkeep.stay", F_OK) == 0) {
             SBKLog(@"xrkeep.stay 存在 → 保持前台不锁屏");
+        } else {
+            SBKLog(@"已回主屏(%@) → 不主动锁屏，交给系统自动锁定时间熄屏",
+                   homeOK ? @"成功" : @"回主屏 API 不可用");
         }
         gLastPrimeAt = time(NULL);
     });
@@ -1440,7 +1463,7 @@ __attribute__((constructor)) static void SBKInit(void) {
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v2.1.0 pid=%d proc=%s fdA=%d(e%d) fdB=%d(e%d) stage=%d =====\n",
+             "\n===== XRWeChatKeep v2.2.0 pid=%d proc=%s fdA=%d(e%d) fdB=%d(e%d) stage=%d =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB, gStageOn);
     SBKRawLog(head);
     gCtorAt = time(NULL);
