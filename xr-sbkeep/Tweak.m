@@ -83,6 +83,7 @@
 #import <fcntl.h>
 #import <errno.h>
 #import <sys/stat.h>
+#import <sys/time.h>
 #import <dlfcn.h>
 
 // 不引用 substrate.h：本工程已完全不用 Logos，hook 走 ObjC runtime 替换 IMP
