@@ -169,3 +169,72 @@ jobs:
         with:
           name: wcvoicekeep-lite-xr14
           path: xr-lite/packages/wcvoicekeep-lite-xr14.deb
+
+  # ===== iPhone XR / iOS 14.6 / rootful：SpringBoard 注入保活 =====
+  # 老板 2026-11-19：XR 在屋里没人解锁，微信掉了必须自动拉起并「一直跑」。
+  # daemon 只能拉起（headless → 被 suspend，CPU=0），所以这一层注入 SpringBoard：
+  # RBSAssertion(PreventTaskSuspend) 让 RunningBoard 不挂起微信，锁屏期再扶持场景。
+  build-xr-sbkeep:
+    name: build (xr-sbkeep rootful iOS14)
+    runs-on: macos-15-intel
+    steps:
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: 'latest-stable'
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Theos (standard, rootful)
+        run: |
+          git clone --recurse-submodules https://github.com/theos/theos.git ${{ runner.temp }}/theos
+          find ${{ runner.temp }}/theos/bin -name "*.pl" -exec sed -i '' '1s|#!/usr/bin/perl|#!/usr/bin/env perl' {} \;
+          echo "THEOS=${{ runner.temp }}/theos" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
+          brew install dpkg ldid
+
+      - name: Install SDK
+        run: |
+          cd ${{ runner.temp }}/theos/sdks
+          curl -sLO https://github.com/theos/sdks/archive/refs/heads/master.zip
+          unzip -q master.zip
+          mv sdks-master/iPhoneOS16.5.sdk .
+          rm -rf sdks-master master.zip
+
+      - name: Build xr-sbkeep
+        run: |
+          set -o pipefail
+          cd xr-sbkeep
+          chmod 755 layout/DEBIAN/postinst
+          make package 2>&1 | tee build-sbkeep.log
+
+      - name: Verify and repack
+        run: |
+          set -o pipefail
+          {
+            if [ ! -d xr-sbkeep/.theos/_ ]; then echo "ERROR: staging missing"; exit 1; fi
+            OUT="xr-sbkeep/packages/xrwechatkeep-xr14.deb"
+            mkdir -p xr-sbkeep/packages
+            rm -f "$OUT"
+            dpkg-deb -b xr-sbkeep/.theos/_ "$OUT"
+            echo "=== control ==="; dpkg-deb -f "$OUT"
+            echo "=== contents ==="; dpkg-deb -c "$OUT"
+          } 2>&1 | tee -a xr-sbkeep/build-sbkeep.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-xr-sbkeep
+          path: xr-sbkeep/build-sbkeep.log
+
+      - name: Upload deb
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrwechatkeep-xr14
+          path: xr-sbkeep/packages/xrwechatkeep-xr14.deb

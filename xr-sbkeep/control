@@ -1,0 +1,9 @@
+Package: com.wcvoicekeep.xrkeep
+Name: XR WeChat Keep
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 只做一件事：让微信在后台「真的持续运行」。注入 SpringBoard，为 com.tencent.xin 持有 RBS 防挂起断言（PreventTaskSuspend/PreventTaskThrottleDown），锁屏期额外扶持场景，并可在微信不在时以解锁语义发起启动。解锁/锁屏均生效；无设置页、无 AltList、无键盘、无音频。
+Depends: firmware (>= 14.0), mobilesubstrate
+Maintainer: huhansibuxin
+Author: huhansibuxin
+Section: Tweaks
