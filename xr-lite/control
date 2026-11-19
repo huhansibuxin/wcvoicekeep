@@ -1,0 +1,9 @@
+Package: com.wcvoicekeep.lite
+Name: 微信保活 Lite
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 只做一件事：保活微信（com.tencent.xin）。被杀后事件驱动地在后台无头拉起，不切前台。无设置页、无 PreferenceLoader、无 AltList、无 SpringBoard 注入、无键盘扩展、无第三方依赖，适配 iOS 14+ rootful 越狱。
+Maintainer: huhansibuxin
+Author: huhansibuxin
+Section: Tweaks
+Depends: firmware (>= 14.0)

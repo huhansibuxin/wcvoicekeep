@@ -1,0 +1,31 @@
+#!/bin/sh
+# wcvoicekeep lite（rootful / iOS 14+）：安装后激活 LaunchDaemon
+#
+# iOS 14 的 launchctl 对 load / bootstrap 都支持，两者都跑、错误全忽略，
+# 最后 enable + kickstart 强制拉起（RunAtLoad 已设，重启后 launchd 也会自动起）。
+
+PLIST=/Library/LaunchDaemons/com.wcvoicekeep.lite.plist
+BIN=/usr/bin/wcvoicekeeplite
+LABEL=com.wcvoicekeep.lite
+
+# 1) 属主/权限（launchd 拒绝执行非 root:wheel 的 daemon）
+chown root:wheel "$PLIST" 2>/dev/null || true
+chmod 0644 "$PLIST" 2>/dev/null || true
+chown root:wheel "$BIN" 2>/dev/null || true
+chmod 0755 "$BIN" 2>/dev/null || true
+
+# 2) 清上一版日志，避免新旧混淆
+rm -f /var/mobile/wcvoicekeep.lite.log /var/log/wcvoicekeeplite.out /var/log/wcvoicekeeplite.err 2>/dev/null || true
+
+# 3) 先卸后载
+launchctl unload "$PLIST" >/dev/null 2>&1 || true
+launchctl bootout system "$LABEL" >/dev/null 2>&1 || true
+
+# 4) 激活
+launchctl load "$PLIST" >/dev/null 2>&1 || true
+launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true
+launchctl enable system/"$LABEL" >/dev/null 2>&1 || true
+launchctl kickstart -k system/"$LABEL" >/dev/null 2>&1 || true
+launchctl start "$LABEL" >/dev/null 2>&1 || true
+
+exit 0

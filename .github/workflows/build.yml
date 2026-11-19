@@ -100,3 +100,72 @@ jobs:
         with:
           name: wcvoicekeep-${{ matrix.variant }}-${{ matrix.flavor }}
           path: packages/wcvoicekeep-${{ matrix.variant }}-${{ matrix.flavor }}.deb
+
+  # ===== iPhone XR / iOS 14.6 / rootful 专用极简版 =====
+  # 老板 2026-11-19：XR 上只要「拉起微信」一件事，不要设置页 / AltList / 键盘 / SpringBoard 注入。
+  # 与上面的 roothide job 完全独立：标准 theos（非 roothide fork）、不设 THEOS_PACKAGE_SCHEME
+  # （空 = 原生根布局）、TARGET min 14.0，产物装到 /Library/LaunchDaemons + /usr/bin。
+  build-xr-lite:
+    name: build (xr-lite rootful iOS14)
+    runs-on: macos-15-intel
+    steps:
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: 'latest-stable'
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Theos (standard, rootful)
+        run: |
+          git clone --recurse-submodules https://github.com/theos/theos.git ${{ runner.temp }}/theos
+          find ${{ runner.temp }}/theos/bin -name "*.pl" -exec sed -i '' '1s|#!/usr/bin/perl|#!/usr/bin/env perl' {} \;
+          echo "THEOS=${{ runner.temp }}/theos" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
+          brew install dpkg ldid
+
+      - name: Install SDK
+        run: |
+          cd ${{ runner.temp }}/theos/sdks
+          curl -sLO https://github.com/theos/sdks/archive/refs/heads/master.zip
+          unzip -q master.zip
+          mv sdks-master/iPhoneOS16.5.sdk .
+          rm -rf sdks-master master.zip
+
+      - name: Build xr-lite
+        run: |
+          set -o pipefail
+          cd xr-lite
+          chmod 755 layout/DEBIAN/postinst
+          make package 2>&1 | tee build-lite.log
+
+      - name: Verify and repack
+        run: |
+          set -o pipefail
+          {
+            if [ ! -d xr-lite/.theos/_ ]; then echo "ERROR: staging missing"; exit 1; fi
+            OUT="xr-lite/packages/wcvoicekeep-lite-xr14.deb"
+            mkdir -p xr-lite/packages
+            rm -f "$OUT"
+            dpkg-deb -b xr-lite/.theos/_ "$OUT"
+            echo "=== control ==="; dpkg-deb -f "$OUT"
+            echo "=== contents ==="; dpkg-deb -c "$OUT"
+          } 2>&1 | tee -a xr-lite/build-lite.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-xr-lite
+          path: xr-lite/build-lite.log
+
+      - name: Upload deb
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wcvoicekeep-lite-xr14
+          path: xr-lite/packages/wcvoicekeep-lite-xr14.deb
