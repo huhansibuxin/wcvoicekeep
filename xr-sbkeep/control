@@ -1,8 +1,8 @@
 Package: com.wcvoicekeep.xrkeep
 Name: XR WeChat Keep
-Version: 1.4.0
+Version: 1.5.0
 Architecture: iphoneos-arm
-Description: 只做一件事：让微信在后台「真的持续运行」。注入 SpringBoard，为 com.tencent.xin 持有 RBS 防挂起断言（PreventTaskSuspend/PreventTaskThrottleDown），锁屏期额外扶持场景；识别挂起态(SSTOP/CPU不前进)并以非挂起方式强制重启，确保拉起后真的在跑。纯 ObjC runtime 实现，不依赖 substrate。解锁/锁屏均生效；无设置页、无 AltList、无键盘、无音频。v1.4.0 新增「有头模式」：设备无锁屏密码时自动免密解锁 → 有头拉起 → 保持前台（让微信内部注入的插件真正跑起来），有密码自动回落无头；模式可用 /var/mobile/Library/SpringBoard/xrkeep.mode 指定 headful/headless。v1.3.3 加退出原因诊断（读 FBProcessExitContext.exitReason）、跳过必失败的 grants 断言档、锁屏场景强推加日志；v1.3.2 修安全模式：锁屏状态改用 sharedInstanceIfExists（不再在启动期实例化 SBLockScreenManager），并加 12s 启动静默期（含 xrkeep.off 远程急停开关）：ctor 第一行纯 C 落盘，日志主路径改为 SpringBoard 自有目录，Filter 兼挂 Safari 用于判定注入通路。
+Description: 只做一件事：微信掉了就把它「前台过一遍」。注入 SpringBoard，检测到微信不在运行或被杀（含息屏状态下的内存杀）后，免密解锁设备（需已取消锁屏密码）→ 有头（前台）拉起微信 → 前台停留 15 秒 → 回主屏，之后微信靠自己的后台保活继续跑；下次被杀再来一遍。不做保活断言、不做场景欺骗、不注入 App。纯 ObjC runtime 实现，不依赖 substrate。无设置页、无 AltList、无键盘、无音频。可调项：/var/mobile/Library/SpringBoard/xrkeep.prime（前台停留秒数，0=一直留前台）、xrkeep.mode（headful/headless 强制模式）、xrkeep.off（急停开关）。
 Depends: firmware (>= 14.0), mobilesubstrate | libhooker
 Maintainer: huhansibuxin
 Author: huhansibuxin
