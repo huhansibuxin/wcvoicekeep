@@ -1,4 +1,4 @@
-// XRWeChatKeep — v1.5.1（前台过一遍 + API 勘探）
+// XRWeChatKeep — v1.6.0（前台过一遍，真机 API 落地）
 // 老板 2026-11-19 定案：XR 放屋里、没人解锁，微信掉了必须自动拉起并「一直跑」。
 //
 // v1.3.0（XR 实机装 v1.2.0 后「日志 0 字节、ctor 疑似没执行」后加的诊断版）：
@@ -222,6 +222,33 @@ static BOOL SBKIsLocked(void) {
     }
 }
 
+// ===== SpringBoard 实例 & 通用调用助手（v1.6.0 按真机 API 重写）=====
+static id SBKSpringBoard(void) {
+    static Class cls;
+    static SEL sel;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cls = objc_getClass("UIApplication");   // SpringBoard 是 UIApplication 子类，进程内取到的就是它自己
+        sel = sel_registerName("sharedApplication");
+    });
+    if (!cls) return nil;
+    @try { return ((id (*)(id, SEL))objc_msgSend)((id)cls, sel); }
+    @catch (NSException *e) { (void)e; return nil; }
+}
+
+static BOOL SBKTryVoidSel(id obj, const char *name) {
+    if (!obj) return NO;
+    SEL s = sel_registerName(name);
+    if (![obj respondsToSelector:s]) return NO;
+    @try {
+        ((void (*)(id, SEL))objc_msgSend)(obj, s);
+        return YES;
+    } @catch (NSException *e) {
+        (void)e;
+        return NO;
+    }
+}
+
 // ===== v1.5.0「前台过一遍」基础设施 =====
 // 老板 2026-11-19 定案（第二次收窄需求）：
 //   不要保活断言、不要场景欺骗，只做一件事 ——
@@ -267,46 +294,60 @@ static void SBKLoadMode(void) {
            gPrimeHoldSec, low.length ? @"已指定" : @"未指定");
 }
 
-// 免密解锁：设备没锁屏密码时才能成功。只用 +sharedInstanceIfExists（+sharedInstance 会崩，见 v1.3.2）
+// 免密解锁（设备已取消锁屏密码）。真机 API 勘探（v1.5.1）确认 iOS 14 上真实可用的是：
+//   SpringBoard -_turnScreenOnAndUnlockWithCompletion:（点亮+解锁一步到位）
+//   SpringBoard -requestDeviceUnlock
+//   SBLockScreenManager -unlockUIFromSource:withOptions:（注意是 void 返回，之前当 BOOL 用是错的）
 static BOOL SBKUnlockDevice(NSString *why) {
     if (!SBKIsLocked()) return YES;
     time_t now = time(NULL);
     if (gLastUnlockAt > 0 && (now - gLastUnlockAt) < 3) return NO;
     gLastUnlockAt = now;
 
-    Class cls = objc_getClass("SBLockScreenManager");
-    if (!cls) { SBKLog(@"解锁失败：SBLockScreenManager 缺失"); return NO; }
+    BOOL ok = NO;
+    id sb = SBKSpringBoard();
 
-    id mgr = nil;
-    @try {
-        if (class_respondsToSelector(object_getClass((id)cls), sel_registerName("sharedInstanceIfExists"))) {
-            mgr = ((id (*)(id, SEL))objc_msgSend)((id)cls, sel_registerName("sharedInstanceIfExists"));
-        }
-    } @catch (NSException *e) { (void)e; }
-    if (!mgr) { SBKLog(@"解锁跳过：SBLockScreenManager 实例还没建好 (%@)", why ?: @"?"); return NO; }
-
-    BOOL did = NO;
-    SEL s2 = sel_registerName("unlockUIFromSource:withOptions:");
-    if ([mgr respondsToSelector:s2]) {
-        int sources[3] = { 0, 7, 6 };
-        for (int i = 0; i < 3; i++) {
-            @try { did = ((BOOL (*)(id, SEL, int, id))objc_msgSend)(mgr, s2, sources[i], nil); }
-            @catch (NSException *e) { (void)e; }
-            if (did || !SBKIsLocked()) { did = YES; break; }
-        }
+    // ① 点亮并解锁（最贴合「息屏下被拉起」的场景）
+    SEL sOn = sel_registerName("_turnScreenOnAndUnlockWithCompletion:");
+    if (sb && [sb respondsToSelector:sOn]) {
+        @try { ((void (*)(id, SEL, id))objc_msgSend)(sb, sOn, ^{}); }
+        @catch (NSException *e) { (void)e; }
+        usleep(300 * 1000);
+        ok = !SBKIsLocked();
+        if (ok) SBKLog(@"解锁 (%@) 走 _turnScreenOnAndUnlock ✔", why ?: @"?");
     }
-    SEL s1 = sel_registerName("unlockUIFromSource:");
-    if (!did && [mgr respondsToSelector:s1]) {
-        int sources[3] = { 0, 7, 6 };
-        for (int i = 0; i < 3; i++) {
-            @try { did = ((BOOL (*)(id, SEL, int))objc_msgSend)(mgr, s1, sources[i]); }
-            @catch (NSException *e) { (void)e; }
-            if (did || !SBKIsLocked()) { did = YES; break; }
+    // ② requestDeviceUnlock
+    if (!ok && sb && [sb respondsToSelector:sel_registerName("requestDeviceUnlock")]) {
+        @try { ((void (*)(id, SEL))objc_msgSend)(sb, sel_registerName("requestDeviceUnlock")); }
+        @catch (NSException *e) { (void)e; }
+        usleep(300 * 1000);
+        ok = !SBKIsLocked();
+        if (ok) SBKLog(@"解锁 (%@) 走 requestDeviceUnlock ✔", why ?: @"?");
+    }
+    // ③ SBLockScreenManager（void 返回，逐个 source 试）
+    if (!ok) {
+        Class cls = objc_getClass("SBLockScreenManager");
+        id mgr = nil;
+        @try {
+            if (cls && class_respondsToSelector(object_getClass((id)cls), sel_registerName("sharedInstanceIfExists"))) {
+                mgr = ((id (*)(id, SEL))objc_msgSend)((id)cls, sel_registerName("sharedInstanceIfExists"));
+            }
+        } @catch (NSException *e) { (void)e; }
+        SEL s2 = sel_registerName("unlockUIFromSource:withOptions:");
+        if (mgr && [mgr respondsToSelector:s2]) {
+            int sources[3] = { 0, 7, 6 };
+            for (int i = 0; i < 3 && !ok; i++) {
+                @try { ((void (*)(id, SEL, int, id))objc_msgSend)(mgr, s2, sources[i], nil); }
+                @catch (NSException *e) { (void)e; }
+                usleep(250 * 1000);
+                ok = !SBKIsLocked();
+                if (ok) SBKLog(@"解锁 (%@) 走 unlockUIFromSource:%d ✔", why ?: @"?", sources[i]);
+            }
         }
     }
 
     BOOL stillLocked = SBKIsLocked();
-    SBKLog(@"解锁 (%@) 返回=%@ → locked=%d", why ?: @"?", did ? @"YES" : @"NO", stillLocked ? 1 : 0);
+    SBKLog(@"解锁 (%@) 结果 locked=%d", why ?: @"?", stillLocked ? 1 : 0);
     if (!stillLocked && gHeadfulMode < 0) {
         gHeadfulMode = 1;
         SBKLog(@"模式判定=有头（免密解锁成功）");
@@ -317,45 +358,29 @@ static BOOL SBKUnlockDevice(NSString *why) {
     return (stillLocked == NO);
 }
 
-// 交回后台：把设备重新锁上（屏幕灭 → 微信自然回后台），跟 wcvoicekeep 过完前台就退后台一致
+// 交回后台 / 恢复息屏：真机确认可用 SpringBoard -_simulateLockButtonPress（等价按一下电源键）
 static void SBKRelockDevice(NSString *why) {
+    if (SBKIsLocked()) return;
+    id sb = SBKSpringBoard();
+    if (SBKTryVoidSel(sb, "_simulateLockButtonPress")) {
+        usleep(300 * 1000);
+        SBKLog(@"恢复息屏（%@）_simulateLockButtonPress → locked=%d", why ?: @"?", SBKIsLocked() ? 1 : 0);
+        return;
+    }
     Class cls = objc_getClass("SBLockScreenManager");
-    if (!cls) return;
     id mgr = nil;
     @try {
-        if (class_respondsToSelector(object_getClass((id)cls), sel_registerName("sharedInstanceIfExists"))) {
+        if (cls && class_respondsToSelector(object_getClass((id)cls), sel_registerName("sharedInstanceIfExists"))) {
             mgr = ((id (*)(id, SEL))objc_msgSend)((id)cls, sel_registerName("sharedInstanceIfExists"));
         }
     } @catch (NSException *e) { (void)e; }
-    if (!mgr) return;
-    BOOL ok = NO;
     SEL s = sel_registerName("lockUIFromSource:withOptions:");
-    if ([mgr respondsToSelector:s]) {
-        @try { ok = ((BOOL (*)(id, SEL, int, id))objc_msgSend)(mgr, s, 0, nil); }
+    if (mgr && [mgr respondsToSelector:s]) {
+        @try { ((void (*)(id, SEL, int, id))objc_msgSend)(mgr, s, 0, nil); }
         @catch (NSException *e) { (void)e; }
+        usleep(250 * 1000);
     }
-    if (!ok) {
-        SEL s2 = sel_registerName("lockUIFromSource:");
-        if ([mgr respondsToSelector:s2]) {
-            @try { ok = ((BOOL (*)(id, SEL, int))objc_msgSend)(mgr, s2, 0); }
-            @catch (NSException *e) { (void)e; }
-        }
-    }
-    if (!ok) {
-        SEL s3 = sel_registerName("lockDeviceAnimated:");
-        if ([mgr respondsToSelector:s3]) {
-            @try { ok = ((BOOL (*)(id, SEL, BOOL))objc_msgSend)(mgr, s3, YES); }
-            @catch (NSException *e) { (void)e; }
-        }
-    }
-    if (!ok) {
-        SEL s4 = sel_registerName("lockDevice");
-        if ([mgr respondsToSelector:s4]) {
-            @try { ((void (*)(id, SEL))objc_msgSend)(mgr, s4); ok = YES; }
-            @catch (NSException *e) { (void)e; }
-        }
-    }
-    SBKLog(@"交回后台（%@）lock 调用=%@ locked=%d", why ?: @"?", ok ? @"YES" : @"NO", SBKIsLocked() ? 1 : 0);
+    SBKLog(@"恢复息屏（%@）lockUIFromSource → locked=%d", why ?: @"?", SBKIsLocked() ? 1 : 0);
 }
 
 // 微信场景是否前台（由场景 hook 顺带采集，未知 = -1）
@@ -751,41 +776,35 @@ static void SBKDumpAPI(void) {
 // 老板定案的最终形态：把微信拉到前台停一会儿 → 回主屏 → 它自己保活；
 // 下一次被系统杀掉，再来一遍。不做任何保活断言、不做场景欺骗。
 
-static BOOL SBKTryVoidSel(id obj, const char *name) {
-    if (!obj) return NO;
-    SEL s = sel_registerName(name);
-    if (![obj respondsToSelector:s]) return NO;
-    @try {
-        ((void (*)(id, SEL))objc_msgSend)(obj, s);
-        return YES;
-    } @catch (NSException *e) {
-        (void)e;
-        return NO;
-    }
-}
-
-// 回到主屏（让微信用最自然的方式进后台）
+// 回到主屏（让微信用最自然的方式进后台）。真机 API 勘探确认 iOS 14 可用：
+//   SpringBoard -_simulateHomeButtonPress（等价按一下 Home）
+//   SBUIController -handleHomeButtonSinglePressUp
+//   SpringBoard -_resetToHomeScreen
 static BOOL SBKGoHome(void) {
+    id sb = SBKSpringBoard();
+    if (SBKTryVoidSel(sb, "_simulateHomeButtonPress")) {
+        usleep(300 * 1000);
+        SBKLog(@"回主屏：SpringBoard _simulateHomeButtonPress");
+        return YES;
+    }
     Class cUI = objc_getClass("SBUIController");
     if (cUI) {
         id ui = nil;
         @try { ui = ((id (*)(id, SEL))objc_msgSend)((id)cUI, sel_registerName("sharedInstance")); }
         @catch (NSException *e) { (void)e; }
-        const char *sels[] = { "handleHomeButtonSinglePress", "_handleHomeButtonSinglePress" };
-        for (int i = 0; i < 2; i++) {
-            if (SBKTryVoidSel(ui, sels[i])) { SBKLog(@"回主屏：SBUIController %s", sels[i]); return YES; }
+        SEL s1 = sel_registerName("handleHomeButtonSinglePressUp");
+        if (ui && [ui respondsToSelector:s1]) {
+            @try { ((BOOL (*)(id, SEL))objc_msgSend)(ui, s1); }
+            @catch (NSException *e) { (void)e; }
+            usleep(300 * 1000);
+            SBKLog(@"回主屏：SBUIController handleHomeButtonSinglePressUp");
+            return YES;
         }
     }
-    Class cWS = objc_getClass("SBMainWorkspace");
-    if (cWS) {
-        id ws = nil;
-        @try { ws = ((id (*)(id, SEL))objc_msgSend)((id)cWS, sel_registerName("sharedInstance")); }
-        @catch (NSException *e) { (void)e; }
-        const char *sels[] = { "dismissAppSwitcherAndReturnToHomeScreen",
-                               "_dismissAppSwitcherAndReturnToHomeScreen" };
-        for (int i = 0; i < 2; i++) {
-            if (SBKTryVoidSel(ws, sels[i])) { SBKLog(@"回主屏：SBMainWorkspace %s", sels[i]); return YES; }
-        }
+    if (SBKTryVoidSel(sb, "_resetToHomeScreen")) {
+        usleep(300 * 1000);
+        SBKLog(@"回主屏：SpringBoard _resetToHomeScreen");
+        return YES;
     }
     SBKLog(@"回主屏：没有可用入口");
     return NO;
@@ -797,15 +816,18 @@ static void SBKStartPrime(NSString *why) {
     gLastPrimeAt = now;
 
     SBKLog(@"===== 前台过一遍开始：%@ (locked=%d) =====", why ?: @"?", SBKIsLocked() ? 1 : 0);
-    SBKUnlockDevice(@"过前台前");
-    dispatch_async(dispatch_get_main_queue(), ^{ SBKLaunch(why); });
+    // 解锁 / 回主屏 / 锁屏都是 SpringBoard 内部状态操作，统一放主线程做（SBKLaunch 自己也会再保险解锁一次）
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SBKUnlockDevice(@"过前台前");
+        SBKLaunch(why);
+    });
 
     if (gPrimeHoldSec <= 0) {
         SBKLog(@"xrkeep.prime=0 → 保持前台，不交回后台");
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gPrimeHoldSec * NSEC_PER_SEC)),
-                   SBKQueue(), ^{
+                   dispatch_get_main_queue(), ^{
         pid_t p = SBKPidForTarget();
         if (p <= 0) {
             SBKLog(@"前台停留结束，但微信已不在（启动失败？）");
@@ -814,7 +836,13 @@ static void SBKStartPrime(NSString *why) {
         int st = SBKProcStatus(p);
         SBKLog(@"前台停留 %ds 结束 pid=%d stat=%d sceneFG=%d → 交回后台",
                gPrimeHoldSec, p, st, gTargetSceneFG);
-        if (!SBKGoHome()) SBKRelockDevice(@"回主屏不可用");
+        BOOL homeOK = SBKGoHome();
+        // 默认「过完前台就恢复息屏」（无 xrkeep.stay 时）；息屏后微信自然回后台。
+        if (access("/var/mobile/Library/SpringBoard/xrkeep.stay", F_OK) != 0) {
+            SBKRelockDevice(homeOK ? @"过完前台恢复息屏" : @"回主屏不可用，直接恢复息屏");
+        } else {
+            SBKLog(@"xrkeep.stay 存在 → 保持前台不锁屏");
+        }
         gLastPrimeAt = time(NULL);
     });
 }
@@ -1091,7 +1119,7 @@ __attribute__((constructor)) static void SBKInit(void) {
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v1.5.1 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
+             "\n===== XRWeChatKeep v1.6.0 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB);
     SBKRawLog(head);
     gCtorAt = time(NULL);
