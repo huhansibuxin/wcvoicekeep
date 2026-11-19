@@ -1016,8 +1016,7 @@ static BOOL SBKGoHome(void) {
     id sb = SBKSpringBoard();
     if (SBKTryVoidSel(sb, "_simulateHomeButtonPress")) {
         usleep(250 * 1000);
-        SBKStage("STAGE: gohome=_simulateHomeButtonPress
-");   // v2.3.0：成功路径不再进常规日志
+        SBKStage("STAGE: gohome=_simulateHomeButtonPress\n");   // v2.3.0：成功路径不再进常规日志
         return YES;
     }
     Class cUI = objc_getClass("SBUIController");
@@ -1030,15 +1029,13 @@ static BOOL SBKGoHome(void) {
             @try { ((BOOL (*)(id, SEL))objc_msgSend)(ui, s1); }
             @catch (NSException *e) { (void)e; }
             usleep(250 * 1000);
-            SBKStage("STAGE: gohome=handleHomeButtonSinglePressUp
-");
+            SBKStage("STAGE: gohome=handleHomeButtonSinglePressUp\n");
             return YES;
         }
     }
     if (SBKTryVoidSel(sb, "_resetToHomeScreen")) {
         usleep(250 * 1000);
-        SBKStage("STAGE: gohome=_resetToHomeScreen
-");
+        SBKStage("STAGE: gohome=_resetToHomeScreen\n");
         return YES;
     }
     SBKLog(@"回主屏：没有可用入口");
