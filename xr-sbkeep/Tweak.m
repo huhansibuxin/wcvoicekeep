@@ -1,4 +1,4 @@
-// XRWeChatKeep — v2.1.1（v2.1.0 收尾 + 未锁屏分支的远程实测钩子）
+// XRWeChatKeep — v2.1.0（正式版收尾：修「用户在用手机时被抢屏锁黑」）
 //
 // v2.1.0（老板 2026-11-19 收尾排查）：
 //   ① **真 bug**：设备未锁屏（= 老板正在用手机）时，原逻辑照样「解锁+抢前台+停 15s+回主屏+息屏锁屏」，
@@ -1172,24 +1172,7 @@ static void SBKSuspendRecheck(NSString *tag) {
 
 static void SBKArmExitWatch(pid_t pid);
 
-// v2.1.1 诊断钩子：/var/mobile/Library/SpringBoard/xrkeep.unlock 存在 → 解锁设备一次并立刻删除该文件。
-// 唯一目的是让远程（SSH）能把设备置于「未锁屏」状态，从而实测 SBKStartPrime 里那条
-// 「用户正在使用设备 → 静默拉起」保护分支（这条路径没有别的办法远程触发）。
-// 解锁后故意把 gSelfUnlockAt 清零 —— 伪装成「老板自己解的锁」，否则自解锁时间窗会把
-// 我们要测的「用户在用」分支挡掉。无文件时只有一次 access() 系统调用，日常零开销。
-static void SBKPollDebugUnlock(void) {
-    if (access("/var/mobile/Library/SpringBoard/xrkeep.unlock", F_OK) != 0) return;
-    unlink("/var/mobile/Library/SpringBoard/xrkeep.unlock");
-    SBKLog(@"诊断钩子 xrkeep.unlock 命中 → 远程解锁一次（battle-test 未锁屏分支）");
-    dispatch_async(dispatch_get_main_queue(), ^{
-        SBKUnlockDevice(@"诊断-远程解锁");
-        gSelfUnlockAt = 0;   // 伪装成用户自己解的锁，让「用户在用」分支可被触发
-        SBKLog(@"诊断钩子 解锁完成 locked=%d gSelfUnlockAt 已清零", SBKLockedNow() ? 1 : 0);
-    });
-}
-
 static void SBKTick(void) {
-    SBKPollDebugUnlock();
     pid_t pid = SBKPidForTarget();
 
     if (pid <= 0) {
@@ -1457,7 +1440,7 @@ __attribute__((constructor)) static void SBKInit(void) {
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v2.1.1 pid=%d proc=%s fdA=%d(e%d) fdB=%d(e%d) stage=%d =====\n",
+             "\n===== XRWeChatKeep v2.1.0 pid=%d proc=%s fdA=%d(e%d) fdB=%d(e%d) stage=%d =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB, gStageOn);
     SBKRawLog(head);
     gCtorAt = time(NULL);
