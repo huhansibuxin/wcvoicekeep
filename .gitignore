@@ -16,3 +16,6 @@ _dl_*/
 _macho/
 _diag/
 dist/
+
+# CI 产物临时下载目录
+_ci_out/
