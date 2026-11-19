@@ -1,4 +1,4 @@
-// XRWeChatKeep — v1.6.0（前台过一遍，真机 API 落地）
+// XRWeChatKeep — v1.6.1（前台过一遍 + 用 SpringBoard 有头拉起 + 可靠锁屏）
 // 老板 2026-11-19 定案：XR 放屋里、没人解锁，微信掉了必须自动拉起并「一直跑」。
 //
 // v1.3.0（XR 实机装 v1.2.0 后「日志 0 字节、ctor 疑似没执行」后加的诊断版）：
@@ -358,15 +358,11 @@ static BOOL SBKUnlockDevice(NSString *why) {
     return (stillLocked == NO);
 }
 
-// 交回后台 / 恢复息屏：真机确认可用 SpringBoard -_simulateLockButtonPress（等价按一下电源键）
+// 交回后台 / 恢复息屏。真机实测：_simulateLockButtonPress 调了但 locked 仍为 0（不生效），
+// 所以改用 SBLockScreenManager 的锁屏实现，逐档尝试并实测 locked。
 static void SBKRelockDevice(NSString *why) {
     if (SBKIsLocked()) return;
-    id sb = SBKSpringBoard();
-    if (SBKTryVoidSel(sb, "_simulateLockButtonPress")) {
-        usleep(300 * 1000);
-        SBKLog(@"恢复息屏（%@）_simulateLockButtonPress → locked=%d", why ?: @"?", SBKIsLocked() ? 1 : 0);
-        return;
-    }
+
     Class cls = objc_getClass("SBLockScreenManager");
     id mgr = nil;
     @try {
@@ -374,13 +370,46 @@ static void SBKRelockDevice(NSString *why) {
             mgr = ((id (*)(id, SEL))objc_msgSend)((id)cls, sel_registerName("sharedInstanceIfExists"));
         }
     } @catch (NSException *e) { (void)e; }
-    SEL s = sel_registerName("lockUIFromSource:withOptions:");
-    if (mgr && [mgr respondsToSelector:s]) {
-        @try { ((void (*)(id, SEL, int, id))objc_msgSend)(mgr, s, 0, nil); }
-        @catch (NSException *e) { (void)e; }
-        usleep(250 * 1000);
+
+    BOOL ok = NO;
+    if (mgr) {
+        // ① 带 completion 的真实签名（void(i,@,block)）
+        SEL s1 = sel_registerName("lockUIFromSource:withOptions:completion:");
+        if (!ok && [mgr respondsToSelector:s1]) {
+            @try { ((void (*)(id, SEL, int, id, id))objc_msgSend)(mgr, s1, 0, nil, ^{}); }
+            @catch (NSException *e) { (void)e; }
+            usleep(400 * 1000);
+            ok = SBKIsLocked();
+            if (ok) SBKLog(@"恢复息屏（%@）lockUIFromSource:withOptions:completion: ✔", why ?: @"?");
+        }
+        // ② _activateLockScreenAnimated:...（SpringBoard 真正的锁屏流程）
+        SEL s2 = sel_registerName("_activateLockScreenAnimated:animationProvider:automatically:inScreenOffMode:dismissNotificationCenter:completion:");
+        if (!ok && [mgr respondsToSelector:s2]) {
+            @try {
+                ((void (*)(id, SEL, BOOL, id, BOOL, BOOL, BOOL, id))objc_msgSend)(
+                    mgr, s2, YES, ^{ return (id)nil; }, YES, YES, NO, ^{});
+            } @catch (NSException *e) { (void)e; }
+            usleep(500 * 1000);
+            ok = SBKIsLocked();
+            if (ok) SBKLog(@"恢复息屏（%@）_activateLockScreenAnimated ✔", why ?: @"?");
+        }
+        // ③ _lockUI（BOOL 返回）
+        SEL s3 = sel_registerName("_lockUI");
+        if (!ok && [mgr respondsToSelector:s3]) {
+            @try { ((BOOL (*)(id, SEL))objc_msgSend)(mgr, s3); }
+            @catch (NSException *e) { (void)e; }
+            usleep(400 * 1000);
+            ok = SBKIsLocked();
+            if (ok) SBKLog(@"恢复息屏（%@）_lockUI ✔", why ?: @"?");
+        }
     }
-    SBKLog(@"恢复息屏（%@）lockUIFromSource → locked=%d", why ?: @"?", SBKIsLocked() ? 1 : 0);
+    // ④ 最后试按键模拟
+    if (!ok && SBKTryVoidSel(SBKSpringBoard(), "_simulateLockButtonPress")) {
+        usleep(400 * 1000);
+        ok = SBKIsLocked();
+        if (ok) SBKLog(@"恢复息屏（%@）_simulateLockButtonPress ✔", why ?: @"?");
+    }
+    SBKLog(@"恢复息屏（%@）结束 locked=%d", why ?: @"?", SBKIsLocked() ? 1 : 0);
 }
 
 // 微信场景是否前台（由场景 hook 顺带采集，未知 = -1）
@@ -668,6 +697,19 @@ static void SBKLaunch(NSString *why) {
     if (gHeadfulMode != 0) {
         // 有头第一步：把锁屏解掉（息屏/锁屏下必须先解开，否则拉起会被压回后台）。
         SBKUnlockDevice(why ?: @"拉起前");
+
+        // SpringBoard 自己的有头拉起（真机 API 勘探确认存在）：
+        //   -launchApplicationWithIdentifier:suspended:
+        //   suspended=NO → 带 UI 前台启动，这是「过前台」最正规的入口。
+        id sb = SBKSpringBoard();
+        SEL sL = sel_registerName("launchApplicationWithIdentifier:suspended:");
+        if (sb && [sb respondsToSelector:sL]) {
+            BOOL ok = NO;
+            @try { ok = ((BOOL (*)(id, SEL, id, BOOL))objc_msgSend)(sb, sL, kTargetBID, NO); }
+            @catch (NSException *e) { (void)e; }
+            SBKLog(@"SpringBoard 有头拉起 (%@) 返回=%d", why ?: @"?", ok ? 1 : 0);
+            if (ok) return;
+        }
     }
     Class cPM  = objc_getClass("FBProcessManager");
     Class cReq = objc_getClass("FBSystemServiceOpenApplicationRequest");
@@ -825,6 +867,18 @@ static void SBKStartPrime(NSString *why) {
     if (gPrimeHoldSec <= 0) {
         SBKLog(@"xrkeep.prime=0 → 保持前台，不交回后台");
         return;
+    }
+
+    // 前台逗留中途复查：真机见过拉起 2s 后场景被挤回后台，这里再顶一次前台
+    if (gPrimeHoldSec >= 8) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((gPrimeHoldSec / 2) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            pid_t p0 = SBKPidForTarget();
+            if (p0 > 0 && gTargetSceneFG == 0) {
+                SBKLog(@"前台逗留期场景=%d → 再顶一次前台", gTargetSceneFG);
+                SBKLaunch(@"保持前台");
+            }
+        });
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gPrimeHoldSec * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -1119,7 +1173,7 @@ __attribute__((constructor)) static void SBKInit(void) {
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v1.6.0 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
+             "\n===== XRWeChatKeep v1.6.1 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB);
     SBKRawLog(head);
     gCtorAt = time(NULL);

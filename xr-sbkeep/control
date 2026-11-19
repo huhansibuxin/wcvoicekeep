@@ -1,6 +1,6 @@
 Package: com.wcvoicekeep.xrkeep
 Name: XR WeChat Keep
-Version: 1.6.0
+Version: 1.6.1
 Architecture: iphoneos-arm
 Description: 只做一件事：微信掉了就把它「前台过一遍」。注入 SpringBoard，检测到微信不在运行或被杀（含息屏状态下的内存杀）后，免密解锁设备（需已取消锁屏密码）→ 有头（前台）拉起微信 → 前台停留 15 秒 → 回主屏，之后微信靠自己的后台保活继续跑；下次被杀再来一遍。不做保活断言、不做场景欺骗、不注入 App。纯 ObjC runtime 实现，不依赖 substrate。无设置页、无 AltList、无键盘、无音频。可调项：/var/mobile/Library/SpringBoard/xrkeep.prime（前台停留秒数，0=一直留前台）、xrkeep.mode（headful/headless 强制模式）、xrkeep.off（急停开关）、xrkeep.stay（存在则过完前台不锁屏）。
 Depends: firmware (>= 14.0), mobilesubstrate | libhooker
