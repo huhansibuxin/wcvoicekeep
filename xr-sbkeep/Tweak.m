@@ -1,4 +1,16 @@
-// XRWeChatKeep — v2.2.0（收尾改回主屏不锁屏，修「卡在通知中心不熄屏」）
+// XRWeChatKeep — v2.3.0（去掉静默/无头分支，一律有头拉起；日志再降频）
+//
+// v2.3.0（老板 2026-11-20 明确要求）：
+//   ① **删除「用户正在使用设备 → 静默拉起」分支**。老板原话：静默拉起就是无头拉起，
+//      无头拉起微信里注入的插件根本不运行 → 等于没拉。唯一需求是「被系统内存杀掉后
+//      一定要有头拉起（这样微信插件才跑），有头拉起后再回 home 就行」，不需要任何分叉。
+//      所以现在不管设备锁没锁屏，一律走「解锁 → 有头拉起 → 停留 → 回主屏」。
+//      连带删掉只服务该分支的 gSelfUnlockAt 自解锁时间窗。
+//   ② 日志再降频：每轮从约 14 行压到 5 行 —— 死因并入「N 秒后拉起」那一行、
+//      解锁途径与结果合并一行、回主屏三行合并一行、stat=2 的正常状态不再打点、
+//      挂事件/清零/进程状态等噪音全部移除。
+//
+// v2.2.0（收尾改回主屏不锁屏，修「卡在通知中心不熄屏」）
 //
 // v2.2.0（老板 2026-11-20 实机反馈）：
 //   现象：CocoaTop 杀微信 → 马上熄屏 → 几秒后自动拉起 → 又过几秒变成通知中心 →
@@ -13,7 +25,7 @@
 //
 // v2.1.0（老板 2026-11-19 收尾排查）：
 //   ① **真 bug**：设备未锁屏（= 老板正在用手机）时，原逻辑照样「解锁+抢前台+停 15s+回主屏+息屏锁屏」，
-//      会把正在用的 App 顶掉再直接黑屏。现在未锁屏一律降级为「静默拉起」：只把微信拉回后台，
+//      会把正在用的 App 顶掉再直接黑屏。当时未锁屏降级为「静默拉起」（**该分支已在 v2.3.0 删除**）：只把微信拉回后台，
 //      不 activate、不 go home、不锁屏；设备重新锁屏后由健康检查补完整的有头过前台。
 //   ② 延迟秒数可调：xrkeep.delay（0~120）。不充电+息屏会进深度睡眠，dispatch_after 被拖长
 //      （实测 5s→65s），此场景可调小或设 0。
@@ -423,10 +435,6 @@ static BOOL gUseAssert    = NO;   // 保活断言：按老板要求关闭
 static int  gPrimeHoldSec = 15;   // 前台停留秒数；0 = 一直留前台不交回后台
 static time_t gLastPrimeAt = 0;   // 上次「前台过一遍」时间
 static time_t gLastUnlockAt = 0;
-// v2.1.0：最近一次「插件自己解锁成功」的时间戳。用于把「我们自己亮的屏」和
-// 「老板正在用手机」区分开，详见 SBKUnlockDevice / SBKStartPrime 里的注释。
-static time_t gSelfUnlockAt = 0;
-static const int kSelfUnlockWindowSec = 60;   // 自解锁后 60s 内不算「用户在用」
 
 // 模式文件：/var/mobile/Library/SpringBoard/xrkeep.mode（headful / headless），可选
 // 前台停留秒数：/var/mobile/Library/SpringBoard/xrkeep.prime（整数，0 = 一直留前台）
@@ -461,6 +469,9 @@ static void SBKLoadMode(void) {
 //   SBLockScreenManager -unlockUIFromSource:withOptions:（注意是 void 返回，之前当 BOOL 用是错的）
 static BOOL SBKUnlockDevice(NSString *why) {
     if (!SBKLockedNow()) return YES;
+    // v2.3.0 日志精简：解锁"走哪条路"和"结果"合并成一行输出，这里只记下途径。
+    static char gUnlockWay[40] = "none";
+    gUnlockWay[0] = 'n'; gUnlockWay[1] = 'o'; gUnlockWay[2] = 'n'; gUnlockWay[3] = 'e'; gUnlockWay[4] = 0;
     time_t now = time(NULL);
     if (gLastUnlockAt > 0 && (now - gLastUnlockAt) < 3) return NO;
     gLastUnlockAt = now;
@@ -475,7 +486,7 @@ static BOOL SBKUnlockDevice(NSString *why) {
         @catch (NSException *e) { (void)e; }
         usleep(250 * 1000);
         ok = !SBKLockedNow();
-        if (ok) SBKLog(@"解锁 (%@) 走 _turnScreenOnAndUnlock ✔", why ?: @"?");
+        if (ok) { const char *w = "_turnScreenOnAndUnlock"; for (int i=0;i<39 && w[i];i++) gUnlockWay[i]=w[i], gUnlockWay[i+1]=0; }
     }
     // ② requestDeviceUnlock
     if (!ok && sb && [sb respondsToSelector:sel_registerName("requestDeviceUnlock")]) {
@@ -483,7 +494,7 @@ static BOOL SBKUnlockDevice(NSString *why) {
         @catch (NSException *e) { (void)e; }
         usleep(250 * 1000);
         ok = !SBKLockedNow();
-        if (ok) SBKLog(@"解锁 (%@) 走 requestDeviceUnlock ✔", why ?: @"?");
+        if (ok) { const char *w = "requestDeviceUnlock"; for (int i=0;i<39 && w[i];i++) gUnlockWay[i]=w[i], gUnlockWay[i+1]=0; }
     }
     // ③ SBLockScreenManager（void 返回，逐个 source 试）
     if (!ok) {
@@ -502,17 +513,13 @@ static BOOL SBKUnlockDevice(NSString *why) {
                 @catch (NSException *e) { (void)e; }
                 usleep(250 * 1000);
                 ok = !SBKLockedNow();
-                if (ok) SBKLog(@"解锁 (%@) 走 unlockUIFromSource:%d ✔", why ?: @"?", sources[i]);
+                if (ok) { const char *w = "unlockUIFromSource"; for (int i=0;i<39 && w[i];i++) gUnlockWay[i]=w[i], gUnlockWay[i+1]=0; }
             }
         }
     }
 
     BOOL stillLocked = SBKLockedNow();
-    SBKLog(@"解锁 (%@) 结果 locked=%d", why ?: @"?", stillLocked ? 1 : 0);
-    // v2.1.0：记下「这次是插件自己解的锁」。解锁后到恢复息屏之间（实测约 17s）设备必然处于
-    // 未锁屏状态，如果不区分来源，SBKStartPrime 的「用户在用」保护会把自己刚亮的屏误判成
-    // 老板在用 → 降级成静默拉起 → 微信只回后台、插件不运行。用时间窗自救。
-    if (!stillLocked) gSelfUnlockAt = time(NULL);
+    SBKLog(@"解锁(%@) 走 %s → locked=%d", why ?: @"?", gUnlockWay, stillLocked ? 1 : 0);
     // 模式判定允许纠正：只要成功解开过一次，就永远按有头跑。
     // （v2.0.0 首版把一次失败的解锁固化成"无头"，之后再也不解锁 → 必须修）
     if (!stillLocked && gHeadfulMode != 1) {
@@ -528,7 +535,7 @@ static BOOL SBKUnlockDevice(NSString *why) {
 // 交回后台 / 恢复息屏。真机实测：_simulateLockButtonPress 调了但 locked 仍为 0（不生效），
 // 所以改用 SBLockScreenManager 的锁屏实现，逐档尝试并实测 locked。
 static void SBKRelockDevice(NSString *why) {
-    if (SBKLockedNow()) { gSelfUnlockAt = 0; return; }
+    if (SBKLockedNow()) return;
 
     Class cls = objc_getClass("SBLockScreenManager");
     id mgr = nil;
@@ -579,8 +586,6 @@ static void SBKRelockDevice(NSString *why) {
         if (ok) SBKLog(@"恢复息屏（%@）_simulateLockButtonPress ✔", why ?: @"?");
     }
     SBKLog(@"恢复息屏（%@）结束 locked=%d", why ?: @"?", SBKLockedNow() ? 1 : 0);
-    // 已经锁回去了：清掉「插件自解锁」标记，下次未锁屏就真的代表老板在用手机。
-    if (SBKLockedNow()) gSelfUnlockAt = 0;
 }
 
 // 微信场景是否前台（由场景 hook 顺带采集，未知 = -1）
@@ -1011,7 +1016,8 @@ static BOOL SBKGoHome(void) {
     id sb = SBKSpringBoard();
     if (SBKTryVoidSel(sb, "_simulateHomeButtonPress")) {
         usleep(250 * 1000);
-        SBKLog(@"回主屏：SpringBoard _simulateHomeButtonPress");
+        SBKStage("STAGE: gohome=_simulateHomeButtonPress
+");   // v2.3.0：成功路径不再进常规日志
         return YES;
     }
     Class cUI = objc_getClass("SBUIController");
@@ -1024,13 +1030,15 @@ static BOOL SBKGoHome(void) {
             @try { ((BOOL (*)(id, SEL))objc_msgSend)(ui, s1); }
             @catch (NSException *e) { (void)e; }
             usleep(250 * 1000);
-            SBKLog(@"回主屏：SBUIController handleHomeButtonSinglePressUp");
+            SBKStage("STAGE: gohome=handleHomeButtonSinglePressUp
+");
             return YES;
         }
     }
     if (SBKTryVoidSel(sb, "_resetToHomeScreen")) {
         usleep(250 * 1000);
-        SBKLog(@"回主屏：SpringBoard _resetToHomeScreen");
+        SBKStage("STAGE: gohome=_resetToHomeScreen
+");
         return YES;
     }
     SBKLog(@"回主屏：没有可用入口");
@@ -1061,32 +1069,12 @@ static void SBKStartPrime(NSString *why) {
 
     gLastPrimeAt = now;
 
-    // v2.1.0（老板 2026-11-19 收尾排查发现的真 bug）：设备「未锁屏」= 屏幕亮着且已解锁 = 老板正在用手机。
-    // 此时如果照旧走「解锁 + 抢前台 + 停 15s + 回主屏 + 强制息屏锁屏」，
-    // 会把老板正在用的 App 顶掉、然后直接把屏幕锁黑——这是唯一会真正打扰使用的路径。
-    // 因此在用状态下降级为「静默拉起」：不 activate、不抢 UI、不 go home、不锁屏，
-    // 只把微信进程拉回后台继续跑；等设备重新锁屏后，健康检查会自然补一次完整的有头过前台。
-    // 注意：本分支把 gLastPrimeAt 回退为 0，让 15s 后的健康检查还能按当时状态重新决策。
-    // 但「未锁屏」也可能是插件自己刚解锁造成的（解锁→恢复息屏之间约 17s），
-    // 那种情况不能算老板在用，否则过前台流程会被自己的保护逻辑打断 → 用自解锁时间窗排除。
-    if (!SBKLockedNow()) {
-        BOOL selfOwned = (gSelfUnlockAt > 0 && (now - gSelfUnlockAt) < (time_t)kSelfUnlockWindowSec);
-        if (selfOwned) {
-            SBKLogT("primeSelfUnlock", 60, @"未锁屏但来源=插件自解锁(%lds前)，按有头继续（%@）",
-                    (long)(now - gSelfUnlockAt), why ?: @"?");
-        } else {
-            gLastPrimeAt = 0;
-            pid_t cur = SBKPidForTarget();
-            if (cur <= 0) {
-                SBKLog(@"用户正在使用设备（未锁屏）→ 静默拉起，不抢前台（%@）", why ?: @"?");
-                SBKLaunchViaSBS(why ?: @"用户在用");
-            } else {
-                SBKLogT("primeSkip", 60, @"用户正在使用设备（未锁屏）→ 跳过过前台（%@）", why ?: @"?");
-            }
-            return;
-        }
-    }
-
+    // v2.3.0（老板 2026-11-20 明确要求）：**删除「用户正在使用设备 → 静默拉起」分支**。
+    // 老板原话：「你静默拉起是无头拉起吗 无头拉起是没有效果的 会导致我微信里面的插件不运行
+    // 我们主要的功能是要让微信里面的插件运行 就必须要有头拉起 有头拉起然后再回 home 就行了」。
+    // 结论：静默（SBS 不 activate）拉起 = 无头，微信里注入的插件根本不会跑，等于白拉。
+    // 所以不管设备当时锁没锁屏，一律走「有头拉起 → 回 home」，不再降级、不再分叉
+    // （v2.1.0 那个防打扰分支已彻底移除，gSelfUnlockAt 自解锁时间窗也随之删除）。
     SBKLog(@"===== 前台过一遍开始：%@ (locked=%d) =====", why ?: @"?", SBKIsLocked() ? 1 : 0);
     // 解锁 / 回主屏 / 锁屏都是 SpringBoard 内部状态操作，统一放主线程做（SBKLaunch 自己也会再保险解锁一次）
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1118,8 +1106,6 @@ static void SBKStartPrime(NSString *why) {
             return;
         }
         int st = SBKProcStatus(p);
-        SBKLog(@"前台停留 %ds 结束 pid=%d stat=%d sceneFG=%d → 交回后台",
-               gPrimeHoldSec, p, st, gTargetSceneFG);
         BOOL homeOK = SBKGoHome();
         // v2.2.0（老板 2026-11-20 实机反馈）：过完前台**只回主屏，不再主动锁屏**。
         // 原来这里调 SBKRelockDevice → _activateLockScreenAnimated:...:inScreenOffMode:YES
@@ -1129,13 +1115,17 @@ static void SBKStartPrime(NSString *why) {
         // 把通知中心留在屏上；inScreenOffMode=YES 还会按"息屏锁屏"样式铺通知。
         // 老板的要求：回到桌面就行了，之后由系统自己的「自动锁定」时间负责熄屏，不要拉通知中心。
         // 真需要主动锁屏时放一个 xrkeep.relock 文件即可（保留原行为）。
+        // v2.3.0 日志精简：原来"停留结束"+"回主屏：xxx"+"已回主屏(成功)"三行合并成一行。
         if (access("/var/mobile/Library/SpringBoard/xrkeep.relock", F_OK) == 0) {
+            SBKLog(@"前台 %ds 结束(pid=%d stat=%d) → 回主屏%@ → 按 xrkeep.relock 主动锁屏",
+                   gPrimeHoldSec, p, st, homeOK ? @"✔" : @"✘");
             SBKRelockDevice(@"xrkeep.relock 存在 → 过完前台仍主动锁屏");
         } else if (access("/var/mobile/Library/SpringBoard/xrkeep.stay", F_OK) == 0) {
-            SBKLog(@"xrkeep.stay 存在 → 保持前台不锁屏");
+            SBKLog(@"前台 %ds 结束(pid=%d stat=%d) → xrkeep.stay 存在，保持前台不回主屏",
+                   gPrimeHoldSec, p, st);
         } else {
-            SBKLog(@"已回主屏(%@) → 不主动锁屏，交给系统自动锁定时间熄屏",
-                   homeOK ? @"成功" : @"回主屏 API 不可用");
+            SBKLog(@"前台 %ds 结束(pid=%d stat=%d) → 回主屏%@ → 不锁屏，交给系统自动熄屏",
+                   gPrimeHoldSec, p, st, homeOK ? @"✔" : @"✘");
         }
         gLastPrimeAt = time(NULL);
     });
@@ -1145,6 +1135,8 @@ static void SBKStartPrime(NSString *why) {
 // 好处：给微信/系统一次自然回收机会，避免「杀掉-秒拉」抖动；少一次无谓亮屏；
 // 也防住退出事件 + 健康定时器 + 场景 hook 三处同时触发导致的重复拉起。
 static time_t gPendingRelaunchAt = 0;
+// v2.3.0 日志精简：死因先存这里，等 SBKScheduleRelaunch 打「N 秒后拉起」时一起输出，少一行。
+static NSString *gLastExitReason = nil;
 
 static void SBKScheduleRelaunch(NSString *why) {
     int delay = SBKRelaunchDelaySec();
@@ -1154,7 +1146,12 @@ static void SBKScheduleRelaunch(NSString *why) {
     }
     gPendingRelaunchAt = now;
     NSString *reason = why ? [why copy] : @"?";
-    SBKLog(@"微信不在运行 → %d 秒后拉起（%@）", delay, reason);
+    if (gLastExitReason.length) {
+        SBKLog(@"微信不在运行(死因=%@) → %d 秒后拉起（%@）", gLastExitReason, delay, reason);
+        gLastExitReason = nil;
+    } else {
+        SBKLog(@"微信不在运行 → %d 秒后拉起（%@）", delay, reason);
+    }
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    SBKQueue(), ^{
@@ -1221,8 +1218,7 @@ static void SBKTick(void) {
     }
 
     if (gFailCount != 0) {
-        SBKLog(@"微信已在运行 pid=%d，失败计数清零", pid);
-        gFailCount = 0;
+        gFailCount = 0;   // v2.3.0 日志精简：不再单独打一行
         gLastLaunchAt = 0;
     }
 
@@ -1237,10 +1233,13 @@ static void SBKTick(void) {
         gStallTicks++;
     }
     if (st != gLastProcStatus) {
-        SBKLog(@"微信 pid=%d 状态 stat=%d %@ cpu=%llu", pid, st,
-               st == SBK_SSTOP ? @"(SSTOP/挂起)" : (st < 0 ? @"(读取失败)" : @"(非SSTOP)"),
-               (unsigned long long)cpu);
+        // v2.3.0 日志精简：stat=2（正常运行/睡眠）不再打点，只在挂起/异常等需要关注时输出
         gLastProcStatus = st;
+        if (st != 2) {
+            SBKLog(@"微信 pid=%d 状态 stat=%d %@ cpu=%llu", pid, st,
+                   st == SBK_SSTOP ? @"(SSTOP/挂起)" : (st < 0 ? @"(读取失败)" : @"(非SSTOP)"),
+                   (unsigned long long)cpu);
+        }
     }
     // 两种判定：内核直接报 SSTOP，或 CPU 时间连续 3 个 tick（≈30s）毫无前进
     BOOL frozen = (st == SBK_SSTOP) || (gStallTicks >= 3);
@@ -1272,7 +1271,6 @@ static void SBKArmExitWatch(pid_t pid) {
     __weak typeof(src) weakSrc = src;
     dispatch_source_set_event_handler(src, ^{
         __strong typeof(weakSrc) strongSrc = weakSrc;
-        SBKLog(@"微信退出事件 pid=%d", pid);
         SBKDropAssertion(@"进程退出");
         gWatchedPid = 0;
         if (strongSrc) {
@@ -1285,7 +1283,6 @@ static void SBKArmExitWatch(pid_t pid) {
     });
     dispatch_resume(src);
     gExitSource = src;
-    SBKLog(@"已挂微信退出事件 pid=%d", pid);
 }
 
 static void SBKStartHealthTimer(void) {
@@ -1418,15 +1415,18 @@ static void SBKDidExitHook(id self, SEL _cmd, id ctx) {
                                           [r valueForKey:@"domain"] ?: @"-"];
                         } @catch (NSException *e) { (void)e; }
                     }
-                    if (d) reasonDesc = [reasonDesc stringByAppendingFormat:@" | desc=%@", d];
+                    // v2.3.0：desc 常和主值一模一样（如 "8 | desc=8"），重复就不再追加
+                    if (d && ![[NSString stringWithFormat:@"%@", d] isEqualToString:[NSString stringWithFormat:@"%@", r]])
+                        reasonDesc = [reasonDesc stringByAppendingFormat:@" | desc=%@", d];
                 } else {
                     NSString *cd = ctxDesc;
                     if (cd.length > 160) cd = [[cd substringToIndex:160] stringByAppendingString:@"…"];
                     reasonDesc = [NSString stringWithFormat:@"ctx=%@ %@", NSStringFromClass([ctx class]), cd];
                 }
             } @catch (NSException *e) { (void)e; }
-            // 日志降频：平时只写一行简短死因；完整 ctx 只在 xrkeep.dump 诊断模式下才写
-            SBKLog(@"_didExitWithContext 微信退出 | %@", reasonDesc);
+            // v2.3.0 日志精简：死因不再单独成行，暂存到 gLastExitReason，由 SBKScheduleRelaunch 合并输出。
+            // 完整 ctx 只在 xrkeep.dump 诊断模式下才写。
+            gLastExitReason = [reasonDesc copy];
             if (gStageOn) SBKLog(@"_didExitWithContext 完整 ctx=%@", ctxDesc);
             dispatch_async(SBKQueue(), ^{
                 SBKDropAssertion(@"_didExitWithContext");
@@ -1463,7 +1463,7 @@ __attribute__((constructor)) static void SBKInit(void) {
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v2.2.0 pid=%d proc=%s fdA=%d(e%d) fdB=%d(e%d) stage=%d =====\n",
+             "\n===== XRWeChatKeep v2.3.0 pid=%d proc=%s fdA=%d(e%d) fdB=%d(e%d) stage=%d =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB, gStageOn);
     SBKRawLog(head);
     gCtorAt = time(NULL);
