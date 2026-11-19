@@ -31,7 +31,9 @@ static NSString *const kBID = @"com.tencent.xin";
 static const char kExeSuffix[]     = "/WeChat.app/WeChat";
 static const size_t kExeSuffixLen  = sizeof(kExeSuffix) - 1;
 
+#ifndef WCLITE_NO_LOG
 static NSString *const kLogPath = @"/var/mobile/wcvoicekeep.lite.log";
+#endif
 
 // 时序常量
 static const int kStartDelaySec       = 2;    // 开机后等 SpringBoard 就绪
@@ -42,6 +44,12 @@ static const int kCooldownSec         = 60;   // 冷却时长
 static const int kArmRetrySecs[]      = {2, 5, 10, 20, 40};
 
 // ===== 日志（事件驱动，只在事件发生时写一行；常态零写入）=====
+// v1.0.1：默认编译期彻底无日志（-DWCLITE_NO_LOG）。此时 WCLog 是纯空函数，
+// 不 open 任何文件、不格式化字符串、不产生任何写盘 syscall；调用点一律保留，
+// 需要诊断时去掉该编译开关重编即可恢复，不需要改代码。
+#ifdef WCLITE_NO_LOG
+static void WCLog(NSString *fmt, ...) { (void)fmt; }
+#else
 static int gLogFd = -1;
 static void WCLog(NSString *fmt, ...) {
     if (gLogFd < 0) return;
@@ -68,6 +76,7 @@ static void WCLog(NSString *fmt, ...) {
         (void)ignored;
     }
 }
+#endif  // WCLITE_NO_LOG
 
 // ===== 队列（状态机串行 / 拉起串行，均非主线程）=====
 static dispatch_queue_t WCVKQueue(void) {
@@ -305,8 +314,11 @@ int main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
     @autoreleasepool {
+        // 纯净版（WCLITE_NO_LOG）不打开日志文件，连 fd 都不持有
+#ifndef WCLITE_NO_LOG
         gLogFd = open(kLogPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
         WCLog(@"===== wcvoicekeep lite start (pid=%d) =====", getpid());
+#endif
 
         WCVKSBSReady();
         unsigned g = ++gGen;

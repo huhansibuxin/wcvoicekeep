@@ -20,7 +20,8 @@ wcvoicekeeplite_INSTALL_PATH = /usr/bin
 wcvoicekeeplite_FRAMEWORKS = Foundation
 # SBSLaunchApplicationWithIdentifier 需要 com.apple.springboard.launchapplications
 wcvoicekeeplite_CODESIGN_FLAGS = -S$(THEOS_PROJECT_DIR)/entitlements.plist
-wcvoicekeeplite_CFLAGS = -fobjc-arc -fno-modules -w
+wcvoicekeeplite_CFLAGS = -fobjc-arc -fno-modules -w -DWCLITE_NO_LOG
+# 纯净版：编译期关闭全部日志（不 open 文件、不写盘）。要出诊断版就删掉 -DWCLITE_NO_LOG。
 
 include $(THEOS_MAKE_PATH)/tool.mk
 
