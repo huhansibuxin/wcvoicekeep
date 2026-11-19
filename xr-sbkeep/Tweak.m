@@ -1,5 +1,15 @@
-// XRWeChatKeep — v1.2.0
+// XRWeChatKeep — v1.3.0（自证探针版）
 // 老板 2026-11-19 定案：XR 放屋里、没人解锁，微信掉了必须自动拉起并「一直跑」。
+//
+// v1.3.0（XR 实机装 v1.2.0 后「日志 0 字节、ctor 疑似没执行」后加的诊断版）：
+//   XR 上 launchd 已带 DYLD_INSERT_LIBRARIES=/usr/lib/substitute-inserter.dylib，
+//   说明注入链在，但 SpringBoard 里连 ctor 第一行都没落盘。
+//   本版把「能否写日志」「ctor 是否执行」变成可观测事实：
+//   ① ctor 第一条语句就是纯 C 的 open+write（不碰 NSString/ObjC），带 pid/进程名；
+//   ② 日志主路径改为 SpringBoard 自有目录 /var/mobile/Library/SpringBoard/（沙盒内必可写），
+//      旧路径 /var/mobile/ 作为第二落点，open 失败的 errno 一并写进能写的那个文件；
+//   ③ Filter 额外挂 com.apple.mobilesafari：Safari 里只写一行探针就退出，用来判定
+//      「注入整体不通」还是「只有 SpringBoard 特殊」。
 //
 // v1.2.0（XR 实机装了 v1.0.0 后「零日志、dylib 未加载」后修正）：
 //   v1.0.0 用 Logos %hook，编译产物引用 MSHookMessageEx（动态查找），Taurine/amfidebilitate
@@ -28,8 +38,8 @@
 //   ① 解锁使用期间**不**做场景扶持，只持断言 —— 不抢前台归属，界面零异常；
 //   ② 只在锁屏期（isUILocked）才把微信场景强制 foreground，避免和用户操作打架。
 //
-// 日志：/var/mobile/wcvoicekeep.xrkeep.log（SpringBoard 非沙盒，rootful 原生路径）
-// 只在状态变化时写，常态零写入。
+// 日志：主路径落 SpringBoard 自有数据目录（沙盒内必可写），旧的 /var/mobile 作第二落点，
+// 两处都开，哪处能写就写哪处；只在状态变化时写，常态零写入。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -42,6 +52,7 @@
 #import <time.h>
 #import <unistd.h>
 #import <fcntl.h>
+#import <errno.h>
 #import <dlfcn.h>
 
 // 不引用 substrate.h：本工程已完全不用 Logos，hook 走 ObjC runtime 替换 IMP
@@ -113,7 +124,9 @@ static uint64_t SBKTaskCPUTime(pid_t pid) {
 
 // ===== 常量 =====
 static NSString *const kTargetBID = @"com.tencent.xin";
-static NSString *const kLogPath   = @"/var/mobile/wcvoicekeep.xrkeep.log";
+// A 路：SpringBoard 自有数据目录（首选）；B 路：/var/mobile（旧路径兜底）
+static NSString *const kLogPathA = @"/var/mobile/Library/SpringBoard/wcvoicekeep.xrkeep.log";
+static NSString *const kLogPathB = @"/var/mobile/wcvoicekeep.xrkeep.log";
 
 // 拉起退避阶梯（秒）；成功一次立即清零
 static const NSTimeInterval kLaunchBackoff[] = {3, 8, 20, 45, 60};
@@ -123,10 +136,20 @@ static const int kLaunchBackoffCount = 5;
 static const int kHealthIntervalSec = 10;
 
 // ===== 日志 =====
-static int gLogFd = -1;
+// 两路 fd：A = SpringBoard 自有目录（首选），B = /var/mobile（旧路径兜底）
+static int gLogFd = -1;    // A 路
+static int gLogFdB = -1;   // B 路
+
+// 纯 C 落盘：不碰 ObjC/NSString，ctor 第一行就能用
+static void SBKRawLog(const char *s) {
+    if (!s) return;
+    size_t n = strlen(s);
+    if (gLogFd >= 0) { ssize_t ig = write(gLogFd, s, n); (void)ig; }
+    if (gLogFdB >= 0) { ssize_t ig = write(gLogFdB, s, n); (void)ig; }
+}
 
 static void SBKLog(NSString *fmt, ...) {
-    if (gLogFd < 0) return;
+    if (gLogFd < 0 && gLogFdB < 0) return;
     va_list ap;
     va_start(ap, fmt);
     NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
@@ -141,8 +164,8 @@ static void SBKLog(NSString *fmt, ...) {
     char line[1400];
     int n = snprintf(line, sizeof(line), "[%s] %s\n", ts, body.UTF8String ?: "?");
     if (n > 0) {
-        ssize_t ignored = write(gLogFd, line, (size_t)n);
-        (void)ignored;
+        if (gLogFd >= 0) { ssize_t ig = write(gLogFd, line, (size_t)n); (void)ig; }
+        if (gLogFdB >= 0) { ssize_t ig = write(gLogFdB, line, (size_t)n); (void)ig; }
     }
 }
 
@@ -728,11 +751,28 @@ static void SBKDidExitHook(id self, SEL _cmd, id ctx) {
 
 // ===== 入口（普通 constructor，不依赖 Logos）=====
 __attribute__((constructor)) static void SBKInit(void) {
-    gLogFd = open(kLogPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (gLogFd >= 0) {
-        SBKLog(@"===== XRWeChatKeep v1.2.0 start pid=%d target=%@ locked=%d =====",
-               getpid(), kTargetBID, SBKIsLocked());
+    // ① 先开两路日志：纯 C，不依赖 ObjC / NSString，ctor 第一件事就能落盘
+    errno = 0;
+    gLogFd = open(kLogPathA.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int errA = errno;
+    errno = 0;
+    gLogFdB = open(kLogPathB.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int errB = errno;
+
+    char head[512];
+    snprintf(head, sizeof(head),
+             "\n===== XRWeChatKeep v1.3.0 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
+             getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB);
+    SBKRawLog(head);
+
+    // ② 只有 SpringBoard 才跑真正的保活逻辑；Safari 等探针进程到这就结束
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if (![bid isEqualToString:@"com.apple.springboard"]) {
+        SBKLog(@"探针进程 bid=%@ ctor 已执行 → 注入通路正常，本进程不做保活", bid ?: @"nil");
+        return;
     }
+
+    SBKLog(@"SpringBoard 注入生效，开始初始化");
 
     Class cSceneMgr = objc_getClass("FBSceneManager");
     BOOL okScene = SBKHook(cSceneMgr,
