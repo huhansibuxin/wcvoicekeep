@@ -1,12 +1,18 @@
-// XRWeChatKeep — v1.1.0
+// XRWeChatKeep — v1.2.0
 // 老板 2026-11-19 定案：XR 放屋里、没人解锁，微信掉了必须自动拉起并「一直跑」。
 //
+// v1.2.0（XR 实机装了 v1.0.0 后「零日志、dylib 未加载」后修正）：
+//   v1.0.0 用 Logos %hook，编译产物引用 MSHookMessageEx（动态查找），Taurine/amfidebilitate
+//   环境下 SpringBoard 里拿不到该符号 → dylib 加载失败、一条日志都没有。
+//   现改为纯 ObjC runtime：class_addMethod / method_setImplementation 自己换 IMP，
+//   不用 Logos、不引用 substrate.h、不链接 libsubstrate，任何越狱都能加载。
+//
 // v1.1.0（老板实机反馈「锁屏被拉起来了但没持续跑，手点一次微信才跑」后修正）：
-//   实测结论 —— headless(suspended) 拉起只让进程「存在」，进程处于 SSTOP 挂起态，
+//   headless(suspended) 拉起只让进程「存在」，进程处于 SSTOP 挂起态，
 //   App 层任何插件（含音频保活）都还没机会执行，所以救不了。
-//   新增：① proc_pidinfo(PROC_PIDTBSDINFO) 读 pbi_status，识别 SSTOP 挂起态；
-//        ② 挂起态 → 断言后 3s 复核，仍未解挂则用 __ActivateSuspended=NO 强制非挂起启动；
-//        ③ 断言加第三档 BKSProcessAssertion 兜底（对已 suspend 进程会直接 task_resume）；
+//   新增：① proc_pidinfo 读 pbi_status + CPU 时间，识别挂起/冻结；
+//        ② 冻结 → 断言后 3s 复核，仍未解挂则用 __ActivateSuspended=NO 强制非挂起启动；
+//        ③ 断言加第三档 BKSProcessAssertion 兜底（对已 suspend 进程会 task_resume）；
 //        ④ FB 启动请求失败时回退 SBSLaunchApplicationWithIdentifier(bid, 0)。
 //
 // 背景（为什么不是音频、不是有头拉起）：
@@ -38,10 +44,7 @@
 #import <fcntl.h>
 #import <dlfcn.h>
 
-// Logos 会用到（Theos 自带 include/substrate.h；缺失时不影响，Logos 走自身的 hooking 实现）
-#if __has_include(<substrate.h>)
-#import <substrate.h>
-#endif
+// 不引用 substrate.h：本工程已完全不用 Logos，hook 走 ObjC runtime 替换 IMP
 
 // ===== libproc（公开 API，在 libSystem 里；不引用头文件，手动声明）=====
 extern int proc_listallpids(void *buffer, int buffersize);
@@ -309,7 +312,7 @@ static BOOL SBKAcquireBKS(pid_t pid, NSString **errOut) {
     @try {
         id alloced = ((id (*)(id, SEL))objc_msgSend)((id)cBKS, sel_registerName("alloc"));
         // -initWithPID:flags:reason:name:acquire:withHandler:
-        Sel selInit = sel_registerName("initWithPID:flags:reason:name:acquire:withHandler:");
+        SEL selInit = sel_registerName("initWithPID:flags:reason:name:acquire:withHandler:");
         id assertion = nil;
         __block BOOL granted = NO;
         if ([alloced respondsToSelector:selInit]) {
@@ -321,7 +324,7 @@ static BOOL SBKAcquireBKS(pid_t pid, NSString **errOut) {
                 });
         } else {
             // 退回更老的形态
-            Sel selOld = sel_registerName("initWithPID:flags:reason:name:");
+            SEL selOld = sel_registerName("initWithPID:flags:reason:name:");
             if ([alloced respondsToSelector:selOld]) {
                 assertion = ((id (*)(id, SEL, int, unsigned int, unsigned int, id))objc_msgSend)(
                     alloced, selOld, (int)pid, (unsigned int)kLegacyFlags,
@@ -657,71 +660,93 @@ static void SBKStartHealthTimer(void) {
     dispatch_resume(gHealthTimer);
 }
 
-// ===== Hooks =====
-%hook FBSceneManager
+// ===== 自实现 swizzle（不用 Logos / 不依赖 substrate 的 MSHookMessageEx）=====
+// v1.2.0 关键修正：v1.0.0 用 %hook 生成的代码会引用 MSHookMessageEx，而该符号由注入框架
+// 提供；Taurine(amfidebilitate) 环境下 SpringBoard 里可能拿不到 → dylib 加载失败、零日志。
+// 现在改为纯 ObjC runtime 替换 IMP，零框架依赖，任何越狱都能加载。
+typedef void (*SBKApplySettingsFn)(id, SEL, id, id, id, id);
+typedef void (*SBKDidExitFn)(id, SEL, id);
 
-// 场景设置落地前的唯一改动点：锁屏期把微信场景强行按在 foreground
-- (void)_applyMutableSettings:(id)settings toScene:(id)scene
-        withTransitionContext:(id)ctx completion:(id)completion {
-    if (gForceScene && gInForce == 0 && SBKIsLocked()) {
-        NSString *bid = SBKSceneBID(scene);
-        if ([bid isEqualToString:kTargetBID]) {
-            gInForce = 1;
-            @try {
-                SBKForceForeground(settings);
-            } @catch (NSException *e) {
-                SBKLog(@"场景扶持异常 %@", e.reason ?: @"?");
-            }
-            gInForce = 0;
-        }
+static SBKApplySettingsFn gOrigApplySettings = NULL;
+static SBKDidExitFn       gOrigDidExit = NULL;
+
+static BOOL SBKHook(Class cls, SEL sel, IMP repl, IMP *origOut) {
+    if (!cls || !sel) return NO;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+    IMP orig = method_getImplementation(m);
+    const char *types = method_getTypeEncoding(m);
+    if (class_addMethod(cls, sel, repl, types)) {
+        // 说明该方法继承自父类，addMethod 只在本类覆盖，父类原实现保留
+        if (origOut) *origOut = orig;
+        return YES;
     }
-    %orig;
+    method_setImplementation(m, repl);
+    if (origOut) *origOut = orig;
+    return YES;
 }
 
-%end
+// 场景设置落地前的唯一改动点：锁屏期把微信场景强行按在 foreground
+static void SBKApplySettingsHook(id self, SEL _cmd, id settings, id scene, id ctx, id completion) {
+    if (gForceScene && gInForce == 0 && SBKIsLocked()) {
+        @try {
+            NSString *bid = SBKSceneBID(scene);
+            if ([bid isEqualToString:kTargetBID]) {
+                gInForce = 1;
+                SBKForceForeground(settings);
+                gInForce = 0;
+            }
+        } @catch (NSException *e) {
+            gInForce = 0;
+            SBKLog(@"场景扶持异常 %@", e.reason ?: @"?");
+        }
+    }
+    if (gOrigApplySettings) gOrigApplySettings(self, _cmd, settings, scene, ctx, completion);
+}
 
-%hook SBApplication
-
-- (void)_didExitWithContext:(id)ctx {
-    BOOL target = NO;
+static void SBKDidExitHook(id self, SEL _cmd, id ctx) {
     @try {
-        // self 在 %hook 内是前置声明类型，统一走 id 收发消息
         id app = (id)self;
         NSString *bid = [app valueForKey:@"bundleIdentifier"];
         if (![bid isKindOfClass:[NSString class]]) {
             bid = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("bundleIdentifier"));
         }
-        target = [bid isKindOfClass:[NSString class]] && [bid isEqualToString:kTargetBID];
-    } @catch (NSException *e) {
-            (void)e;
+        if ([bid isKindOfClass:[NSString class]] && [bid isEqualToString:kTargetBID]) {
+            SBKLog(@"_didExitWithContext 微信退出，清理断言");
+            dispatch_async(SBKQueue(), ^{
+                SBKDropAssertion(@"_didExitWithContext");
+                gLastLaunchAt = 0;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                               SBKQueue(), ^{ SBKTick(); });
+            });
         }
-    if (target) {
-        SBKLog(@"_didExitWithContext 微信退出，清理断言");
-        dispatch_async(SBKQueue(), ^{
-            SBKDropAssertion(@"_didExitWithContext");
-            gLastLaunchAt = 0;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                           SBKQueue(), ^{ SBKTick(); });
-        });
+    } @catch (NSException *e) {
+        SBKLog(@"_didExitWithContext 异常 %@", e.reason ?: @"?");
     }
-    %orig;
+    if (gOrigDidExit) gOrigDidExit(self, _cmd, ctx);
 }
 
-%end
-
-// ===== 入口 =====
-%ctor {
+// ===== 入口（普通 constructor，不依赖 Logos）=====
+__attribute__((constructor)) static void SBKInit(void) {
     gLogFd = open(kLogPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (gLogFd >= 0) {
-        SBKLog(@"===== XRWeChatKeep start pid=%d target=%@ locked=%d =====",
+        SBKLog(@"===== XRWeChatKeep v1.2.0 start pid=%d target=%@ locked=%d =====",
                getpid(), kTargetBID, SBKIsLocked());
     }
 
-    %init;
+    Class cSceneMgr = objc_getClass("FBSceneManager");
+    BOOL okScene = SBKHook(cSceneMgr,
+                           sel_registerName("_applyMutableSettings:toScene:withTransitionContext:completion:"),
+                           (IMP)SBKApplySettingsHook, (IMP *)&gOrigApplySettings);
+    Class cApp = objc_getClass("SBApplication");
+    BOOL okExit = SBKHook(cApp, sel_registerName("_didExitWithContext:"),
+                          (IMP)SBKDidExitHook, (IMP *)&gOrigDidExit);
+    SBKLog(@"hook 结果 sceneMgr=%d(FBSceneManager=%s) didExit=%d(SBApplication=%s)",
+           okScene ? 1 : 0, cSceneMgr ? "yes" : "nil", okExit ? 1 : 0, cApp ? "yes" : "nil");
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), SBKQueue(), ^{
         pid_t pid = SBKPidForTarget();
-        SBKLog(@"启动自检 pid=%d locked=%d", pid, SBKIsLocked());
+        SBKLog(@"启动自检 pid=%d stat=%d locked=%d", pid, SBKProcStatus(pid), SBKIsLocked());
         if (pid > 0) {
             SBKArmExitWatch(pid);
             SBKEnsureAssertion(pid);

@@ -1,4 +1,4 @@
-# xr-sbkeep / XR 微信持续运行 —— 1.1.0
+# xr-sbkeep / XR 微信持续运行 —— 1.2.0
 #
 # 老板 2026-11-19 定案：XR 放在屋里、没人解锁，微信掉了必须自动拉起并「一直跑」。
 # 光靠 daemon 拉起只是「进程存在但被 suspend」（CPU 为 0），所以这一层注入 SpringBoard：
@@ -13,9 +13,9 @@ ARCHS = arm64 arm64e
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = XRWeChatKeep
-XRWeChatKeep_FILES = Tweak.xm
+XRWeChatKeep_FILES = Tweak.m
 XRWeChatKeep_CFLAGS = -fobjc-arc -fno-modules -w
-# 关键：不链接 libsubstrate，符号全部由宿主注入框架在运行时提供（Substitute / libhooker / ellekit 都兼容）
+# 纯 ObjC runtime swizzle，不用 Logos、不链接也不引用 libsubstrate，任何越狱都能加载
 XRWeChatKeep_LDFLAGS = -undefined dynamic_lookup
 
 include $(THEOS_MAKE_PATH)/tweak.mk
