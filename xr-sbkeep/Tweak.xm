@@ -1,5 +1,13 @@
-// XRWeChatKeep — v1.0.0
+// XRWeChatKeep — v1.1.0
 // 老板 2026-11-19 定案：XR 放屋里、没人解锁，微信掉了必须自动拉起并「一直跑」。
+//
+// v1.1.0（老板实机反馈「锁屏被拉起来了但没持续跑，手点一次微信才跑」后修正）：
+//   实测结论 —— headless(suspended) 拉起只让进程「存在」，进程处于 SSTOP 挂起态，
+//   App 层任何插件（含音频保活）都还没机会执行，所以救不了。
+//   新增：① proc_pidinfo(PROC_PIDTBSDINFO) 读 pbi_status，识别 SSTOP 挂起态；
+//        ② 挂起态 → 断言后 3s 复核，仍未解挂则用 __ActivateSuspended=NO 强制非挂起启动；
+//        ③ 断言加第三档 BKSProcessAssertion 兜底（对已 suspend 进程会直接 task_resume）；
+//        ④ FB 启动请求失败时回退 SBSLaunchApplicationWithIdentifier(bid, 0)。
 //
 // 背景（为什么不是音频、不是有头拉起）：
 //   - SBSLaunchApplicationWithIdentifier(bid, 1) = suspended:YES = 无头拉起，锁屏也能成，
@@ -28,6 +36,7 @@
 #import <time.h>
 #import <unistd.h>
 #import <fcntl.h>
+#import <dlfcn.h>
 
 // Logos 会用到（Theos 自带 include/substrate.h；缺失时不影响，Logos 走自身的 hooking 实现）
 #if __has_include(<substrate.h>)
@@ -39,6 +48,66 @@ extern int proc_listallpids(void *buffer, int buffersize);
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #define SBK_PIDPATH_MAX 4096
 
+// ===== libproc 补充：进程状态（判断是否处于挂起态）=====
+extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+#define SBK_PROC_PIDTBSDINFO 3
+#define SBK_SSTOP 4   // stopped / suspended
+
+struct SBKBsdInfo {
+    uint32_t pbi_flags;
+    uint32_t pbi_status;
+    uint32_t pbi_xstatus;
+    uint32_t pbi_pid;
+    uint32_t pbi_ppid;
+    uint32_t pbi_uid;
+    uint32_t pbi_gid;
+    uint32_t pbi_ruid;
+    uint32_t pbi_rgid;
+    uint32_t pbi_svuid;
+    uint32_t pbi_svgid;
+    uint32_t rfu_1;
+    char     pbi_comm[16];
+    char     pbi_name[32];
+    uint32_t pbi_nfiles;
+    uint32_t pbi_pgid;
+    uint32_t pbi_pjobc;
+    uint32_t e_tdev;
+    uint32_t e_tpgid;
+    int32_t  pbi_nice;
+    uint64_t pbi_start_tvsec;
+    uint64_t pbi_start_tvusec;
+};
+
+// 返回 pbi_status；读不到返回 -1
+static int SBKProcStatus(pid_t pid) {
+    if (pid <= 0) return -1;
+    struct SBKBsdInfo info;
+    memset(&info, 0, sizeof(info));
+    int rc = proc_pidinfo(pid, SBK_PROC_PIDTBSDINFO, 0, &info, (int)sizeof(info));
+    if (rc < (int)sizeof(info)) return -1;
+    return (int)info.pbi_status;
+}
+
+// ===== CPU 时间（客观判断「到底跑没跑」）=====
+#define SBK_PROC_PIDTASKINFO 4
+struct SBKTaskInfo {
+    uint64_t pti_virtual_size;
+    uint64_t pti_resident_size;
+    uint64_t pti_total_user;
+    uint64_t pti_total_system;
+    uint64_t rest[16];
+};
+
+// 返回 user+system 累计 CPU 纳秒；读不到返回 0
+static uint64_t SBKTaskCPUTime(pid_t pid) {
+    if (pid <= 0) return 0;
+    struct SBKTaskInfo info;
+    memset(&info, 0, sizeof(info));
+    int rc = proc_pidinfo(pid, SBK_PROC_PIDTASKINFO, 0, &info, (int)sizeof(info));
+    if (rc <= 0) return 0;
+    return info.pti_total_user + info.pti_total_system;
+}
+
 // ===== 常量 =====
 static NSString *const kTargetBID = @"com.tencent.xin";
 static NSString *const kLogPath   = @"/var/mobile/wcvoicekeep.xrkeep.log";
@@ -47,8 +116,8 @@ static NSString *const kLogPath   = @"/var/mobile/wcvoicekeep.xrkeep.log";
 static const NSTimeInterval kLaunchBackoff[] = {3, 8, 20, 45, 60};
 static const int kLaunchBackoffCount = 5;
 
-// 健康检查间隔（秒）。真正的退出检测走 DISPATCH_PROC_EXIT 事件，这个只是兜底复核断言。
-static const int kHealthIntervalSec = 15;
+// 健康检查间隔（秒）。真正的退出检测走 DISPATCH_PROC_EXIT 事件，这个只做挂起态/断言复核。
+static const int kHealthIntervalSec = 10;
 
 // ===== 日志 =====
 static int gLogFd = -1;
@@ -131,8 +200,9 @@ static pid_t SBKPidForTarget(void) {
 
 // ===== RBS 断言 =====
 static id    gAssertion = nil;   // RBSAssertion *
+static id    gBKSAssertion = nil; // BKSProcessAssertion *（第三档兜底，老 API，能直接解挂）
 static pid_t gAssertPid = 0;
-static int   gAssertTier = 0;    // 1 = legacy+grants，2 = 仅 legacy；0 = 无
+static int   gAssertTier = 0;    // 1 = legacy+grants，2 = 仅 legacy，3 = BKSProcessAssertion
 
 // BKSProcessAssertionFlags：PreventTaskSuspend(1) | PreventTaskThrottleDown(2)
 //                          | PreventThrottleDownUI(4) | PreventThrottleDownCPU(8)
@@ -146,9 +216,18 @@ static void SBKDropAssertion(NSString *why) {
         } @catch (NSException *e) {
             (void)e;
         }
-        SBKLog(@"断言释放 (%@) pid=%d tier=%d", why ?: @"?", gAssertPid, gAssertTier);
+        SBKLog(@"RBS 断言释放 (%@) pid=%d tier=%d", why ?: @"?", gAssertPid, gAssertTier);
+    }
+    if (gBKSAssertion) {
+        @try {
+            ((void (*)(id, SEL))objc_msgSend)(gBKSAssertion, sel_registerName("invalidate"));
+        } @catch (NSException *e) {
+            (void)e;
+        }
+        SBKLog(@"BKS 断言释放 (%@) pid=%d", why ?: @"?", gAssertPid);
     }
     gAssertion = nil;
+    gBKSAssertion = nil;
     gAssertPid = 0;
     gAssertTier = 0;
 }
@@ -219,6 +298,53 @@ static BOOL SBKTryAcquire(pid_t pid, BOOL withGrants, NSString **errOut) {
     return NO;
 }
 
+// 第三档兜底：BKSProcessAssertion（老 BackBoardServices API，iOS 14 上 SpringBoard 里通常可直接生效，
+// 而且它对「已 suspend 的进程」会立即做 task_resume，比 RBSLegacyAttribute 更"能解挂"）
+static BOOL SBKAcquireBKS(pid_t pid, NSString **errOut) {
+    Class cBKS = objc_getClass("BKSProcessAssertion");
+    if (!cBKS) {
+        if (errOut) *errOut = @"BKSProcessAssertion 类缺失";
+        return NO;
+    }
+    @try {
+        id alloced = ((id (*)(id, SEL))objc_msgSend)((id)cBKS, sel_registerName("alloc"));
+        // -initWithPID:flags:reason:name:acquire:withHandler:
+        Sel selInit = sel_registerName("initWithPID:flags:reason:name:acquire:withHandler:");
+        id assertion = nil;
+        __block BOOL granted = NO;
+        if ([alloced respondsToSelector:selInit]) {
+            assertion = ((id (*)(id, SEL, int, unsigned int, unsigned int, id, BOOL, id))objc_msgSend)(
+                alloced, selInit, (int)pid, (unsigned int)kLegacyFlags, (unsigned int)kLegacyReason,
+                @"XRWeChatKeep", YES, ^(BOOL ok, NSError *e) {
+                    granted = ok;
+                    if (!ok) SBKLog(@"BKS handler granted=NO err=%@", e.localizedDescription ?: @"nil");
+                });
+        } else {
+            // 退回更老的形态
+            Sel selOld = sel_registerName("initWithPID:flags:reason:name:");
+            if ([alloced respondsToSelector:selOld]) {
+                assertion = ((id (*)(id, SEL, int, unsigned int, unsigned int, id))objc_msgSend)(
+                    alloced, selOld, (int)pid, (unsigned int)kLegacyFlags,
+                    (unsigned int)kLegacyReason, @"XRWeChatKeep");
+                granted = (assertion != nil);
+            }
+        }
+        if (assertion) {
+            gBKSAssertion = assertion;
+            gAssertion = assertion;
+            gAssertPid = pid;
+            gAssertTier = 3;
+            SBKLog(@"BKS 断言成功 pid=%d flags=%llu granted=%d", pid, kLegacyFlags, granted ? 1 : 0);
+            return YES;
+        }
+        if (errOut) *errOut = @"init 返回 nil";
+    } @catch (NSException *e) {
+        if (errOut) *errOut = e.reason ?: @"exception";
+        SBKLog(@"BKS 断言异常 %@", e.reason ?: @"?");
+    }
+    return NO;
+}
+
 static void SBKEnsureAssertion(pid_t pid) {
     if (pid <= 0) return;
 
@@ -229,6 +355,8 @@ static void SBKEnsureAssertion(pid_t pid) {
         } @catch (NSException *e) {
             (void)e;
         }
+        // BKSProcessAssertion 没有 isValid，按其存在性当作有效
+        if (gAssertTier == 3) valid = YES;
         if (valid && gAssertPid == pid) return;
         SBKDropAssertion(valid ? @"pid 变化" : @"已失效");
     }
@@ -237,7 +365,9 @@ static void SBKEnsureAssertion(pid_t pid) {
     if (SBKTryAcquire(pid, YES, &err1)) return;
     NSString *err2 = nil;
     if (SBKTryAcquire(pid, NO, &err2)) return;
-    SBKLog(@"两档断言均失败 → 仅依赖场景扶持 (grants_err=%@ legacy_err=%@)", err1, err2);
+    NSString *err3 = nil;
+    if (SBKAcquireBKS(pid, &err3)) return;
+    SBKLog(@"三档断言全部失败 (grants_err=%@ legacy_err=%@ bks_err=%@)", err1, err2, err3);
 }
 
 // ===== 场景扶持（仅锁屏期）=====
@@ -280,6 +410,27 @@ static void SBKForceForeground(id settings) {
 }
 
 // ===== 拉起（SpringBoard 身份 + 解锁语义，穿透锁屏）=====
+// 回退路径：SpringBoardServices 的 SBSLaunchApplicationWithIdentifier(bid, suspended)
+// suspended=0 会以非挂起方式启动，是「挂起态解不开」时最后的手段。放串行队列，绝不占主线程。
+static void SBKLaunchViaSBS(NSString *why) {
+    typedef int (*SBKLaunchFn)(CFStringRef, Boolean);
+    static SBKLaunchFn fn = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+                         RTLD_LAZY);
+        fn = (SBKLaunchFn)dlsym(h ? h : RTLD_DEFAULT, "SBSLaunchApplicationWithIdentifier");
+    });
+    if (!fn) {
+        SBKLog(@"SBS 回退：符号不可用 (%@)", why ?: @"?");
+        return;
+    }
+    dispatch_async(SBKQueue(), ^{
+        int rc = fn((__bridge CFStringRef)kTargetBID, (Boolean)0);
+        SBKLog(@"SBS 回退拉起 rc=%d (%@)", rc, why ?: @"?");
+    });
+}
+
 static void SBKLaunch(NSString *why) {
     Class cPM  = objc_getClass("FBProcessManager");
     Class cReq = objc_getClass("FBSystemServiceOpenApplicationRequest");
@@ -324,12 +475,46 @@ static void SBKLaunch(NSString *why) {
         ((void (*)(id, SEL, id, id, id))objc_msgSend)(
             ws, sel_registerName("systemService:handleOpenApplicationRequest:withCompletion:"),
             svc, req, ^(NSError *e) {
-                if (e) SBKLog(@"拉起回调失败 err=%@ (%ld)", e.localizedDescription, (long)e.code);
-                else   SBKLog(@"拉起回调 ok");
+                if (e) {
+                    SBKLog(@"拉起回调失败 err=%@ (%ld) → 回退 SBSLaunch 前台档",
+                           e.localizedDescription, (long)e.code);
+                    SBKLaunchViaSBS(why);
+                } else {
+                    SBKLog(@"拉起回调 ok");
+                }
             });
     } @catch (NSException *e) {
         SBKLog(@"拉起异常 %@", e.reason ?: @"?");
     }
+}
+
+// ===== 强制非挂起重启（挂起态专用）=====
+// 老板 2026-11-19 实测：headless(suspended) 拉起后进程是挂起态，App 层插件根本没机会跑，
+// 断言也不一定解挂 → 检测到 SSTOP 就再用 __ActivateSuspended=NO 发起一次启动。
+static time_t gLastForceLaunchAt = 0;
+
+static void SBKForceRelaunch(NSString *why) {
+    time_t now = time(NULL);
+    if (gLastForceLaunchAt > 0 && (now - gLastForceLaunchAt) < 12) return;   // 12s 内不重复
+    gLastForceLaunchAt = now;
+    SBKLog(@"发起强制非挂起启动 (%@)", why ?: @"?");
+    dispatch_async(dispatch_get_main_queue(), ^{ SBKLaunch(why); });
+}
+
+// 断言刚建立/刚切换后的 3s 复核：还没解挂就强制非挂起启动
+static void SBKSuspendRecheck(NSString *tag) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   SBKQueue(), ^{
+        pid_t p2 = SBKPidForTarget();
+        if (p2 <= 0) return;
+        int s2 = SBKProcStatus(p2);
+        if (s2 == SBK_SSTOP) {
+            SBKLog(@"[%@] 断言未解挂 stat=%d → 强制非挂起启动", tag ?: @"?", s2);
+            SBKForceRelaunch(tag);
+        } else {
+            SBKLog(@"[%@] 已解挂 stat=%d，进入持续运行", tag ?: @"?", s2);
+        }
+    });
 }
 
 // ===== 状态机 =====
@@ -339,6 +524,9 @@ static dispatch_source_t gHealthTimer = nil;
 static dispatch_source_t gExitSource = nil;
 static pid_t  gWatchedPid = 0;
 static int    gTick = 0;
+static int    gLastProcStatus = -99;
+static uint64_t gLastCPUTime = 0;
+static int    gStallTicks = 0;       // 连续多少 tick CPU 时间没前进
 
 static void SBKArmExitWatch(pid_t pid);
 
@@ -347,6 +535,7 @@ static void SBKTick(void) {
 
     if (pid <= 0) {
         SBKDropAssertion(@"微信不在运行");
+        gLastProcStatus = -99;
         if (gExitSource) {
             dispatch_source_cancel(gExitSource);
             gExitSource = nil;
@@ -361,7 +550,12 @@ static void SBKTick(void) {
         return;
     }
 
-    if (gWatchedPid != pid) SBKArmExitWatch(pid);
+    if (gWatchedPid != pid) {
+        gLastCPUTime = 0;
+        gStallTicks = 0;
+        gLastProcStatus = -99;
+        SBKArmExitWatch(pid);
+    }
 
     if (gFailCount != 0) {
         SBKLog(@"微信已在运行 pid=%d，失败计数清零", pid);
@@ -369,11 +563,54 @@ static void SBKTick(void) {
         gLastLaunchAt = 0;
     }
 
-    SBKEnsureAssertion(pid);
+    // ===== 关键：区分「进程存在但被 suspend」与「真在跑」=====
+    int st = SBKProcStatus(pid);
+    uint64_t cpu = SBKTaskCPUTime(pid);
+    BOOL cpuMoved = (cpu > 0 && cpu != gLastCPUTime);
+    if (cpuMoved) {
+        gLastCPUTime = cpu;
+        gStallTicks = 0;
+    } else if (cpu > 0) {
+        gStallTicks++;
+    }
+    if (st != gLastProcStatus) {
+        SBKLog(@"微信 pid=%d 状态 stat=%d %@ cpu=%llu", pid, st,
+               st == SBK_SSTOP ? @"(SSTOP/挂起)" : (st < 0 ? @"(读取失败)" : @"(非SSTOP)"),
+               (unsigned long long)cpu);
+        gLastProcStatus = st;
+    }
+    // 两种判定：内核直接报 SSTOP，或 CPU 时间连续 3 个 tick（≈30s）毫无前进
+    BOOL frozen = (st == SBK_SSTOP) || (gStallTicks >= 3);
+    if (gStallTicks == 3) {
+        SBKLog(@"CPU 时间连续 30s 未前进 (cpu=%llu) → 判定为冻结", (unsigned long long)cpu);
+    }
 
-    // 锁屏期每 tick 复核一次场景（unlock 后 hook 才会重新发力，这里只是兜底）
-    if (gForceScene && SBKIsLocked()) {
-        SBKLog(@"锁屏期健康复核 pid=%d 断言tier=%d", pid, gAssertTier);
+    BOOL hadAssert = (gAssertion != nil);
+    SBKEnsureAssertion(pid);
+    BOOL freshAssert = (!hadAssert && gAssertion != nil);
+
+    if (frozen) {
+        if (st != SBK_SSTOP && gStallTicks > 3) {
+            // 纯 CPU 冻结信号只触发一次（第 3 个 tick），避免反复重启一个本就空闲的进程
+            // 等 CPU 恢复（gStallTicks 归零）或进程退出后重新判定
+        } else if (gAssertTier == 3) {
+            SBKForceRelaunch(@"BKS 断言下仍挂起");
+        } else if (gAssertTier != 0) {
+            if (freshAssert) {
+                SBKLog(@"检测到挂起态，RBS 断言刚建立，3s 后复核能否解挂");
+                SBKSuspendRecheck(@"RBS 初次");
+            } else {
+                SBKLog(@"RBS 断言(tier=%d)在持但仍挂起 → 切换 BKS 断言", gAssertTier);
+                SBKDropAssertion(@"切换 BKS");
+                NSString *eBKS = nil;
+                if (SBKAcquireBKS(pid, &eBKS)) SBKSuspendRecheck(@"BKS");
+                else SBKForceRelaunch(@"BKS 也不可用");
+            }
+        } else {
+            SBKForceRelaunch(@"无断言且挂起");
+        }
+    } else if (gForceScene && SBKIsLocked() && gTick % 6 == 0) {
+        SBKLog(@"锁屏期健康复核 pid=%d stat=%d 断言tier=%d", pid, st, gAssertTier);
     }
 
     gTick++;
