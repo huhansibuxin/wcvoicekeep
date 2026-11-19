@@ -180,18 +180,29 @@ static dispatch_queue_t SBKQueue(void) {
 }
 
 // ===== 锁屏状态 =====
+// v1.3.2 关键修正（安全模式元凶）：绝不能调 +sharedInstance！
+//   SBLockScreenManager 在 SpringBoard 启动早期尚未构建，tweak 在启动期（场景设置 hook 里）
+//   去 +sharedInstance 会触发它现场 alloc/init，UI 依赖没就绪 → SpringBoard 直接崩 → 安全模式。
+//   改用 +sharedInstanceIfExists：只读已存在的实例，不存在就返回 nil（此时必然是开机早期，
+//   也不可能处于「锁屏使用中」状态），零副作用。
 static BOOL SBKIsLocked(void) {
     static Class cls;
-    static SEL selShared, selLocked;
+    static SEL selIfExists, selShared, selLocked;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         cls = objc_getClass("SBLockScreenManager");
-        selShared = sel_registerName("sharedInstance");
-        selLocked = sel_registerName("isUILocked");
+        selIfExists = sel_registerName("sharedInstanceIfExists");
+        selShared   = sel_registerName("sharedInstance");
+        selLocked   = sel_registerName("isUILocked");
     });
     if (!cls) return NO;
     @try {
-        id inst = ((id (*)(id, SEL))objc_msgSend)((id)cls, selShared);
+        id inst = nil;
+        if (class_respondsToSelector(object_getClass((id)cls), selIfExists)) {
+            inst = ((id (*)(id, SEL))objc_msgSend)((id)cls, selIfExists);
+        } else {
+            inst = ((id (*)(id, SEL))objc_msgSend)((id)cls, selShared);
+        }
         if (!inst) return NO;
         return ((BOOL (*)(id, SEL))objc_msgSend)(inst, selLocked);
     } @catch (NSException *e) {
@@ -399,6 +410,14 @@ static void SBKEnsureAssertion(pid_t pid) {
 // ===== 场景扶持（仅锁屏期）=====
 static BOOL gForceScene = YES;    // 场景扶持总开关（编译期固定开）
 static __thread int gInForce = 0; // 防重入
+
+// 启动静默期：ctor 之后 12s 内不做任何「主动改系统状态」的动作。
+// SpringBoard 启动早期各单例/场景都还没就绪，此时强行 setForeground 或建断言都容易炸。
+static time_t gCtorAt = 0;
+static BOOL SBKSettled(void) {
+    if (gCtorAt == 0) return NO;
+    return (time(NULL) - gCtorAt) >= 12;
+}
 
 static NSString *SBKSceneBID(id scene) {
     if (!scene) return nil;
@@ -716,7 +735,7 @@ static void SBKApplySettingsHook(id self, SEL _cmd, id settings, id scene, id ct
     int no = gHookNo < 100 ? ++gHookNo : 100;
     if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-enter\n", no); SBKRawLog(b); }
 
-    if (gForceScene && gInForce == 0) {
+    if (gForceScene && gInForce == 0 && SBKSettled()) {
         if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-precheck\n", no); SBKRawLog(b); }
         BOOL locked = SBKIsLocked();
         if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-locked=%d\n", no, locked ? 1 : 0); SBKRawLog(b); }
@@ -776,6 +795,7 @@ __attribute__((constructor)) static void SBKInit(void) {
              "\n===== XRWeChatKeep v1.3.1 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB);
     SBKRawLog(head);
+    gCtorAt = time(NULL);
 
     // 急停开关：存在 /var/mobile/Library/SpringBoard/xrkeep.off 就完全不装 hook
     if (access("/var/mobile/Library/SpringBoard/xrkeep.off", F_OK) == 0) {
@@ -804,7 +824,8 @@ __attribute__((constructor)) static void SBKInit(void) {
            okScene ? 1 : 0, cSceneMgr ? "yes" : "nil", okExit ? 1 : 0, cApp ? "yes" : "nil");
     SBKRawLog("STAGE: hook-all-done, schedule selfcheck\n");
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), SBKQueue(), ^{
+    // ③ 3s 只做「无副作用」的状态观测（读 pid / 读状态 / 读锁屏），不碰任何系统单例构建
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), SBKQueue(), ^{
         SBKRawLog("STAGE: selfcheck-enter\n");
         @try {
             pid_t pid = SBKPidForTarget();
@@ -814,19 +835,30 @@ __attribute__((constructor)) static void SBKInit(void) {
             int locked = SBKIsLocked() ? 1 : 0;
             SBKRawLog("STAGE: selfcheck-locked-done\n");
             SBKLog(@"启动自检 pid=%d stat=%d locked=%d", pid, st, locked);
-            if (pid > 0) {
-                SBKArmExitWatch(pid);
-                SBKRawLog("STAGE: selfcheck-watch-done\n");
-                SBKEnsureAssertion(pid);
-                SBKRawLog("STAGE: selfcheck-assert-done\n");
-            }
-            SBKStartHealthTimer();
-            SBKRawLog("STAGE: selfcheck-timer-done\n");
-            SBKTick();
-            SBKRawLog("STAGE: selfcheck-tick-done\n");
         } @catch (NSException *e) {
             SBKLog(@"自检异常 %@", e.reason ?: @"?");
             SBKRawLog("STAGE: selfcheck-exception\n");
+        }
+    });
+
+    // ④ 15s 后才开始「动系统」（断言 / 退出监听 / 健康定时器）。给 SpringBoard 充分启动时间。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)), SBKQueue(), ^{
+        SBKRawLog("STAGE: active-enter\n");
+        @try {
+            pid_t pid = SBKPidForTarget();
+            if (pid > 0) {
+                SBKArmExitWatch(pid);
+                SBKRawLog("STAGE: active-watch-done\n");
+                SBKEnsureAssertion(pid);
+                SBKRawLog("STAGE: active-assert-done\n");
+            }
+            SBKStartHealthTimer();
+            SBKRawLog("STAGE: active-timer-done\n");
+            SBKTick();
+            SBKRawLog("STAGE: active-tick-done\n");
+        } @catch (NSException *e) {
+            SBKLog(@"启动异常 %@", e.reason ?: @"?");
+            SBKRawLog("STAGE: active-exception\n");
         }
     });
 }
