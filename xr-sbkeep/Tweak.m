@@ -1,4 +1,4 @@
-// XRWeChatKeep — v1.3.0（自证探针版）
+// XRWeChatKeep — v1.3.2（安全模式已修）
 // 老板 2026-11-19 定案：XR 放屋里、没人解锁，微信掉了必须自动拉起并「一直跑」。
 //
 // v1.3.0（XR 实机装 v1.2.0 后「日志 0 字节、ctor 疑似没执行」后加的诊断版）：
@@ -398,13 +398,13 @@ static void SBKEnsureAssertion(pid_t pid) {
         SBKDropAssertion(valid ? @"pid 变化" : @"已失效");
     }
 
-    NSString *err1 = nil;
-    if (SBKTryAcquire(pid, YES, &err1)) return;
+    // v1.3.3：grants 档在 iOS 14 必失败（"Hereditary grants must specify a target environment"），
+    // 直接跳过，省一次无效 acquire 和一行噪音日志，直接走 legacy 档。
     NSString *err2 = nil;
     if (SBKTryAcquire(pid, NO, &err2)) return;
     NSString *err3 = nil;
     if (SBKAcquireBKS(pid, &err3)) return;
-    SBKLog(@"三档断言全部失败 (grants_err=%@ legacy_err=%@ bks_err=%@)", err1, err2, err3);
+    SBKLog(@"两档断言全部失败 (legacy_err=%@ bks_err=%@)", err2, err3);
 }
 
 // ===== 场景扶持（仅锁屏期）=====
@@ -743,6 +743,12 @@ static void SBKApplySettingsHook(id self, SEL _cmd, id settings, id scene, id ct
             @try {
                 NSString *bid = SBKSceneBID(scene);
                 if ([bid isEqualToString:kTargetBID]) {
+                    static time_t lastLog = 0;
+                    time_t nowT = time(NULL);
+                    if (nowT - lastLog >= 5) {
+                        lastLog = nowT;
+                        SBKLog(@"锁屏期微信场景设置 → 强制 foreground");
+                    }
                     gInForce = 1;
                     SBKForceForeground(settings);
                     gInForce = 0;
@@ -766,7 +772,23 @@ static void SBKDidExitHook(id self, SEL _cmd, id ctx) {
             bid = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("bundleIdentifier"));
         }
         if ([bid isKindOfClass:[NSString class]] && [bid isEqualToString:kTargetBID]) {
-            SBKLog(@"_didExitWithContext 微信退出，清理断言");
+            // 退出原因诊断：FBProcessExitContext → exitReason（reason/code/description）是最直接的死因
+            NSString *ctxDesc = @"?";
+            NSString *reasonDesc = @"?";
+            @try { ctxDesc = [ctx description] ?: @"nil"; } @catch (NSException *e) { (void)e; }
+            @try {
+                id r = [ctx valueForKey:@"exitReason"];
+                if (r) {
+                    id d = nil;
+                    @try { d = [r valueForKey:@"description"]; } @catch (NSException *e) { (void)e; }
+                    reasonDesc = [NSString stringWithFormat:@"%@ | status=%d code=%llu domain=%@",
+                                  r, (int)[[r valueForKey:@"status"] intValue],
+                                  (unsigned long long)[[r valueForKey:@"code"] unsignedLongLongValue],
+                                  [r valueForKey:@"domain"] ?: @"-"];
+                    if (d) reasonDesc = [reasonDesc stringByAppendingFormat:@" | desc=%@", d];
+                }
+            } @catch (NSException *e) { (void)e; }
+            SBKLog(@"_didExitWithContext 微信退出，清理断言 | reason=%@ | ctx=%@", reasonDesc, ctxDesc);
             dispatch_async(SBKQueue(), ^{
                 SBKDropAssertion(@"_didExitWithContext");
                 gLastLaunchAt = 0;
@@ -792,7 +814,7 @@ __attribute__((constructor)) static void SBKInit(void) {
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v1.3.1 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
+             "\n===== XRWeChatKeep v1.3.3 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB);
     SBKRawLog(head);
     gCtorAt = time(NULL);
