@@ -710,21 +710,33 @@ static BOOL SBKHook(Class cls, SEL sel, IMP repl, IMP *origOut) {
 }
 
 // 场景设置落地前的唯一改动点：锁屏期把微信场景强行按在 foreground
+static int gHookNo = 0;
 static void SBKApplySettingsHook(id self, SEL _cmd, id settings, id scene, id ctx, id completion) {
-    if (gForceScene && gInForce == 0 && SBKIsLocked()) {
-        @try {
-            NSString *bid = SBKSceneBID(scene);
-            if ([bid isEqualToString:kTargetBID]) {
-                gInForce = 1;
-                SBKForceForeground(settings);
+    // 埋点：只记前 3 次，确认 hook 是否在启动期就被调用、是否死在半路
+    int no = gHookNo < 100 ? ++gHookNo : 100;
+    if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-enter\n", no); SBKRawLog(b); }
+
+    if (gForceScene && gInForce == 0) {
+        if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-precheck\n", no); SBKRawLog(b); }
+        BOOL locked = SBKIsLocked();
+        if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-locked=%d\n", no, locked ? 1 : 0); SBKRawLog(b); }
+        if (locked) {
+            @try {
+                NSString *bid = SBKSceneBID(scene);
+                if ([bid isEqualToString:kTargetBID]) {
+                    gInForce = 1;
+                    SBKForceForeground(settings);
+                    gInForce = 0;
+                }
+            } @catch (NSException *e) {
                 gInForce = 0;
+                SBKLog(@"场景扶持异常 %@", e.reason ?: @"?");
             }
-        } @catch (NSException *e) {
-            gInForce = 0;
-            SBKLog(@"场景扶持异常 %@", e.reason ?: @"?");
         }
     }
+    if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-call-orig\n", no); SBKRawLog(b); }
     if (gOrigApplySettings) gOrigApplySettings(self, _cmd, settings, scene, ctx, completion);
+    if (no <= 3) { char b[64]; snprintf(b, sizeof(b), "STAGE: h%d-orig-done\n", no); SBKRawLog(b); }
 }
 
 static void SBKDidExitHook(id self, SEL _cmd, id ctx) {
@@ -761,9 +773,15 @@ __attribute__((constructor)) static void SBKInit(void) {
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v1.3.0 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
+             "\n===== XRWeChatKeep v1.3.1 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB);
     SBKRawLog(head);
+
+    // 急停开关：存在 /var/mobile/Library/SpringBoard/xrkeep.off 就完全不装 hook
+    if (access("/var/mobile/Library/SpringBoard/xrkeep.off", F_OK) == 0) {
+        SBKRawLog("KILLSWITCH: xrkeep.off 存在，跳过全部逻辑\n");
+        return;
+    }
 
     // ② 只有 SpringBoard 才跑真正的保活逻辑；Safari 等探针进程到这就结束
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
@@ -772,26 +790,43 @@ __attribute__((constructor)) static void SBKInit(void) {
         return;
     }
 
-    SBKLog(@"SpringBoard 注入生效，开始初始化");
+    SBKRawLog("STAGE: springboard-ctor-enter\n");
 
     Class cSceneMgr = objc_getClass("FBSceneManager");
     BOOL okScene = SBKHook(cSceneMgr,
                            sel_registerName("_applyMutableSettings:toScene:withTransitionContext:completion:"),
                            (IMP)SBKApplySettingsHook, (IMP *)&gOrigApplySettings);
+    SBKRawLog("STAGE: hook-scene-done\n");
     Class cApp = objc_getClass("SBApplication");
     BOOL okExit = SBKHook(cApp, sel_registerName("_didExitWithContext:"),
                           (IMP)SBKDidExitHook, (IMP *)&gOrigDidExit);
     SBKLog(@"hook 结果 sceneMgr=%d(FBSceneManager=%s) didExit=%d(SBApplication=%s)",
            okScene ? 1 : 0, cSceneMgr ? "yes" : "nil", okExit ? 1 : 0, cApp ? "yes" : "nil");
+    SBKRawLog("STAGE: hook-all-done, schedule selfcheck\n");
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), SBKQueue(), ^{
-        pid_t pid = SBKPidForTarget();
-        SBKLog(@"启动自检 pid=%d stat=%d locked=%d", pid, SBKProcStatus(pid), SBKIsLocked());
-        if (pid > 0) {
-            SBKArmExitWatch(pid);
-            SBKEnsureAssertion(pid);
+        SBKRawLog("STAGE: selfcheck-enter\n");
+        @try {
+            pid_t pid = SBKPidForTarget();
+            SBKRawLog("STAGE: selfcheck-pid-done\n");
+            int st = SBKProcStatus(pid);
+            SBKRawLog("STAGE: selfcheck-stat-done\n");
+            int locked = SBKIsLocked() ? 1 : 0;
+            SBKRawLog("STAGE: selfcheck-locked-done\n");
+            SBKLog(@"启动自检 pid=%d stat=%d locked=%d", pid, st, locked);
+            if (pid > 0) {
+                SBKArmExitWatch(pid);
+                SBKRawLog("STAGE: selfcheck-watch-done\n");
+                SBKEnsureAssertion(pid);
+                SBKRawLog("STAGE: selfcheck-assert-done\n");
+            }
+            SBKStartHealthTimer();
+            SBKRawLog("STAGE: selfcheck-timer-done\n");
+            SBKTick();
+            SBKRawLog("STAGE: selfcheck-tick-done\n");
+        } @catch (NSException *e) {
+            SBKLog(@"自检异常 %@", e.reason ?: @"?");
+            SBKRawLog("STAGE: selfcheck-exception\n");
         }
-        SBKStartHealthTimer();
-        SBKTick();
     });
 }
