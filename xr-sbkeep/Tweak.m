@@ -1,4 +1,4 @@
-// XRWeChatKeep — v1.5.0（前台过一遍）
+// XRWeChatKeep — v1.5.1（前台过一遍 + API 勘探）
 // 老板 2026-11-19 定案：XR 放屋里、没人解锁，微信掉了必须自动拉起并「一直跑」。
 //
 // v1.3.0（XR 实机装 v1.2.0 后「日志 0 字节、ctor 疑似没执行」后加的诊断版）：
@@ -706,6 +706,47 @@ static void SBKLaunch(NSString *why) {
 // 断言也不一定解挂 → 检测到 SSTOP 就再用 __ActivateSuspended=NO 发起一次启动。
 static time_t gLastForceLaunchAt = 0;
 
+// ===== v1.5.1：API 勘探（真机把 SpringBoard 里跟 home/lock/background 相关的方法名打进日志）=====
+// 为什么需要：iOS 14 上 SBUIController 的 handleHomeButtonSinglePress、
+// SBMainWorkspace 的 dismissAppSwitcherAndReturnToHomeScreen、SBLockScreenManager 的
+// lockUIFromSource: 全都不存在（真机实测返回 NO），必须按真机实际方法名来实现「交回后台」。
+static void SBKDumpClassAPI(const char *clsName) {
+    Class c = objc_getClass(clsName);
+    if (!c) { SBKLog(@"API: %s → 类不存在", clsName); return; }
+    const char *kws[] = { "home", "lock", "dismiss", "background", "sleep", "button", "unlock", "suspend" };
+    const int nkw = 8;
+
+    for (int pass = 0; pass < 2; pass++) {
+        Class target = (pass == 0) ? c : object_getClass((id)c);
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(target, &n);
+        SBKLog(@"API: %s %s方法共 %u 个", clsName, pass == 0 ? "实例" : "类", n);
+        for (unsigned i = 0; i < n; i++) {
+            const char *nm = sel_getName(method_getName(ms[i]));
+            if (!nm) continue;
+            BOOL hit = NO;
+            for (int k = 0; k < nkw; k++) {
+                if (strcasestr(nm, kws[k])) { hit = YES; break; }
+            }
+            if (hit) SBKLog(@"   %s %s%s  <%s>", clsName, pass == 0 ? "-" : "+", nm,
+                            method_getTypeEncoding(ms[i]) ?: "?");
+        }
+        free(ms);
+    }
+}
+
+static void SBKDumpAPI(void) {
+    SBKLog(@"===== API 勘探开始 =====");
+    const char *classes[] = {
+        "SBUIController", "SBMainWorkspace", "SBLockScreenManager", "SBBacklightController",
+        "SpringBoard", "SBHomeScreenController", "SBHardwareButtonService",
+        "SBIdleTimerGlobalCoordinator", "SBScreenWakeAnimationController",
+        "SBApplicationController", "SBMainSwitcherControllerCoordinator"
+    };
+    for (int i = 0; i < 11; i++) SBKDumpClassAPI(classes[i]);
+    SBKLog(@"===== API 勘探结束 =====");
+}
+
 // ===== v1.5.0：前台过一遍（prime）=====
 // 老板定案的最终形态：把微信拉到前台停一会儿 → 回主屏 → 它自己保活；
 // 下一次被系统杀掉，再来一遍。不做任何保活断言、不做场景欺骗。
@@ -1050,7 +1091,7 @@ __attribute__((constructor)) static void SBKInit(void) {
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v1.5.0 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
+             "\n===== XRWeChatKeep v1.5.1 PROBE pid=%d proc=%s openA=%d(e%d) openB=%d(e%d) =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB);
     SBKRawLog(head);
     gCtorAt = time(NULL);
@@ -1115,6 +1156,8 @@ __attribute__((constructor)) static void SBKInit(void) {
             }
             SBKStartHealthTimer();
             SBKRawLog("STAGE: active-timer-done\n");
+            // 诊断开关：/var/mobile/Library/SpringBoard/xrkeep.dump 存在时输出 API 勘探结果
+            if (access("/var/mobile/Library/SpringBoard/xrkeep.dump", F_OK) == 0) SBKDumpAPI();
             SBKTick();
             SBKRawLog("STAGE: active-tick-done\n");
         } @catch (NSException *e) {
