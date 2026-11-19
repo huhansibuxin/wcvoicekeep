@@ -412,6 +412,10 @@ static BOOL gUseAssert    = NO;   // 保活断言：按老板要求关闭
 static int  gPrimeHoldSec = 15;   // 前台停留秒数；0 = 一直留前台不交回后台
 static time_t gLastPrimeAt = 0;   // 上次「前台过一遍」时间
 static time_t gLastUnlockAt = 0;
+// v2.1.0：最近一次「插件自己解锁成功」的时间戳。用于把「我们自己亮的屏」和
+// 「老板正在用手机」区分开，详见 SBKUnlockDevice / SBKStartPrime 里的注释。
+static time_t gSelfUnlockAt = 0;
+static const int kSelfUnlockWindowSec = 60;   // 自解锁后 60s 内不算「用户在用」
 
 // 模式文件：/var/mobile/Library/SpringBoard/xrkeep.mode（headful / headless），可选
 // 前台停留秒数：/var/mobile/Library/SpringBoard/xrkeep.prime（整数，0 = 一直留前台）
@@ -494,6 +498,10 @@ static BOOL SBKUnlockDevice(NSString *why) {
 
     BOOL stillLocked = SBKLockedNow();
     SBKLog(@"解锁 (%@) 结果 locked=%d", why ?: @"?", stillLocked ? 1 : 0);
+    // v2.1.0：记下「这次是插件自己解的锁」。解锁后到恢复息屏之间（实测约 17s）设备必然处于
+    // 未锁屏状态，如果不区分来源，SBKStartPrime 的「用户在用」保护会把自己刚亮的屏误判成
+    // 老板在用 → 降级成静默拉起 → 微信只回后台、插件不运行。用时间窗自救。
+    if (!stillLocked) gSelfUnlockAt = time(NULL);
     // 模式判定允许纠正：只要成功解开过一次，就永远按有头跑。
     // （v2.0.0 首版把一次失败的解锁固化成"无头"，之后再也不解锁 → 必须修）
     if (!stillLocked && gHeadfulMode != 1) {
@@ -509,7 +517,7 @@ static BOOL SBKUnlockDevice(NSString *why) {
 // 交回后台 / 恢复息屏。真机实测：_simulateLockButtonPress 调了但 locked 仍为 0（不生效），
 // 所以改用 SBLockScreenManager 的锁屏实现，逐档尝试并实测 locked。
 static void SBKRelockDevice(NSString *why) {
-    if (SBKLockedNow()) return;
+    if (SBKLockedNow()) { gSelfUnlockAt = 0; return; }
 
     Class cls = objc_getClass("SBLockScreenManager");
     id mgr = nil;
@@ -558,6 +566,8 @@ static void SBKRelockDevice(NSString *why) {
         if (ok) SBKLog(@"恢复息屏（%@）_simulateLockButtonPress ✔", why ?: @"?");
     }
     SBKLog(@"恢复息屏（%@）结束 locked=%d", why ?: @"?", SBKLockedNow() ? 1 : 0);
+    // 已经锁回去了：清掉「插件自解锁」标记，下次未锁屏就真的代表老板在用手机。
+    if (SBKLockedNow()) gSelfUnlockAt = 0;
 }
 
 // 微信场景是否前台（由场景 hook 顺带采集，未知 = -1）
@@ -1044,16 +1054,24 @@ static void SBKStartPrime(NSString *why) {
     // 因此在用状态下降级为「静默拉起」：不 activate、不抢 UI、不 go home、不锁屏，
     // 只把微信进程拉回后台继续跑；等设备重新锁屏后，健康检查会自然补一次完整的有头过前台。
     // 注意：本分支把 gLastPrimeAt 回退为 0，让 15s 后的健康检查还能按当时状态重新决策。
+    // 但「未锁屏」也可能是插件自己刚解锁造成的（解锁→恢复息屏之间约 17s），
+    // 那种情况不能算老板在用，否则过前台流程会被自己的保护逻辑打断 → 用自解锁时间窗排除。
     if (!SBKLockedNow()) {
-        gLastPrimeAt = 0;
-        pid_t cur = SBKPidForTarget();
-        if (cur <= 0) {
-            SBKLog(@"用户正在使用设备（未锁屏）→ 静默拉起，不抢前台（%@）", why ?: @"?");
-            SBKLaunchViaSBS(why ?: @"用户在用");
+        BOOL selfOwned = (gSelfUnlockAt > 0 && (now - gSelfUnlockAt) < (time_t)kSelfUnlockWindowSec);
+        if (selfOwned) {
+            SBKLogT("primeSelfUnlock", 60, @"未锁屏但来源=插件自解锁(%lds前)，按有头继续（%@）",
+                    (long)(now - gSelfUnlockAt), why ?: @"?");
         } else {
-            SBKLogT("primeSkip", 60, @"用户正在使用设备（未锁屏）→ 跳过过前台（%@）", why ?: @"?");
+            gLastPrimeAt = 0;
+            pid_t cur = SBKPidForTarget();
+            if (cur <= 0) {
+                SBKLog(@"用户正在使用设备（未锁屏）→ 静默拉起，不抢前台（%@）", why ?: @"?");
+                SBKLaunchViaSBS(why ?: @"用户在用");
+            } else {
+                SBKLogT("primeSkip", 60, @"用户正在使用设备（未锁屏）→ 跳过过前台（%@）", why ?: @"?");
+            }
+            return;
         }
-        return;
     }
 
     SBKLog(@"===== 前台过一遍开始：%@ (locked=%d) =====", why ?: @"?", SBKIsLocked() ? 1 : 0);
