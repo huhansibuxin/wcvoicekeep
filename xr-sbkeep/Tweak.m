@@ -1,4 +1,13 @@
-// XRWeChatKeep — v2.0.1（正式版：5 秒延迟拉起 + 日志降频 + CPU 优化）
+// XRWeChatKeep — v2.1.0（正式版收尾：修「用户在用手机时被抢屏锁黑」）
+//
+// v2.1.0（老板 2026-11-19 收尾排查）：
+//   ① **真 bug**：设备未锁屏（= 老板正在用手机）时，原逻辑照样「解锁+抢前台+停 15s+回主屏+息屏锁屏」，
+//      会把正在用的 App 顶掉再直接黑屏。现在未锁屏一律降级为「静默拉起」：只把微信拉回后台，
+//      不 activate、不 go home、不锁屏；设备重新锁屏后由健康检查补完整的有头过前台。
+//   ② 延迟秒数可调：xrkeep.delay（0~120）。不充电+息屏会进深度睡眠，dispatch_after 被拖长
+//      （实测 5s→65s），此场景可调小或设 0。
+//   ③ 死因日志修好：FBProcessExitContext 上 exitReason 这个 KVC 键取不到（一直打 "?"），
+//      改多键兜底（exitReason/_exitReason/reason/_reason/terminationReason），取不到就退化为类名+ctx。
 //
 // v2.0.1（修 v2.0.0 实测暴露的解锁误判）：
 //   v2.0.0 给 SBKIsLocked 加的「1 秒缓存」把解锁后的回读也缓存了 —— 解锁刚做完 120ms 就回查，
@@ -166,6 +175,38 @@ static const int kLaunchBackoffCount = 5;
 // 老板 2026-11-19 定案：微信被杀后**等 5 秒**再拉起（不要杀掉立刻拉）。
 // 目的：给微信自身/系统一次自然回收的机会，避免「杀掉-秒拉」的抖动；也少一次亮屏。
 static const int kRelaunchDelaySec = 5;
+
+// v2.1.0：延迟秒数可调（/var/mobile/Library/SpringBoard/xrkeep.delay，内容为 0~120 的整数）。
+// 为什么需要：不充电 + 息屏时 iOS 进深度睡眠，用户态 dispatch_after 不会唤醒 CPU，
+// 真机实测「5 秒」被拖到 65 秒。此场景可把值调小（甚至 0=立刻拉），插电时保持默认 5。
+// 30 秒缓存，避免每次触发都 open/read 磁盘。
+static int SBKRelaunchDelaySec(void) {
+    static int cached = -1;
+    static time_t cachedAt = 0;
+    time_t now = time(NULL);
+    if (cached >= 0 && (now - cachedAt) < 30) return cached;
+    int v = kRelaunchDelaySec;
+    int fd = open("/var/mobile/Library/SpringBoard/xrkeep.delay", O_RDONLY);
+    if (fd >= 0) {
+        char buf[16];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = '\0';
+            int t = 0;
+            int digits = 0;
+            for (ssize_t i = 0; i < n; i++) {
+                if (buf[i] >= '0' && buf[i] <= '9') { t = t * 10 + (buf[i] - '0'); digits++; }
+                else if (digits > 0) break;
+                else if (buf[i] != ' ' && buf[i] != '\n') break;
+            }
+            if (digits > 0 && t >= 0 && t <= 120) v = t;
+        }
+    }
+    cached = v;
+    cachedAt = now;
+    return v;
+}
 
 // 健康检查间隔（秒）。真正的退出检测走 DISPATCH_PROC_EXIT 事件（实时），
 // 这个只做挂起态兜底复核 → 10s 放宽到 15s，息屏时少 1/3 的唤醒。
@@ -996,6 +1037,25 @@ static void SBKStartPrime(NSString *why) {
     }
 
     gLastPrimeAt = now;
+
+    // v2.1.0（老板 2026-11-19 收尾排查发现的真 bug）：设备「未锁屏」= 屏幕亮着且已解锁 = 老板正在用手机。
+    // 此时如果照旧走「解锁 + 抢前台 + 停 15s + 回主屏 + 强制息屏锁屏」，
+    // 会把老板正在用的 App 顶掉、然后直接把屏幕锁黑——这是唯一会真正打扰使用的路径。
+    // 因此在用状态下降级为「静默拉起」：不 activate、不抢 UI、不 go home、不锁屏，
+    // 只把微信进程拉回后台继续跑；等设备重新锁屏后，健康检查会自然补一次完整的有头过前台。
+    // 注意：本分支把 gLastPrimeAt 回退为 0，让 15s 后的健康检查还能按当时状态重新决策。
+    if (!SBKLockedNow()) {
+        gLastPrimeAt = 0;
+        pid_t cur = SBKPidForTarget();
+        if (cur <= 0) {
+            SBKLog(@"用户正在使用设备（未锁屏）→ 静默拉起，不抢前台（%@）", why ?: @"?");
+            SBKLaunchViaSBS(why ?: @"用户在用");
+        } else {
+            SBKLogT("primeSkip", 60, @"用户正在使用设备（未锁屏）→ 跳过过前台（%@）", why ?: @"?");
+        }
+        return;
+    }
+
     SBKLog(@"===== 前台过一遍开始：%@ (locked=%d) =====", why ?: @"?", SBKIsLocked() ? 1 : 0);
     // 解锁 / 回主屏 / 锁屏都是 SpringBoard 内部状态操作，统一放主线程做（SBKLaunch 自己也会再保险解锁一次）
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1046,15 +1106,16 @@ static void SBKStartPrime(NSString *why) {
 static time_t gPendingRelaunchAt = 0;
 
 static void SBKScheduleRelaunch(NSString *why) {
+    int delay = SBKRelaunchDelaySec();
     time_t now = time(NULL);
-    if (gPendingRelaunchAt > 0 && (now - gPendingRelaunchAt) <= (time_t)kRelaunchDelaySec + 3) {
+    if (gPendingRelaunchAt > 0 && (now - gPendingRelaunchAt) <= (time_t)delay + 3) {
         return;   // 已经排了队，别叠任务
     }
     gPendingRelaunchAt = now;
     NSString *reason = why ? [why copy] : @"?";
-    SBKLog(@"微信不在运行 → %d 秒后拉起（%@）", kRelaunchDelaySec, reason);
+    SBKLog(@"微信不在运行 → %d 秒后拉起（%@）", delay, reason);
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRelaunchDelaySec * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    SBKQueue(), ^{
         gPendingRelaunchAt = 0;
         if (SBKPidForTarget() > 0) {
@@ -1295,15 +1356,32 @@ static void SBKDidExitHook(id self, SEL _cmd, id ctx) {
             NSString *reasonDesc = @"?";
             @try { ctxDesc = [ctx description] ?: @"nil"; } @catch (NSException *e) { (void)e; }
             @try {
-                id r = [ctx valueForKey:@"exitReason"];
+                // v2.1.0：真机实测 [ctx valueForKey:@"exitReason"] 返回 nil（日志一直是 "微信退出 | ?"），
+                // 说明 iOS 14 的 FBProcessExitContext 不暴露该 KVC 键。这里按优先级多键兜底，
+                // 全部取不到时退化为打印 ctx 的类名 + 简短 description，保证「死于什么」至少有个线索。
+                id r = nil;
+                NSArray *keys = @[@"exitReason", @"_exitReason", @"reason", @"_reason", @"terminationReason"];
+                for (NSString *k in keys) {
+                    @try { r = [ctx valueForKey:k]; } @catch (NSException *e) { r = nil; }
+                    if (r) break;
+                }
                 if (r) {
                     id d = nil;
                     @try { d = [r valueForKey:@"description"]; } @catch (NSException *e) { (void)e; }
-                    reasonDesc = [NSString stringWithFormat:@"%@ | status=%d code=%llu domain=%@",
-                                  r, (int)[[r valueForKey:@"status"] intValue],
-                                  (unsigned long long)[[r valueForKey:@"code"] unsignedLongLongValue],
-                                  [r valueForKey:@"domain"] ?: @"-"];
+                    reasonDesc = [NSString stringWithFormat:@"%@", r];
+                    if ([r respondsToSelector:@selector(valueForKey:)]) {
+                        @try {
+                            reasonDesc = [reasonDesc stringByAppendingFormat:@" | status=%d code=%llu domain=%@",
+                                          (int)[[r valueForKey:@"status"] intValue],
+                                          (unsigned long long)[[r valueForKey:@"code"] unsignedLongLongValue],
+                                          [r valueForKey:@"domain"] ?: @"-"];
+                        } @catch (NSException *e) { (void)e; }
+                    }
                     if (d) reasonDesc = [reasonDesc stringByAppendingFormat:@" | desc=%@", d];
+                } else {
+                    NSString *cd = ctxDesc;
+                    if (cd.length > 160) cd = [[cd substringToIndex:160] stringByAppendingString:@"…"];
+                    reasonDesc = [NSString stringWithFormat:@"ctx=%@ %@", NSStringFromClass([ctx class]), cd];
                 }
             } @catch (NSException *e) { (void)e; }
             // 日志降频：平时只写一行简短死因；完整 ctx 只在 xrkeep.dump 诊断模式下才写
@@ -1344,7 +1422,7 @@ __attribute__((constructor)) static void SBKInit(void) {
 
     char head[512];
     snprintf(head, sizeof(head),
-             "\n===== XRWeChatKeep v2.0.1 pid=%d proc=%s fdA=%d(e%d) fdB=%d(e%d) stage=%d =====\n",
+             "\n===== XRWeChatKeep v2.1.0 pid=%d proc=%s fdA=%d(e%d) fdB=%d(e%d) stage=%d =====\n",
              getpid(), getprogname() ?: "?", gLogFd, errA, gLogFdB, errB, gStageOn);
     SBKRawLog(head);
     gCtorAt = time(NULL);
